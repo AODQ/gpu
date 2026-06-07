@@ -10,6 +10,8 @@ layout(local_size_x = 128) in;
 
 layout(push_constant) uniform PushConstants {
 	mat4 viewProj;
+	vec3 cameraForward;
+	vec3 cameraPosWorld;
 	uint64_t instanceCount;
 	uint64_t vertexBufferVas;
 	BufferInstance instanceBufferVa;
@@ -17,6 +19,8 @@ layout(push_constant) uniform PushConstants {
 	BufferCommand commandBufferVa;
 	BufferCommandCount commandCountBufferVa;
 } pc;
+
+layout(set = 0, binding = 0) uniform sampler2D textureHiZ;
 
 void main() {
 	if (gl_GlobalInvocationID.x >= pc.instanceCount) {
@@ -38,9 +42,7 @@ void main() {
 	const float maxScale = sqrt(max(dot(sx, sx), max(dot(sy, sy), dot(sz, sz))));
 	const float radiusWorld = instanceRadius * maxScale;
 
-	bool isVisible = true;
-
-	// frustum test
+	// -- frustum test
 	{
 		mat4 m = pc.viewProj;
 		vec4 row0 = vec4(m[0][0], m[1][0], m[2][0], m[3][0]);
@@ -69,15 +71,53 @@ void main() {
 		}
 
 		if (!visible) {
-			isVisible = false;
+			return;
 		}
 	}
 
-	// emit to command buffer
-	if (!isVisible) {
-		return;
+	// -- hiZ occlusion test
+	{
+		// project bounding sphere to screenspace
+		const vec4 clipPos = pc.viewProj * vec4(instanceCenterWorld, 1.0f);
+		if (clipPos.w <= 0.0f) {
+			return;
+		}
+		const vec3 ndcPos = clipPos.xyz / clipPos.w;
+		const vec2 screenPos = (
+			(ndcPos.xy * 0.5f + 0.5f) * vec2(textureSize(textureHiZ, 0))
+		);
+
+		// pick the correct mip level based on projected radius
+		// the sphere should cover about a texel to this mip level
+		const float projectedRadius = (instanceRadius * maxScale) / clipPos.w;
+		const float mipLevel = max(0.0f, log2(projectedRadius));
+		const float radiusTexels = (
+			  projectedRadius
+			* 0.5f
+			* float(textureSize(textureHiZ, 0).x) // sqr?
+		);
+		const float mipLevelClamped = (
+			max(0.0f, ceil(log2(radiusTexels)))
+		);
+
+		// sample depth from HiZ
+		const vec3 nearestWorld = (
+			instanceCenterWorld - pc.cameraForward * radiusWorld
+		);
+		const vec4 nearClip = pc.viewProj * vec4(nearestWorld, 1.0f);
+		const float sphereNearZ = nearClip.z / nearClip.w;
+		if (sphereNearZ < 0.0f) {
+			return;
+		}
+
+		const vec2 uv = ndcPos.xy * 0.5f + 0.5f;
+		const float hiZDepth = textureLod(textureHiZ, uv, mipLevelClamped).r;
+		if (sphereNearZ > hiZDepth) {
+			return;
+		}
 	}
 
+	// -- emit to command buffer
 	const uint commandIndex = atomicAdd(pc.commandCountBufferVa.commandCount, 1);
 	pc.commandBufferVa.commands[commandIndex] = (
 		CommandDrawIndexed(

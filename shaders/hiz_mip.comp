@@ -1,15 +1,45 @@
 #version 450 core
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(set = 0, binding = 0) uniform sampler2D depthTexture;
-layout(set = 0, binding = 1, r32f) uniform writeonly image2D hiz;
+layout(set = 0, binding = 0) uniform sampler2D textureDepthHiZ;
+layout(set = 0, binding = 1, r32f) uniform image2D imageHiZ;
+
+layout(push_constant) uniform PushConstants {
+	int selectedMipLevel;
+	int maxMipLevel;
+} pc;
 
 void main() {
-	const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
-	const ivec2 size = imageSize(hiz);
-	if (p.x >= size.x || p.y >= size.y) {
+	// first mipmap just copies
+	if (pc.selectedMipLevel == 0)
+	{
+		const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+		const ivec2 size = imageSize(imageHiZ);
+		if (p.x >= size.x || p.y >= size.y) {
+			return;
+		}
+		const float depth = texelFetch(textureDepthHiZ, p, 0).r;
+		imageStore(imageHiZ, p, vec4(depth, 0, 0, 0));
 		return;
 	}
-	const float depth = texelFetch(depthTexture, p, 0).r;
-	imageStore(hiz, p, vec4(depth, 0, 0, 0));
+
+	// 2x2 reduction
+	const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	const ivec2 size = imageSize(imageHiZ);
+	const ivec2 mipSize = size;
+	if (p.x >= mipSize.x || p.y >= mipSize.y) {
+		return;
+	}
+	const ivec2 p0 = p * 2;
+	const ivec2 p1 = p0 + ivec2(1, 0);
+	const ivec2 p2 = p0 + ivec2(0, 1);
+	const ivec2 p3 = p0 + ivec2(1, 1);
+
+	const float d0 = texelFetch(textureDepthHiZ, p0, pc.selectedMipLevel - 1).r;
+	const float d1 = texelFetch(textureDepthHiZ, p1, pc.selectedMipLevel - 1).r;
+	const float d2 = texelFetch(textureDepthHiZ, p2, pc.selectedMipLevel - 1).r;
+	const float d3 = texelFetch(textureDepthHiZ, p3, pc.selectedMipLevel - 1).r;
+
+	const float maxDepth = max(max(d0, d1), max(d2, d3));
+	imageStore(imageHiZ, p, vec4(maxDepth, 0, 0, 0));
 }

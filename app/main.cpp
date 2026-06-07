@@ -81,7 +81,12 @@ void glfwScrollCallback(
 	camera->scrollDelta = (f32)yoffset;
 }
 
-f32m44 cameraUpdate(GLFWwindow * const window, Camera & camera) {
+f32m44 cameraUpdate(
+	GLFWwindow * const window,
+	Camera & camera,
+	f32v3 & cameraForward,
+	f32v3 & cameraPosWorld
+) {
 	double mouseX, mouseY;
 	glfwGetCursorPos(window, &mouseX, &mouseY);
 
@@ -123,6 +128,9 @@ f32m44 cameraUpdate(GLFWwindow * const window, Camera & camera) {
 		camera.target.y + camera.distance * sinPitch,
 		camera.target.z + camera.distance * cosPitch * cosYaw
 	};
+
+	cameraForward = normalize(camera.target - eye);
+	cameraPosWorld = eye;
 
 	return lookat(eye, camera.target, { 0.0f, -1.0f, 0.0f });
 }
@@ -221,7 +229,11 @@ int32_t main() {
 			glfwSetWindowShouldClose(context.window, true);
 		}
 
-		f32m44 const view = cameraUpdate(context.window, camera);
+		f32v3 cameraForward;
+		f32v3 cameraPosWorld;
+		f32m44 const view = (
+			cameraUpdate(context.window, camera, cameraForward, cameraPosWorld)
+		);
 		f32m44 const proj = perspective(
 			90.0f * (3.14159265f / 180.0f),
 			1.77777f,
@@ -326,31 +338,6 @@ int32_t main() {
 		);
 
 		// -- setup render
-		VkRenderingAttachmentInfo const colorAttachment {
-			.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-			.pNext = nullptr,
-			.imageView = context.swapchain.get_image_views().value()[imageIdx],
-			.imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL_KHR,
-			.resolveMode = VK_RESOLVE_MODE_NONE,
-			.resolveImageView = VK_NULL_HANDLE,
-			.resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-			.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-			.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-			.clearValue = VkClearValue { .color = { 0.2f, 0.2f, 0.8f, 1.0f } },
-		};
-
-		VkRenderingAttachmentInfo const depthAttachment {
-			.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-			.pNext = nullptr,
-			.imageView = context.swapchainDepthImageViews[imageIdx],
-			.imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL_KHR,
-			.resolveMode = VK_RESOLVE_MODE_NONE,
-			.resolveImageView = VK_NULL_HANDLE,
-			.resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-			.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-			.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-			.clearValue = VkClearValue { .depthStencil = { 1.0f, 0 } },
-		};
 
 		{
 			f32m44 const cullProj = (
@@ -362,26 +349,57 @@ int32_t main() {
 				)
 			);
 			f32m44 const cullViewProj = cullProj * view;
-			Cull::update(context, frame.commandBuffer, cullViewProj);
+			Cull::update(
+				context, frame.commandBuffer,
+				/*viewProj=*/ cullViewProj,
+				/*cameraForward=*/ cameraForward,
+				/*cameraPosWorld=*/ cameraPosWorld
+			);
 		}
 
-		VkRenderingInfo renderingInfo {
-			.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-			.pNext = nullptr,
-			.flags = 0,
-			.renderArea = VkRect2D {
-				.offset = { 0, 0 },
-				.extent = context.swapchain.extent,
-			},
-			.layerCount = 1,
-			.viewMask = 0,
-			.colorAttachmentCount = 1,
-			.pColorAttachments = &colorAttachment,
-			.pDepthAttachment = &depthAttachment,
-			.pStencilAttachment = nullptr,
-		};
+		{
+			VkRenderingAttachmentInfo const colorAttachment {
+				.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+				.pNext = nullptr,
+				.imageView = context.swapchain.get_image_views().value()[imageIdx],
+				.imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL_KHR,
+				.resolveMode = VK_RESOLVE_MODE_NONE,
+				.resolveImageView = VK_NULL_HANDLE,
+				.resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+				.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+				.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+				.clearValue = VkClearValue { .color = { 0.2f, 0.2f, 0.8f, 1.0f } },
+			};
 
-		vkCmdBeginRendering(frame.commandBuffer, &renderingInfo);
+			VkRenderingAttachmentInfo const depthAttachment {
+				.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+				.pNext = nullptr,
+				.imageView = context.swapchainDepthImageViews[imageIdx],
+				.imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL_KHR,
+				.resolveMode = VK_RESOLVE_MODE_NONE,
+				.resolveImageView = VK_NULL_HANDLE,
+				.resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+				.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+				.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+				.clearValue = VkClearValue { .depthStencil = { 1.0f, 0 } },
+			};
+			VkRenderingInfo renderingInfo {
+				.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+				.pNext = nullptr,
+				.flags = 0,
+				.renderArea = VkRect2D {
+					.offset = { 0, 0 },
+					.extent = context.swapchain.extent,
+				},
+				.layerCount = 1,
+				.viewMask = 0,
+				.colorAttachmentCount = 1,
+				.pColorAttachments = &colorAttachment,
+				.pDepthAttachment = &depthAttachment,
+				.pStencilAttachment = nullptr,
+			};
+			vkCmdBeginRendering(frame.commandBuffer, &renderingInfo);
+		}
 
 		{ // -- imgui
 			gfx::imgui_new_frame();
@@ -397,11 +415,6 @@ int32_t main() {
 				Cull::lastVisibleCount(),
 				Cull::totalInstanceCount()
 			);
-			// ImGui_ImplVulkan_AddTexture;
-			// 	// context.samplerLinear,
-			// 	// Cull::imageHiz(),
-			// 	// VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-			// 	// &Cull::descriptorHiz(
 			ImGui::End();
 		}
 
@@ -425,7 +438,18 @@ int32_t main() {
 			.maxDepth = 1,
 		};
 		vkCmdSetViewport(frame.commandBuffer, 0, 1, &viewport);
-		vkCmdSetScissor(frame.commandBuffer, 0, 1, &renderingInfo.renderArea);
+		{
+			auto const scissor = VkRect2D {
+				.offset = { 0, 0 },
+				.extent = context.swapchain.extent,
+			};
+			vkCmdSetScissor(
+				frame.commandBuffer,
+				/*firstScissor=*/ 0,
+				/*scissorCount=*/ 1,
+				/*pScissors=*/ &scissor
+			);
+		}
 
 		// dispatch mesh shader workgroup
 		// {
@@ -482,7 +506,13 @@ int32_t main() {
 		// 	--reloadPopup;
 		// }
 
-		Cull::draw(context, frame.commandBuffer, viewProj);
+		Cull::draw(
+			context,
+			frame.commandBuffer,
+			/*viewProj=*/ viewProj,
+			/*cameraForward=*/ cameraForward,
+			/*cameraPosWorld=*/ cameraPosWorld
+		);
 		vkCmdEndRendering(frame.commandBuffer);
 
 		Cull::resolveDepth(
@@ -494,28 +524,77 @@ int32_t main() {
 
 		// -- transition depth image for debug presentation
 		Cull::imageHizTransition(frame.commandBuffer);
-		static VkDescriptorSet imguiDescriptorSet { VK_NULL_HANDLE };
-		if (imguiDescriptorSet == VK_NULL_HANDLE) {
-			imguiDescriptorSet = (
-				ImGui_ImplVulkan_AddTexture(
-					context.samplerNearest,
-					Cull::imageHiz(),
-					VK_IMAGE_LAYOUT_GENERAL
-				)
-			);
+		static std::vector<VkDescriptorSet> imguiDescriptorSet {};
+		if (imguiDescriptorSet.size() == 0) {
+			auto const & imageViews = Cull::imageHiz();
+			for (auto const & iv : imageViews) {
+				imguiDescriptorSet.push_back(
+					ImGui_ImplVulkan_AddTexture(
+						context.samplerNearest,
+						iv,
+						VK_IMAGE_LAYOUT_GENERAL
+					)
+				);
+			}
 		}
 
 		ImGui::Begin("HiZ debug");
-		ImGui::Image(
-			imguiDescriptorSet,
-			ImVec2(
-				640.0f*0.5,
-				480.0f*0.5
-			)
-		);
+		for (size_t i = 0; i < imguiDescriptorSet.size(); ++i) {
+			ImGui::Text("Mip level %zu", i);
+			ImGui::Image(
+				imguiDescriptorSet[i],
+				ImVec2(
+					640.0f*0.5,
+					480.0f*0.5
+				)
+			);
+		}
 		ImGui::End();
 
-		vkCmdBeginRendering(frame.commandBuffer, &renderingInfo);
+		{
+			VkRenderingAttachmentInfo const colorAttachment {
+				.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+				.pNext = nullptr,
+				.imageView = context.swapchain.get_image_views().value()[imageIdx],
+				.imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL_KHR,
+				.resolveMode = VK_RESOLVE_MODE_NONE,
+				.resolveImageView = VK_NULL_HANDLE,
+				.resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+				.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+				.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+				.clearValue = {},
+			};
+			VkRenderingAttachmentInfo const depthAttachment {
+				.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+				.pNext = nullptr,
+				.imageView = context.swapchainDepthImageViews[imageIdx],
+				.imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL_KHR,
+				.resolveMode = VK_RESOLVE_MODE_NONE,
+				.resolveImageView = VK_NULL_HANDLE,
+				.resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+				.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+				.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+				.clearValue = {},
+			};
+
+			VkRenderingInfo renderingInfo {
+				.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+				.pNext = nullptr,
+				.flags = 0,
+				.renderArea = VkRect2D {
+					.offset = { 0, 0 },
+					.extent = context.swapchain.extent,
+				},
+				.layerCount = 1,
+				.viewMask = 0,
+				.colorAttachmentCount = 1,
+				.pColorAttachments = &colorAttachment,
+				.pDepthAttachment = &depthAttachment,
+				.pStencilAttachment = nullptr,
+			};
+			vkCmdBeginRendering(frame.commandBuffer, &renderingInfo);
+		}
+
 		{ // -- imgui end
 			ImGui::Render();
 			gfx::imgui_render(frame.commandBuffer);

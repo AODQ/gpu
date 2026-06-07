@@ -51,6 +51,8 @@ struct GpuModel {
 
 struct GpuPushConstant {
 	f32m44 viewProj;
+	alignas(16) f32v3 cameraForward;
+	alignas(16) f32v3 cameraPosWorld;
 	uint64_t instanceCount;
 	VkDeviceAddress vertexBufferVa;
 	VkDeviceAddress instanceBufferVa;
@@ -104,6 +106,8 @@ void * sIndirectDrawCounterBufferReadbackMapped;
 
 VkImage sDepthPyramidImage;
 VkImageView sDepthPyramidImageView;
+std::vector<VkImageView> sDepthPyramidImageViewChain;
+std::vector<VkImageView> sDepthPyramidImageViewRrrr;
 VmaAllocation sDepthPyramidImageAllocation;
 
 PFN_vkCmdPushDescriptorSet2 fnVkCmdPushDescriptorSet2KHR;
@@ -206,39 +210,66 @@ static void loadPipelineStandard(
 static void loadPipelineCompute(
 	gfx::Device const & device
 ) {
-	VkPushConstantRange const pushConstantRange {
-		.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-		.offset = 0,
-		.size = sizeof(GpuPushConstant),
-	};
-	VkPipelineLayoutCreateInfo const pipelineLayoutCi {
-		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-		.pNext = nullptr,
-		.flags = 0,
-		.setLayoutCount = 0,
-		.pSetLayouts = nullptr,
-		.pushConstantRangeCount = 1,
-		.pPushConstantRanges = &pushConstantRange,
-	};
+	{
+		VkDescriptorSetLayoutBinding const binding[1] = {
+			{
+				.binding = 0,
+				.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+				.descriptorCount = 1,
+				.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+				.pImmutableSamplers = nullptr,
+			},
+		};
+		VkDescriptorSetLayoutCreateInfo const descriptorSetLayoutCi {
+			.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+			.pNext = nullptr,
+			.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+			.bindingCount = 1,
+			.pBindings = binding,
+		};
+		VkDescriptorSetLayout descriptorSetLayout;
+		VkAssert(
+			vkCreateDescriptorSetLayout(
+				device.vkDevice(),
+				&descriptorSetLayoutCi,
+				nullptr,
+				&descriptorSetLayout
+			)
+		);
+		VkPushConstantRange const pushConstantRange {
+			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+			.offset = 0,
+			.size = sizeof(GpuPushConstant),
+		};
+		VkPipelineLayoutCreateInfo const pipelineLayoutCi {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+			.pNext = nullptr,
+			.flags = 0,
+			.setLayoutCount = 1,
+			.pSetLayouts = &descriptorSetLayout,
+			.pushConstantRangeCount = 1,
+			.pPushConstantRanges = &pushConstantRange,
+		};
 
-	VkPipelineLayout pipelineLayout;
-	VkAssert(
-		vkCreatePipelineLayout(
-			device.vkDevice(),
-			&pipelineLayoutCi,
-			nullptr,
-			&pipelineLayout
-		)
-	);
+		VkPipelineLayout pipelineLayout;
+		VkAssert(
+			vkCreatePipelineLayout(
+				device.vkDevice(),
+				&pipelineLayoutCi,
+				nullptr,
+				&pipelineLayout
+			)
+		);
 
-	sPipelineCompute = (
-		gfx::pipeline_compute_create(
-			device,
-			pipelineLayout,
-			pwd_dir() / "shaders/visibility.comp",
-			/*hotReloadPipeline=*/ nullptr
-		)
-	);
+		sPipelineCompute = (
+			gfx::pipeline_compute_create(
+				device,
+				pipelineLayout,
+				pwd_dir() / "shaders/visibility.comp",
+				/*hotReloadPipeline=*/ nullptr
+			)
+		);
+	}
 
 	{
 		VkDescriptorSetLayoutBinding const binding[2] = {
@@ -273,14 +304,19 @@ static void loadPipelineCompute(
 				&descriptorSetLayout
 			)
 		);
+		VkPushConstantRange const pushConstantRange {
+			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+			.offset = 0,
+			.size = sizeof(u32)*2,
+		};
 		VkPipelineLayoutCreateInfo const pipelineLayoutCi {
 			.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
 			.pNext = nullptr,
 			.flags = 0,
 			.setLayoutCount = 1,
 			.pSetLayouts = &descriptorSetLayout,
-			.pushConstantRangeCount = 0,
-			.pPushConstantRanges = nullptr
+			.pushConstantRangeCount = 1,
+			.pPushConstantRanges = &pushConstantRange,
 		};
 		VkPipelineLayout mipPipelineLayout;
 		VkAssert(
@@ -808,6 +844,82 @@ void Cull::init(
 			);
 			return view;
 		}();
+
+		sDepthPyramidImageViewChain = [&]() -> std::vector<VkImageView> {
+			std::vector<VkImageView> views;
+			for (u32 i = 0; i < sDimensionMipLevels; ++i) {
+				VkImageViewCreateInfo const viewCi {
+					.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+					.pNext = nullptr,
+					.flags = 0,
+					.image = sDepthPyramidImage,
+					.viewType = VK_IMAGE_VIEW_TYPE_2D,
+					.format = VK_FORMAT_R32_SFLOAT,
+					.components = {
+						.r = VK_COMPONENT_SWIZZLE_IDENTITY,
+						.g = VK_COMPONENT_SWIZZLE_IDENTITY,
+						.b = VK_COMPONENT_SWIZZLE_IDENTITY,
+						.a = VK_COMPONENT_SWIZZLE_IDENTITY,
+					},
+					.subresourceRange = {
+						.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+						.baseMipLevel = i,
+						.levelCount = 1,
+						.baseArrayLayer = 0,
+						.layerCount = 1,
+					},
+				};
+				VkImageView view;
+				VkAssert(
+					vkCreateImageView(
+						device.vkDevice(),
+						&viewCi,
+						nullptr,
+						&view
+					)
+				);
+				views.emplace_back(view);
+			}
+			return views;
+		}();
+
+		sDepthPyramidImageViewRrrr = [&]() -> std::vector<VkImageView> {
+			std::vector<VkImageView> views;
+			for (u32 i = 0; i < sDimensionMipLevels; ++i) {
+				VkImageViewCreateInfo const viewCi {
+					.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+					.pNext = nullptr,
+					.flags = 0,
+					.image = sDepthPyramidImage,
+					.viewType = VK_IMAGE_VIEW_TYPE_2D,
+					.format = VK_FORMAT_R32_SFLOAT,
+					.components = {
+						.r = VK_COMPONENT_SWIZZLE_R,
+						.g = VK_COMPONENT_SWIZZLE_R,
+						.b = VK_COMPONENT_SWIZZLE_R,
+						.a = VK_COMPONENT_SWIZZLE_A,
+					},
+					.subresourceRange = {
+						.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+						.baseMipLevel = i,
+						.levelCount = 1,
+						.baseArrayLayer = 0,
+						.layerCount = 1,
+					},
+				};
+				VkImageView view;
+				VkAssert(
+					vkCreateImageView(
+						device.vkDevice(),
+						&viewCi,
+						nullptr,
+						&view
+					)
+				);
+				views.emplace_back(view);
+			}
+			return views;
+		}();
 	}
 
 	fnVkCmdPushDescriptorSet2KHR = (
@@ -817,6 +929,74 @@ void Cull::init(
 			"vkCmdPushDescriptorSet2KHR"
 		)
 	);
+
+	{
+		VkCommandBufferAllocateInfo const cmdAllocCi {
+			.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+			.pNext = nullptr,
+			.commandPool = commandPool,
+			.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+			.commandBufferCount = 1,
+		};
+		VkCommandBuffer cmd;
+		VkAssert(vkAllocateCommandBuffers(device.vkDevice(), &cmdAllocCi, &cmd));
+		VkCommandBufferBeginInfo const cmdBeginCi {
+			.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+			.pNext = nullptr,
+			.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+			.pInheritanceInfo = nullptr,
+		};
+
+		vkBeginCommandBuffer(cmd, &cmdBeginCi);
+
+		auto const barrier = VkImageMemoryBarrier2 {
+			.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+			.pNext = nullptr,
+			.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+			.srcAccessMask = 0,
+			.dstStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+			.dstAccessMask = 0,
+			.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+			.newLayout = VK_IMAGE_LAYOUT_GENERAL,
+			.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.image = sDepthPyramidImage,
+			.subresourceRange = {
+				.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+				.baseMipLevel = 0,
+				.levelCount = VK_REMAINING_MIP_LEVELS,
+				.baseArrayLayer = 0,
+				.layerCount = 1,
+			},
+		};
+		VkDependencyInfo const depInfo {
+			.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+			.pNext = nullptr,
+			.dependencyFlags = 0,
+			.memoryBarrierCount = 0,
+			.pMemoryBarriers = nullptr,
+			.bufferMemoryBarrierCount = 0,
+			.pBufferMemoryBarriers = nullptr,
+			.imageMemoryBarrierCount = 1,
+			.pImageMemoryBarriers = &barrier,
+		};
+		vkCmdPipelineBarrier2(cmd, &depInfo);
+		vkEndCommandBuffer(cmd);
+		VkSubmitInfo const submitCi {
+			.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+			.pNext = nullptr,
+			.waitSemaphoreCount = 0,
+			.pWaitSemaphores = nullptr,
+			.pWaitDstStageMask = nullptr,
+			.commandBufferCount = 1,
+			.pCommandBuffers = &cmd,
+			.signalSemaphoreCount = 0,
+			.pSignalSemaphores = nullptr,
+		};
+		vkQueueSubmit(device.graphicsQueue, 1, &submitCi, VK_NULL_HANDLE);
+		vkQueueWaitIdle(device.graphicsQueue);
+		vkFreeCommandBuffers(device.vkDevice(), commandPool, 1, &cmd);
+	}
 }
 
 void Cull::shutdown(gfx::Device const & device) {
@@ -830,9 +1010,10 @@ static void bindPushConstants(
 	VkCommandBuffer commandBuffer,
 	VkPipelineLayout layout,
 	VkShaderStageFlagBits stages,
-	f32m44 const & viewProj
+	f32m44 const & viewProj,
+	f32v3 const & cameraForward,
+	f32v3 const & cameraPosWorld
 ) {
-	// { mat4 transform, uint modelIndex, vec4 boundingSphere, }
 	vkCmdPushConstants(
 		commandBuffer,
 		layout,
@@ -840,6 +1021,22 @@ static void bindPushConstants(
 		/*offset=*/ 0, // f32m44 alignment
 		/*size=*/ sizeof(viewProj),
 		&viewProj
+	);
+	vkCmdPushConstants(
+		commandBuffer,
+		layout,
+		stages,
+		/*offset=*/ offsetof(GpuPushConstant, cameraForward),
+		/*size=*/ sizeof(cameraForward),
+		&cameraForward
+	);
+	vkCmdPushConstants(
+		commandBuffer,
+		layout,
+		stages,
+		/*offset=*/ offsetof(GpuPushConstant, cameraPosWorld),
+		/*size=*/ sizeof(cameraPosWorld),
+		&cameraPosWorld
 	);
 	uint64_t const instanceCount = (uint64_t)sInstances.size();
 	vkCmdPushConstants(
@@ -895,7 +1092,9 @@ static void bindPushConstants(
 void Cull::update(
 	gfx::Device const & device,
 	VkCommandBuffer commandBuffer,
-	f32m44 const & viewProj
+	f32m44 const & viewProj,
+	f32v3 const & cameraForward,
+	f32v3 const & cameraPosWorld
 ) {
 	vkCmdFillBuffer(
 		commandBuffer,
@@ -937,8 +1136,42 @@ void Cull::update(
 	bindPushConstants(
 		commandBuffer,
 		sPipelineCompute.layout,
-		VK_SHADER_STAGE_COMPUTE_BIT, viewProj
+		VK_SHADER_STAGE_COMPUTE_BIT, viewProj,
+		/*cameraForward=*/ cameraForward,
+		/*cameraPosWorld=*/ cameraPosWorld
 	);
+	{
+		auto const descriptorImageInfo = VkDescriptorImageInfo{
+			.sampler = device.samplerNearest,
+			.imageView = sDepthPyramidImageView,
+			.imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+		};
+		auto const descriptorWrite = VkWriteDescriptorSet {
+			.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+			.pNext = nullptr,
+			.dstSet = VK_NULL_HANDLE,
+			.dstBinding = 0,
+			.dstArrayElement = 0,
+			.descriptorCount = 1,
+			.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+			.pImageInfo = &descriptorImageInfo,
+			.pBufferInfo = nullptr,
+			.pTexelBufferView = nullptr,
+		};
+		std::array<VkWriteDescriptorSet, 1> writes = {{
+			descriptorWrite,
+		}};
+		VkPushDescriptorSetInfo const pushDescriptorSetInfo {
+			.sType = VK_STRUCTURE_TYPE_PUSH_DESCRIPTOR_SET_INFO_KHR,
+			.pNext = nullptr,
+			.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+			.layout = sPipelineCompute.layout,
+			.set = 0,
+			.descriptorWriteCount = (uint32_t)writes.size(),
+			.pDescriptorWrites = writes.data(),
+		};
+		fnVkCmdPushDescriptorSet2KHR(commandBuffer, &pushDescriptorSetInfo);
+	}
 	vkCmdDispatch(
 		commandBuffer,
 		(sInstances.size()+127)/128,
@@ -994,7 +1227,9 @@ void Cull::update(
 void Cull::draw(
 	gfx::Device const & device,
 	VkCommandBuffer commandBuffer,
-	f32m44 const & viewProj
+	f32m44 const & viewProj,
+	f32v3 const & cameraForward,
+	f32v3 const & cameraPosWorld
 ) {
 	vkCmdBindPipeline(
 		commandBuffer,
@@ -1013,7 +1248,9 @@ void Cull::draw(
 		commandBuffer,
 		sPipeline.layout,
 		VK_SHADER_STAGE_VERTEX_BIT,
-		viewProj
+		viewProj,
+		cameraForward,
+		cameraPosWorld
 	);
 	vkCmdDrawIndexedIndirectCount(
 		commandBuffer,
@@ -1110,67 +1347,172 @@ void Cull::resolveDepth(
 		sPipelineComputeMip.pipeline
 	);
 
-	// bind descriptor push set for sampler+texture
-
-	auto const descriptorImageInfo = VkDescriptorImageInfo{
-		.sampler = device.samplerNearest,
-		.imageView = depthImageView,
-		.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-	};
-	auto const descriptorWrite = VkWriteDescriptorSet {
-		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-		.pNext = nullptr,
-		.dstSet = VK_NULL_HANDLE,
-		.dstBinding = 0,
-		.dstArrayElement = 0,
-		.descriptorCount = 1,
-		.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-		.pImageInfo = &descriptorImageInfo,
-		.pBufferInfo = nullptr,
-		.pTexelBufferView = nullptr,
-	};
-
-	auto const descriptorImageInfoMip = VkDescriptorImageInfo{
-		.sampler = VK_NULL_HANDLE,
-		.imageView = sDepthPyramidImageView,
-		.imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-	};
-	auto const descriptorWriteMip = VkWriteDescriptorSet {
-		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-		.pNext = nullptr,
-		.dstSet = VK_NULL_HANDLE,
-		.dstBinding = 1,
-		.dstArrayElement = 0,
-		.descriptorCount = 1,
-		.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-		.pImageInfo = &descriptorImageInfoMip,
-		.pBufferInfo = nullptr,
-		.pTexelBufferView = nullptr,
-	};
-
-	std::array<VkWriteDescriptorSet, 2> writes = {{
-		descriptorWrite, descriptorWriteMip
-	}};
-
-	VkPushDescriptorSetInfo const pushDescriptorSetInfo {
-		.sType = VK_STRUCTURE_TYPE_PUSH_DESCRIPTOR_SET_INFO_KHR,
-		.pNext = nullptr,
-		.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-		.layout = sPipelineComputeMip.layout,
-		.set = 0,
-		.descriptorWriteCount = (uint32_t)writes.size(),
-		.pDescriptorWrites = writes.data(),
-	};
-
-	fnVkCmdPushDescriptorSet2KHR(commandBuffer, &pushDescriptorSetInfo);
-
 	// emit dispatches
-	vkCmdDispatch(
-		commandBuffer,
-		(sDimensionWidth + 15) / 16,
-		(sDimensionHeight + 15) / 16,
-		1
-	);
+	{
+		{
+			auto const descriptorImageInfo = VkDescriptorImageInfo{
+				.sampler = device.samplerNearest,
+				.imageView = depthImageView,
+				.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			};
+			auto const descriptorWrite = VkWriteDescriptorSet {
+				.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+				.pNext = nullptr,
+				.dstSet = VK_NULL_HANDLE,
+				.dstBinding = 0,
+				.dstArrayElement = 0,
+				.descriptorCount = 1,
+				.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+				.pImageInfo = &descriptorImageInfo,
+				.pBufferInfo = nullptr,
+				.pTexelBufferView = nullptr,
+			};
+			auto const descriptorImageInfoMip = VkDescriptorImageInfo{
+				.sampler = VK_NULL_HANDLE,
+				.imageView = sDepthPyramidImageViewChain[0],
+				.imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+			};
+			auto const descriptorWriteMip = VkWriteDescriptorSet {
+				.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+				.pNext = nullptr,
+				.dstSet = VK_NULL_HANDLE,
+				.dstBinding = 1,
+				.dstArrayElement = 0,
+				.descriptorCount = 1,
+				.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+				.pImageInfo = &descriptorImageInfoMip,
+				.pBufferInfo = nullptr,
+				.pTexelBufferView = nullptr,
+			};
+			std::array<VkWriteDescriptorSet, 2> writes = {{
+				descriptorWrite, descriptorWriteMip
+			}};
+			VkPushDescriptorSetInfo const pushDescriptorSetInfo {
+				.sType = VK_STRUCTURE_TYPE_PUSH_DESCRIPTOR_SET_INFO_KHR,
+				.pNext = nullptr,
+				.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+				.layout = sPipelineComputeMip.layout,
+				.set = 0,
+				.descriptorWriteCount = (uint32_t)writes.size(),
+				.pDescriptorWrites = writes.data(),
+			};
+			fnVkCmdPushDescriptorSet2KHR(commandBuffer, &pushDescriptorSetInfo);
+		}
+
+		struct PushConstantData {
+			int selectedMipLevel;
+			int maxMipLevel;
+		} pushConstantData;
+
+		pushConstantData.maxMipLevel = sDimensionMipLevels;
+		pushConstantData.selectedMipLevel = 0;
+
+		vkCmdPushConstants(
+			commandBuffer,
+			sPipelineComputeMip.layout,
+			VK_SHADER_STAGE_COMPUTE_BIT,
+			/*offset=*/ 0,
+			/*size=*/ sizeof(PushConstantData),
+			&pushConstantData
+		);
+		vkCmdDispatch(
+			commandBuffer,
+			(sDimensionWidth + 15) / 16,
+			(sDimensionHeight + 15) / 16,
+			1
+		);
+		// remaining mips
+		for (size_t it = 1; it < sDimensionMipLevels; ++it) {
+			{
+				// bind the mipmap texture as sampler0
+				// and the next mip level as storage image1
+				auto const passDescriptorImageInfo = VkDescriptorImageInfo{
+					.sampler = device.samplerNearest,
+					.imageView = sDepthPyramidImageView,
+					.imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+				};
+				auto const passDescriptorWrite = VkWriteDescriptorSet {
+					.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+					.pNext = nullptr,
+					.dstSet = VK_NULL_HANDLE,
+					.dstBinding = 0,
+					.dstArrayElement = 0,
+					.descriptorCount = 1,
+					.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+					.pImageInfo = &passDescriptorImageInfo,
+					.pBufferInfo = nullptr,
+					.pTexelBufferView = nullptr,
+				};
+				auto const passDescriptorImageInfoMip = VkDescriptorImageInfo{
+					.sampler = VK_NULL_HANDLE,
+					.imageView = sDepthPyramidImageViewChain[it],
+					.imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+				};
+				auto const passDescriptorWriteMip = VkWriteDescriptorSet {
+					.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+					.pNext = nullptr,
+					.dstSet = VK_NULL_HANDLE,
+					.dstBinding = 1,
+					.dstArrayElement = 0,
+					.descriptorCount = 1,
+					.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+					.pImageInfo = &passDescriptorImageInfoMip,
+					.pBufferInfo = nullptr,
+					.pTexelBufferView = nullptr,
+				};
+				std::array<VkWriteDescriptorSet, 2> writes = {{
+					passDescriptorWrite, passDescriptorWriteMip
+				}};
+				VkPushDescriptorSetInfo const pushDescriptorSetInfo {
+					.sType = VK_STRUCTURE_TYPE_PUSH_DESCRIPTOR_SET_INFO_KHR,
+					.pNext = nullptr,
+					.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+					.layout = sPipelineComputeMip.layout,
+					.set = 0,
+					.descriptorWriteCount = (uint32_t)writes.size(),
+					.pDescriptorWrites = writes.data(),
+				};
+				fnVkCmdPushDescriptorSet2KHR(commandBuffer, &pushDescriptorSetInfo);
+			}
+			pushConstantData.selectedMipLevel = (int)it;
+			vkCmdPushConstants(
+				commandBuffer,
+				sPipelineComputeMip.layout,
+				VK_SHADER_STAGE_COMPUTE_BIT,
+				/*offset=*/ 0,
+				/*size=*/ sizeof(PushConstantData),
+				&pushConstantData
+			);
+			{
+				VkMemoryBarrier2 const barrier {
+					.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+					.pNext = nullptr,
+					.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+					.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT,
+					.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+					.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT,
+				};
+				VkDependencyInfo const depInfo {
+					.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+					.pNext = nullptr,
+					.dependencyFlags = 0,
+					.memoryBarrierCount = 1,
+					.pMemoryBarriers = &barrier,
+					.bufferMemoryBarrierCount = 0,
+					.pBufferMemoryBarriers = nullptr,
+					.imageMemoryBarrierCount = 0,
+					.pImageMemoryBarriers = nullptr,
+				};
+				vkCmdPipelineBarrier2(commandBuffer, &depInfo);
+			}
+			vkCmdDispatch(
+				commandBuffer,
+				(std::max(sDimensionWidth >> it, 1u) + 15) / 16,
+				(std::max(sDimensionHeight >> it, 1u) + 15) / 16,
+				1
+			);
+		}
+	}
 
 	// transition depth attachment back to depth attachment optimal
 	{
@@ -1217,8 +1559,8 @@ u32 Cull::totalInstanceCount() {
 	return (u32)sInstances.size();
 }
 
-VkImageView Cull::imageHiz() {
-	return sDepthPyramidImageView;
+std::vector<VkImageView> const & Cull::imageHiz() {
+	return sDepthPyramidImageViewRrrr;
 }
 
 void Cull::imageHizTransition(VkCommandBuffer const & commandBuffer) {

@@ -11,13 +11,17 @@ namespace Cull {
 	void update(
 		gfx::Device const & context,
 		VkCommandBuffer commandBuffer,
-		f32m44 const & viewProj
+		f32m44 const & viewProj,
+		f32v3 const & cameraForward,
+		f32v3 const & cameraPosWorld
 	);
 
 	void draw(
 		gfx::Device const & context,
 		VkCommandBuffer commandBuffer,
-		f32m44 const & viewProj
+		f32m44 const & viewProj,
+		f32v3 const & cameraForward,
+		f32v3 const & cameraPosWorld
 	);
 
 	void resolveDepth(
@@ -30,6 +34,6 @@ namespace Cull {
 	u32 lastVisibleCount();
 	u32 totalInstanceCount();
 
-	VkImageView imageHiz();
+	std::vector<VkImageView> const & imageHiz();
 	void imageHizTransition(VkCommandBuffer const & commandBuffer);
 }

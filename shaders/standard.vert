@@ -8,6 +8,8 @@
 
 layout(push_constant) uniform PushConstants {
 	mat4 viewProj;
+	vec3 cameraForward;
+	vec3 cameraPosWorld;
 	uint64_t instanceCount;
 	BufferVertexAttribute vertexBufferVas;
 	BufferInstance instanceBufferVa;
