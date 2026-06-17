@@ -1,0 +1,135 @@
+#version 450
+#extension GL_EXT_mesh_shader : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+
+// UV sphere: 5 lat bands x 8 lon slices
+// Vertices: top pole + 4 rings * 8 + bottom pole = 34
+// Triangles: 8 top fan + 3*16 mid quads + 8 bot fan = 64
+const uint kLatBands = 5u;
+const uint kLonBands = 8u;
+const uint kRings = kLatBands - 1u;
+const uint kVertCount = 2u + kRings * kLonBands;
+const uint kMidBands = kLatBands - 2u;
+const uint kMidStart = kLonBands;
+const uint kBotStart = kMidStart + kMidBands * kLonBands * 2u;
+const uint kTriCount = kLonBands + kMidBands * kLonBands * 2u + kLonBands;
+const uint kBotPole = kVertCount - 1u;
+const float kPI = 3.14159265f;
+const float kTwoPi = 6.28318530f;
+
+struct DebugSphere {
+	vec3 position;
+	float radius;
+};
+
+layout(buffer_reference, scalar) readonly buffer DebugSphereBuf {
+	DebugSphere data[];
+};
+
+layout(push_constant, scalar) uniform PC {
+	layout(offset = 128) uint64_t sphereVa;
+	layout(offset = 136) mat4 viewProj;
+	layout(offset = 200) uint startIdx;
+} pc;
+
+layout(local_size_x = 64) in;
+layout(triangles, max_vertices = 34, max_primitives = 64) out;
+
+layout(location = 0) out vec3 outNormal[];
+layout(location = 1) perprimitiveEXT flat out uint outSphereIdx[];
+
+void main() {
+	const uint sphereIdx = gl_WorkGroupID.x;
+	DebugSphereBuf buf = DebugSphereBuf(pc.sphereVa);
+	const DebugSphere sphere = buf.data[sphereIdx];
+
+	SetMeshOutputsEXT(kVertCount, kTriCount);
+
+	const uint tid = gl_LocalInvocationID.x;
+
+	// top and bottom poles written by tid 0
+	if (tid == 0u) {
+		const vec3 topNorm = vec3(0.0, 1.0, 0.0);
+		gl_MeshVerticesEXT[0u].gl_Position = (
+			pc.viewProj * vec4(
+				sphere.position + topNorm * sphere.radius, 1.0
+			)
+		);
+		outNormal[0u] = topNorm;
+		const vec3 botNorm = vec3(0.0, -1.0, 0.0);
+		gl_MeshVerticesEXT[kBotPole].gl_Position = (
+			pc.viewProj * vec4(
+				sphere.position + botNorm * sphere.radius, 1.0
+			)
+		);
+		outNormal[kBotPole] = botNorm;
+	}
+
+	// ring vertices: tid [0, kRings*kLonBands) -> vertex 1+tid
+	if (tid < kRings * kLonBands) {
+		const uint ring = tid / kLonBands;
+		const uint slice = tid % kLonBands;
+		const float phi = (
+			(float(ring + 1u) / float(kLatBands)) * kPI
+		);
+		const float theta = (float(slice) / float(kLonBands)) * kTwoPi;
+		const vec3 norm = vec3(
+			sin(phi) * cos(theta),
+			cos(phi),
+			sin(phi) * sin(theta)
+		);
+		const uint vIdx = 1u + tid;
+		gl_MeshVerticesEXT[vIdx].gl_Position = (
+			pc.viewProj * vec4(
+				sphere.position + norm * sphere.radius, 1.0
+			)
+		);
+		outNormal[vIdx] = norm;
+	}
+
+	// per-primitive sphere index for the frag shader
+	outSphereIdx[tid] = pc.startIdx + sphereIdx;
+
+	// top fan: tid [0, kLonBands)
+	if (tid < kLonBands) {
+		gl_PrimitiveTriangleIndicesEXT[tid] = uvec3(
+			0u,
+			1u + tid,
+			1u + (tid + 1u) % kLonBands
+		);
+	}
+
+	// middle quads: tid [kMidStart, kBotStart)
+	if (tid >= kMidStart && tid < kBotStart) {
+		const uint offset = tid - kMidStart;
+		const uint band = offset / (kLonBands * 2u);
+		const uint local = offset % (kLonBands * 2u);
+		const uint quad = local / 2u;
+		const uint triInQuad = local % 2u;
+		const uint ringBase = 1u + band * kLonBands;
+		const uint ringNext = ringBase + kLonBands;
+		const uint jNext = (quad + 1u) % kLonBands;
+		const uint tl = ringBase + quad;
+		const uint tr = ringBase + jNext;
+		const uint bl = ringNext + quad;
+		const uint br = ringNext + jNext;
+		if (triInQuad == 0u) {
+			gl_PrimitiveTriangleIndicesEXT[tid] = uvec3(tl, bl, tr);
+		} else {
+			gl_PrimitiveTriangleIndicesEXT[tid] = uvec3(tr, bl, br);
+		}
+	}
+
+	// bottom fan: tid [kBotStart, kTriCount)
+	if (tid >= kBotStart) {
+		const uint j = tid - kBotStart;
+		const uint lastRing = 1u + (kRings - 1u) * kLonBands;
+		gl_PrimitiveTriangleIndicesEXT[tid] = uvec3(
+			kBotPole,
+			lastRing + (j + 1u) % kLonBands,
+			lastRing + j
+		);
+	}
+}

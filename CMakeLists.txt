@@ -5,6 +5,12 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_COMPILE_WARNING_AS_ERROR ON)
 
+# CMake 4+ removed support for cmake_minimum_required versions < 3.5.
+# Allow FetchContent'd projects that still declare VERSION 3.x to configure.
+if(CMAKE_VERSION VERSION_GREATER_EQUAL "4.0")
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+endif()
+
 # ------------------------------------------------------------------------------
 # -- ccache
 # ------------------------------------------------------------------------------
@@ -59,6 +65,12 @@ FetchContent_Declare(
 	GIT_SHALLOW	TRUE
 )
 
+set(GLFW_BUILD_DOCS     OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+
+FetchContent_MakeAvailable(vk-bootstrap glfw vma)
+
 FetchContent_Declare(
 	imgui
 	GIT_REPOSITORY https://github.com/ocornut/imgui.git
@@ -66,17 +78,56 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(imgui)
 
-set(GLFW_BUILD_DOCS	 OFF CACHE BOOL "" FORCE)
-set(GLFW_BUILD_TESTS	OFF CACHE BOOL "" FORCE)
-set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+	cgltf
+	GIT_REPOSITORY https://github.com/jkuhlmann/cgltf.git
+	GIT_TAG        v1.14
+	GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(cgltf)
 
-FetchContent_MakeAvailable(vk-bootstrap glfw vma)
+FetchContent_Declare(
+	meshoptimizer
+	GIT_REPOSITORY https://github.com/zeux/meshoptimizer.git
+	GIT_TAG        v0.21
+	GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(meshoptimizer)
+
+FetchContent_Declare(
+	stb
+	GIT_REPOSITORY https://github.com/nothings/stb.git
+	GIT_TAG        master
+	GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(stb)
+
+FetchContent_Declare(
+	rapidjson
+	GIT_REPOSITORY https://github.com/Tencent/rapidjson.git
+	GIT_TAG        master
+	GIT_SHALLOW    TRUE
+)
+set(RAPIDJSON_BUILD_DOC      OFF CACHE BOOL "" FORCE)
+set(RAPIDJSON_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(RAPIDJSON_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(rapidjson)
 
 # ------------------------------------------------------------------------------
 # -- Vulkan
 # ------------------------------------------------------------------------------
 
 find_package(Vulkan REQUIRED)
+
+# ------------------------------------------------------------------------------
+# -- NVIDIA Aftermath (optional GPU crash dump support)
+# ------------------------------------------------------------------------------
+
+option(VKOF_AFTERMATH "Enable NVIDIA Aftermath GPU crash dumps" OFF)
+if(VKOF_AFTERMATH)
+	list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
+	find_package(Aftermath REQUIRED)
+endif()
 
 # ------------------------------------------------------------------------------
 # -- shader compilation
@@ -87,7 +138,7 @@ if(NOT GLSLANG)
 	message(FATAL_ERROR "glslangValidator not found")
 endif()
 
-set(SHADER_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
+set(SHADER_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/app/shaders)
 set(SHADER_BIN_DIR ${CMAKE_BINARY_DIR}/shaders)
 
 ## compile_shader(<output_var> <stage> <source_path>)
@@ -111,21 +162,55 @@ set(SHADER_BIN_DIR ${CMAKE_BINARY_DIR}/shaders)
 #add_custom_target(shaders ALL DEPENDS ${mesh_spv} ${frag_spv})
 
 # ------------------------------------------------------------------------------
-# -- cull executable
+# -- shared compile flags (interface library consumed by all three targets)
 # ------------------------------------------------------------------------------
 
-add_executable(
-	cull
-	app/main.cpp
-	app/gfx.cpp
-	app/cull.cpp
-	app/vma.cpp
-)
-#add_dependencies(cull shaders)
+add_library(cull_flags INTERFACE)
 
-target_sources(
-	cull
+target_compile_options(
+	cull_flags
+	INTERFACE
+	-Wextra
+	-Wpedantic
+	$<$<CONFIG:Debug>:-O0 -g3 -ggdb>
+	$<$<CONFIG:RelWithDebInfo>:-O2 -g3 -ggdb>
+	$<$<CONFIG:Release>:-O3>
+	${san_flags}
+)
+
+# ------------------------------------------------------------------------------
+# -- srat (non-graphics utility library)
+# ------------------------------------------------------------------------------
+
+add_library(
+	srat
+	STATIC
+	lib/srat/alloc-virtual-range.cpp
+	lib/srat/camera.cpp
+)
+
+target_include_directories(
+	srat
+	PUBLIC
+	lib/
+)
+
+target_link_libraries(
+	srat
 	PRIVATE
+	cull_flags
+)
+
+# ------------------------------------------------------------------------------
+# -- vkof (Vulkan object framework; depends on srat)
+# ------------------------------------------------------------------------------
+
+add_library(
+	vkof
+	STATIC
+	lib/vkof/vkof.cpp
+	lib/vkof/vma.cpp
+	lib/vkof/stb_image_write.cpp
 	${imgui_SOURCE_DIR}/imgui.cpp
 	${imgui_SOURCE_DIR}/imgui_draw.cpp
 	${imgui_SOURCE_DIR}/imgui_tables.cpp
@@ -134,9 +219,19 @@ target_sources(
 	${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
 )
 
+if(VKOF_AFTERMATH)
+	target_sources(vkof PRIVATE lib/vkof/aftermath.cpp)
+	target_compile_definitions(vkof PRIVATE VKOF_AFTERMATH)
+	target_link_libraries(vkof PRIVATE Aftermath::Aftermath)
+	install(FILES "${Aftermath_LIBRARY}" DESTINATION bin)
+endif()
+
 target_link_libraries(
-	cull
+	vkof
+	PUBLIC
+	srat
 	PRIVATE
+	cull_flags
 	Vulkan::Vulkan
 	vk-bootstrap::vk-bootstrap
 	glfw
@@ -144,20 +239,92 @@ target_link_libraries(
 )
 
 target_include_directories(
+	vkof
+	SYSTEM PUBLIC
+	${imgui_SOURCE_DIR}
+	SYSTEM PRIVATE
+	${vma_SOURCE_DIR}/include
+	${stb_SOURCE_DIR}
+)
+
+target_precompile_headers(
+	vkof
+	PRIVATE
+	<VkBootstrap.h>
+	<GLFW/glfw3.h>
+)
+
+set_source_files_properties(
+	${imgui_SOURCE_DIR}/imgui.cpp
+	${imgui_SOURCE_DIR}/imgui_draw.cpp
+	${imgui_SOURCE_DIR}/imgui_tables.cpp
+	${imgui_SOURCE_DIR}/imgui_widgets.cpp
+	${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+	${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
+	PROPERTIES SKIP_PRECOMPILE_HEADERS ON
+)
+
+# ------------------------------------------------------------------------------
+# -- mor (glTF scene loading + meshlet building; depends on srat + vkof)
+# ------------------------------------------------------------------------------
+
+add_library(mor STATIC lib/mor/mor.cpp lib/mor/stb_image.cpp)
+
+target_include_directories(mor PUBLIC lib/)
+target_include_directories(mor SYSTEM PRIVATE ${cgltf_SOURCE_DIR} ${stb_SOURCE_DIR})
+
+target_link_libraries(
+	mor
+	PUBLIC  srat vkof
+	PRIVATE cull_flags meshoptimizer
+)
+
+# ------------------------------------------------------------------------------
+# -- cull executable
+# ------------------------------------------------------------------------------
+
+add_executable(
+	cull
+	app/main.cpp
+	app/gfx.cpp
+	app/cull.cpp
+	app/asset_library.cpp
+	app/scene_desc.cpp
+)
+#add_dependencies(cull shaders)
+
+
+target_link_libraries(
+	cull
+	PRIVATE
+	cull_flags
+	srat
+	vkof
+	mor
+	Vulkan::Vulkan
+	vk-bootstrap::vk-bootstrap
+	glfw
+	GPUOpen::VulkanMemoryAllocator
+)
+
+target_compile_definitions(
+	cull
+	PRIVATE
+	ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets/"
+	$<$<BOOL:${VKOF_AFTERMATH}>:VKOF_AFTERMATH>
+)
+
+target_include_directories(
 	cull
 	SYSTEM PRIVATE
 	${vma_SOURCE_DIR}/include
-	${imgui_SOURCE_DIR}
+	${rapidjson_SOURCE_DIR}/include
 )
 
-target_compile_options(
+target_precompile_headers(
 	cull
-	PRIVATE
-	-Wextra -Wpedantic
-	$<$<CONFIG:Debug>:-O0 -g3 -ggdb>
-	$<$<CONFIG:RelWithDebInfo>:-O2 -g3 -ggdb>
-	$<$<CONFIG:Release>:-O3>
-	${san_flags}
+	REUSE_FROM
+	vkof
 )
 
 target_link_options(
@@ -167,14 +334,9 @@ target_link_options(
 	${san_link}
 )
 
-target_precompile_headers(
-	cull
-	PRIVATE
-	<vulkan/vulkan.hpp>
-	<VkBootstrap.h>
-	<vk_mem_alloc.h>
-	<GLFW/glfw3.h>
-)
+if(VKOF_AFTERMATH)
+	set_target_properties(cull PROPERTIES INSTALL_RPATH "$ORIGIN")
+endif()
 
 # copy compiled shaders next to the binary so relative paths work
 #add_custom_command(
@@ -194,3 +356,9 @@ install(
 #	DIRECTORY ${SHADER_BIN_DIR}/
 #	DESTINATION bin/shaders
 #)
+
+# ------------------------------------------------------------------------------
+# -- unit tests
+# ------------------------------------------------------------------------------
+
+add_subdirectory(unit-test)

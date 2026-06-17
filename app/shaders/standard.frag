@@ -10,5 +10,6 @@ void main() {
 		max(dot(normalize(inNormal), normalize(vec3(0.4f, 0.8f, 0.4f))), 0.1f)
 	);
 
-	outColor = vec4(inColor * dotWoNor, 1.0f);
+	// outColor = vec4(inColor * dotWoNor, 1.0f);
+	outColor = vec4(inColor, 1.0f);
 }

@@ -1,0 +1,8 @@
+docs/
+cmake/
+custom-vim.lua
+imgui.ini
+third-party/
+
+*nv-gpudmp
+*shaderinfo

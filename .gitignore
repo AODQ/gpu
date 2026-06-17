@@ -1,4 +1,13 @@
+assets/
+screenshots/
 build/
 install/
+.claude/
 .cache/
 *.spv
+third-party/aftermath/include/
+third-party/aftermath/lib/
+crashes/
+
+third-party/aftermath/include/
+third-party/aftermath/lib/

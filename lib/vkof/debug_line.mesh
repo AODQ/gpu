@@ -1,0 +1,40 @@
+#version 450
+#extension GL_EXT_mesh_shader : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+
+struct DebugVertex {
+	vec3 pos;
+	vec3 color;
+};
+
+layout(buffer_reference, scalar) readonly buffer DebugVertexBuf {
+	DebugVertex data[];
+};
+
+layout(push_constant, scalar) uniform PC {
+	layout(offset = 128) uint64_t vertexVa;
+	layout(offset = 136) mat4 viewProj;
+} pc;
+
+layout(local_size_x = 1) in;
+layout(lines, max_vertices = 2, max_primitives = 1) out;
+
+layout(location = 0) out vec3 outColor[];
+
+void main() {
+	const uint lineIdx = gl_WorkGroupID.x;
+	DebugVertexBuf buf = DebugVertexBuf(pc.vertexVa);
+	const DebugVertex a = buf.data[lineIdx * 2u];
+	const DebugVertex b = buf.data[lineIdx * 2u + 1u];
+
+	SetMeshOutputsEXT(2u, 1u);
+
+	gl_MeshVerticesEXT[0u].gl_Position = pc.viewProj * vec4(a.pos, 1.0);
+	gl_MeshVerticesEXT[1u].gl_Position = pc.viewProj * vec4(b.pos, 1.0);
+	outColor[0u] = a.color;
+	outColor[1u] = b.color;
+
+	gl_PrimitiveLineIndicesEXT[0u] = uvec2(0u, 1u);
+}

@@ -1,0 +1,75 @@
+direction: right
+
+# ── CPU buffers ─────────────────────────────────────────────────────────────
+
+cpu: CPU {
+  globalPC:   "GlobalPC\n(push constant root)\ntime, debugMode, viewProj, cameraPos"
+  drawPC:     "SceneDrawPC\n(push constant per-draw)\nmodelId, meshlets BDA, positions BDA\ninstances BDA, meshletVerts BDA\nmeshletTris BDA, modelMatrix"
+  resolvePC:  "ResolvePC\n(push constant)\nvisibilityImageHandle\noutputImageHandle\nmodels BDA"
+  modelsBuffer: "modelsBuffer\nModelDesc[]\nmeshlets BDA · materials BDA\n(one entry per loaded model)"
+}
+
+# ── GPU transient images ────────────────────────────────────────────────────
+
+images: GPU Transient Images {
+  visibilityTarget: "visibilityTarget\nr32ui  (double-buffered)\npacked: modelId[8] | meshletId[17] | triId[7]"
+  depthTarget:      "depthTarget\nd24_unorm_s8_uint  (double-buffered)"
+  colorTarget:      "colorTarget\nr8g8b8a8_unorm  (double-buffered)\ndebug visualization output"
+}
+
+# ── Per-model GPU buffers (uploaded via mor) ────────────────────────────────
+
+gpuBuffers: GPU Model Buffers (per model) {
+  meshletsBuf:  "MeshletBuf\nMeshlet[]\nvertexOffset, triangleOffset\nmaterialIndex, instanceIndex"
+  materialsBuf: "MaterialBuf\nMaterial[]\nbaseColor, textures, PBR params"
+  instancesBuf: "InstanceBuf\nInstance[]\ntransform, meshletOffset"
+  positionsBuf: "PositionBuf\nvec3[]"
+  meshletVertsBuf: "MeshletVertBuf\nu32[]"
+  meshletTrisBuf:  "MeshletTriBuf\nu8[]"
+}
+
+# ── Render nodes ─────────────────────────────────────────────────────────────
+
+visNode: drawNode (graphics) {
+  label: "scene.mesh + scene.frag\nDraw meshlets → visibility ID"
+}
+
+resolveNode: resolveNode (compute) {
+  label: "resolve.comp\nUnpack visibility → debug color"
+}
+
+swapchain: "Swapchain\n(finalImage blit)"
+
+# ── Data flow ────────────────────────────────────────────────────────────────
+
+cpu.globalPC    -> visNode:   "root push constant"
+cpu.drawPC      -> visNode:   "per-draw push constant"
+cpu.globalPC    -> resolveNode: "root push constant\n(debugMode)"
+cpu.resolvePC   -> resolveNode: "push constant"
+cpu.modelsBuffer -> resolveNode: "BDA via resolvePC.models"
+
+cpu.drawPC      -> gpuBuffers.meshletsBuf:     "meshlets BDA →"
+cpu.drawPC      -> gpuBuffers.positionsBuf:    "positions BDA →"
+cpu.drawPC      -> gpuBuffers.instancesBuf:    "instances BDA →"
+cpu.drawPC      -> gpuBuffers.meshletVertsBuf: "meshletVerts BDA →"
+cpu.drawPC      -> gpuBuffers.meshletTrisBuf:  "meshletTris BDA →"
+
+gpuBuffers.meshletsBuf     -> visNode: "indexed by gl_WorkGroupID"
+gpuBuffers.positionsBuf    -> visNode
+gpuBuffers.instancesBuf    -> visNode
+gpuBuffers.meshletVertsBuf -> visNode
+gpuBuffers.meshletTrisBuf  -> visNode
+
+visNode -> images.visibilityTarget: "color attachment\nwrite"
+visNode -> images.depthTarget:      "depth attachment\nwrite"
+
+images.visibilityTarget -> resolveNode: "storage image read\n(bindless slot)"
+resolveNode -> images.colorTarget:      "storage image write\n(bindless slot)"
+
+cpu.modelsBuffer -> gpuBuffers.meshletsBuf: "BDA stored in\nModelDesc.meshlets"
+cpu.modelsBuffer -> gpuBuffers.materialsBuf: "BDA stored in\nModelDesc.materials"
+
+gpuBuffers.meshletsBuf  -> resolveNode: "BDA lookup\nmaterialIndex / instanceIndex"
+gpuBuffers.materialsBuf -> resolveNode: "(available for future use)"
+
+images.colorTarget -> swapchain: "finalImage blit"
