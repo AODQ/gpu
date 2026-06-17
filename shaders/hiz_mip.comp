@@ -1,10 +1,14 @@
 #version 450 core
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : require
 layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(set = 0, binding = 0) uniform sampler2D textureDepthHiZ;
 layout(set = 0, binding = 1, r32f) uniform image2D imageHiZ;
 
-layout(push_constant) uniform PushConstants {
+layout(push_constant, scalar) uniform PushConstants {
 	int selectedMipLevel;
 	int maxMipLevel;
 } pc;

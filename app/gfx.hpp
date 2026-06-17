@@ -112,6 +112,56 @@ Frame frame_create(
 	CommandPool const & commandPool
 );
 
+struct Buffer {
+	VkBuffer buffer;
+	VmaAllocation allocation;
+	VkDeviceAddress virtualAddress;
+};
+
+Buffer buffer_create(
+	gfx::Device const & device,
+	VkDeviceSize const size,
+	VkBufferUsageFlags const usage,
+	VmaMemoryUsage const memoryUsage
+);
+
+Buffer buffer_create_with_data(
+	gfx::Device const & device,
+	VkDeviceSize const size,
+	VkBufferUsageFlags const usage,
+	VmaMemoryUsage const memoryUsage,
+	VkCommandPool const & commandPool,
+	void const * const data,
+	VkDeviceSize const dataSize
+);
+
+struct Image {
+	VkImage handle;
+	VmaAllocation allocation;
+	VkFormat format;
+	VkExtent2D extent;
+	u32 mipLevels;
+};
+
+Image image_create(
+	gfx::Device const & device,
+	VkExtent2D const extent,
+	VkFormat const format,
+	VkImageUsageFlags const usage,
+	VmaMemoryUsage const memoryUsage,
+	u32 const mipLevels = 1
+);
+void image_destroy(
+	gfx::Device const & device,
+	Image const & image
+);
+
+std::vector<VkImageView> image_create_mip_views(
+	gfx::Device const & device,
+	Image const & image,
+	VkComponentSwizzle const channelSwizzle = VK_COMPONENT_SWIZZLE_IDENTITY
+);
+
 
 // -- imgui
 void imgui_init(gfx::Device const & device);

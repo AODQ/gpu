@@ -6,10 +6,11 @@
 
 #include "shared.glsl"
 
-layout(push_constant) uniform PushConstants {
+layout(push_constant, scalar) uniform PushConstants {
 	mat4 viewProj;
 	vec3 cameraForward;
 	vec3 cameraPosWorld;
+	vec4 drawTintColor;
 	uint64_t instanceCount;
 	BufferVertexAttribute vertexBufferVas;
 	BufferInstance instanceBufferVa;
@@ -26,5 +27,5 @@ void main() {
 	const VertexAttribute attr = pc.vertexBufferVas.vertexAttributes[gl_VertexIndex];
 	gl_Position = pc.viewProj * instance.transform * vec4(attr.position, 1.0);
 	outNormal = attr.normal;
-	outColor = instance.color.xyz;
+	outColor = mix(instance.color.rgb, pc.drawTintColor.rgb, pc.drawTintColor.a);
 }

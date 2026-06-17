@@ -51,8 +51,9 @@ struct GpuModel {
 
 struct GpuPushConstant {
 	f32m44 viewProj;
-	alignas(16) f32v3 cameraForward;
-	alignas(16) f32v3 cameraPosWorld;
+	f32v3 cameraForward;
+	f32v3 cameraPosWorld;
+	f32v4 drawTintColor;
 	uint64_t instanceCount;
 	VkDeviceAddress vertexBufferVa;
 	VkDeviceAddress instanceBufferVa;
@@ -91,6 +92,8 @@ struct VertexAttribute {
 
 struct Model {
 	u32 modelIndex;
+
+	GpuModel gpuModel;
 };
 
 std::vector<Model> sModels;
@@ -525,6 +528,7 @@ void Cull::init(
 
 		sModels.emplace_back(Model {
 			.modelIndex = (u32)allModels.size() - 1,
+			.gpuModel = allModels.back(),
 		});
 	};
 
@@ -1012,7 +1016,8 @@ static void bindPushConstants(
 	VkShaderStageFlagBits stages,
 	f32m44 const & viewProj,
 	f32v3 const & cameraForward,
-	f32v3 const & cameraPosWorld
+	f32v3 const & cameraPosWorld,
+	f32v4 const & drawTintColor
 ) {
 	vkCmdPushConstants(
 		commandBuffer,
@@ -1037,6 +1042,14 @@ static void bindPushConstants(
 		/*offset=*/ offsetof(GpuPushConstant, cameraPosWorld),
 		/*size=*/ sizeof(cameraPosWorld),
 		&cameraPosWorld
+	);
+	vkCmdPushConstants(
+		commandBuffer,
+		layout,
+		stages,
+		/*offset=*/ offsetof(GpuPushConstant, drawTintColor),
+		/*size=*/ sizeof(drawTintColor),
+		&drawTintColor
 	);
 	uint64_t const instanceCount = (uint64_t)sInstances.size();
 	vkCmdPushConstants(
@@ -1138,7 +1151,8 @@ void Cull::update(
 		sPipelineCompute.layout,
 		VK_SHADER_STAGE_COMPUTE_BIT, viewProj,
 		/*cameraForward=*/ cameraForward,
-		/*cameraPosWorld=*/ cameraPosWorld
+		/*cameraPosWorld=*/ cameraPosWorld,
+		/*drawTintColor=*/ f32v4 { 1.0f, 1.0f, 1.0f, 0.0f }
 	);
 	{
 		auto const descriptorImageInfo = VkDescriptorImageInfo{
@@ -1250,8 +1264,35 @@ void Cull::draw(
 		VK_SHADER_STAGE_VERTEX_BIT,
 		viewProj,
 		cameraForward,
-		cameraPosWorld
+		cameraPosWorld,
+		/*drawTintColor=*/ f32v4 { 1.0f, 0.0f, 0.0f, 1.0f }
 	);
+
+	// when debugging, first draw everything. these will be red
+	for (size_t i = 0; i < sInstances.size(); ++i) {
+		auto const & instance = sInstances[i];
+		auto const & model = sModels[instance.modelIndex];
+		vkCmdDrawIndexed(
+			commandBuffer,
+			/*indexCount=*/ model.gpuModel.indexCount,
+			/*instanceCount=*/ 1,
+			/*firstIndex=*/ model.gpuModel.indexOffset,
+			/*vertexOffset=*/ model.gpuModel.vertexOffset,
+			/*firstInstance=*/ (u32)i
+		);
+	}
+
+		bindPushConstants(
+			commandBuffer,
+			sPipeline.layout,
+			VK_SHADER_STAGE_VERTEX_BIT,
+			viewProj,
+			cameraForward,
+			cameraPosWorld,
+			/*drawTintColor=*/ f32v4 { 1.0f, 1.0f, 1.0f, 0.0f }
+		);
+
+	// -- draw visible instances with indirect draw
 	vkCmdDrawIndexedIndirectCount(
 		commandBuffer,
 		/*buffer=*/ sIndirectDrawBuffer,

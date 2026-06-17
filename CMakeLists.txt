@@ -118,8 +118,10 @@ add_executable(
 	cull
 	app/main.cpp
 	app/gfx.cpp
+	app/srat/alloc-virtual-range.cpp
+	app/srat/vkof.cpp
 	app/cull.cpp
-	app/vma.cpp
+	app/srat/vma.cpp
 )
 #add_dependencies(cull shaders)
 
@@ -146,6 +148,7 @@ target_link_libraries(
 target_include_directories(
 	cull
 	SYSTEM PRIVATE
+	app/
 	${vma_SOURCE_DIR}/include
 	${imgui_SOURCE_DIR}
 )

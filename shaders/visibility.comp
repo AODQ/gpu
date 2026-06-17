@@ -8,10 +8,11 @@ layout(local_size_x = 128) in;
 
 #include "shared.glsl"
 
-layout(push_constant) uniform PushConstants {
+layout(push_constant, scalar) uniform PushConstants {
 	mat4 viewProj;
 	vec3 cameraForward;
 	vec3 cameraPosWorld;
+	vec4 drawTintColor;
 	uint64_t instanceCount;
 	uint64_t vertexBufferVas;
 	BufferInstance instanceBufferVa;
@@ -90,15 +91,14 @@ void main() {
 		// pick the correct mip level based on projected radius
 		// the sphere should cover about a texel to this mip level
 		const float projectedRadius = (instanceRadius * maxScale) / clipPos.w;
-		const float mipLevel = max(0.0f, log2(projectedRadius));
 		const float radiusTexels = (
 			  projectedRadius
 			* 0.5f
-			* float(textureSize(textureHiZ, 0).x) // sqr?
+			* float(textureSize(textureHiZ, 0).x)
 		);
-		const float mipLevelClamped = (
-			max(0.0f, ceil(log2(radiusTexels)))
-		);
+		const float mipLevel = ceil(log2(max(radiusTexels, 1.0f)));
+		#define MaxMipLevel 10.0f /* TODO PUSH CONSTANT THIS */
+		const float mipLevelClamped = clamp(mipLevel, 0.0f, float(MaxMipLevel));
 
 		// sample depth from HiZ
 		const vec3 nearestWorld = (
@@ -111,8 +111,15 @@ void main() {
 		}
 
 		const vec2 uv = ndcPos.xy * 0.5f + 0.5f;
-		const float hiZDepth = textureLod(textureHiZ, uv, mipLevelClamped).r;
-		if (sphereNearZ > hiZDepth) {
+		// agther 2x2 covering footprint
+		const float d0 = textureLod(textureHiZ, uv, mipLevel).r;
+		// offsets of one texel
+		const vec2 texel = 1.0f / vec2(textureSize(textureHiZ, int(mipLevel)));
+		const float d1 = textureLod(textureHiZ, uv + vec2(texel.x, 0), mipLevel).r;
+		const float d2 = textureLod(textureHiZ, uv + vec2(0, texel.y), mipLevel).r;
+		const float d3 = textureLod(textureHiZ, uv + texel, mipLevel).r;
+		const float occluderDepth = max(max(d0, d1), max(d2, d3));
+		if (sphereNearZ > occluderDepth) {
 			return;
 		}
 	}
