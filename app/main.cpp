@@ -9,7 +9,7 @@
 #include <cmath>
 #include <filesystem>
 
-#include <srat/vkof.hpp>
+#include <vkof/vkof.hpp>
 
 // inline f32v3 cross(f32v3 const a, f32v3 const b) {
 // 	return {

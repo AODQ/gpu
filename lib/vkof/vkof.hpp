@@ -1,9 +1,12 @@
+#pragma once
 #include <cstdint>
 
 #include <srat/core-array.hpp>
 #include <srat/core-types.hpp>
 
 #include <functional>
+
+struct GLFWwindow;
 
 // -----------------------------------------------------------------------------
 // -- pipeline
@@ -316,5 +319,25 @@ namespace vkof
 namespace vkof
 {
 	void init();
+	// Headless init: no window, no surface, no swapchain.
+	// Uses a fixed offscreen extent (default 512x512).
+	// render_graph_execute skips acquire/present in this mode.
+	void init_headless(u32 width = 512, u32 height = 512);
 	void shutdown();
+	GLFWwindow * window();
+}
+
+// -----------------------------------------------------------------------------
+// -- buffer (extended)
+// -----------------------------------------------------------------------------
+
+namespace vkof
+{
+	// GPU -> CPU blocking copy. Symmetric counterpart to buffer_upload.
+	struct BufferDownloadInfo {
+		Buffer buffer;
+		u64 byteOffset;
+		srat::slice<u8> dst;  // caller-owned destination slice
+	};
+	void buffer_download(BufferDownloadInfo const & info);
 }

@@ -6,7 +6,7 @@
 
 layout(local_size_x = 128) in;
 
-#include "shared.glsl"
+#include "../shared/shared.h"
 
 layout(push_constant, scalar) uniform PushConstants {
 	mat4 viewProj;

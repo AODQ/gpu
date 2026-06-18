@@ -5,6 +5,12 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_COMPILE_WARNING_AS_ERROR ON)
 
+# CMake 4+ removed support for cmake_minimum_required versions < 3.5.
+# Allow FetchContent'd projects that still declare VERSION 3.x to configure.
+if(CMAKE_VERSION VERSION_GREATER_EQUAL "4.0")
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+endif()
+
 # ------------------------------------------------------------------------------
 # -- ccache
 # ------------------------------------------------------------------------------
@@ -87,7 +93,7 @@ if(NOT GLSLANG)
 	message(FATAL_ERROR "glslangValidator not found")
 endif()
 
-set(SHADER_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
+set(SHADER_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/app/shaders)
 set(SHADER_BIN_DIR ${CMAKE_BINARY_DIR}/shaders)
 
 ## compile_shader(<output_var> <stage> <source_path>)
@@ -111,6 +117,84 @@ set(SHADER_BIN_DIR ${CMAKE_BINARY_DIR}/shaders)
 #add_custom_target(shaders ALL DEPENDS ${mesh_spv} ${frag_spv})
 
 # ------------------------------------------------------------------------------
+# -- shared compile flags (interface library consumed by all three targets)
+# ------------------------------------------------------------------------------
+
+add_library(cull_flags INTERFACE)
+
+target_compile_options(
+	cull_flags
+	INTERFACE
+	-Wextra
+	-Wpedantic
+	$<$<CONFIG:Debug>:-O0 -g3 -ggdb>
+	$<$<CONFIG:RelWithDebInfo>:-O2 -g3 -ggdb>
+	$<$<CONFIG:Release>:-O3>
+	${san_flags}
+)
+
+# ------------------------------------------------------------------------------
+# -- srat (non-graphics utility library)
+# ------------------------------------------------------------------------------
+
+add_library(
+	srat
+	STATIC
+	lib/srat/alloc-virtual-range.cpp
+)
+
+target_include_directories(
+	srat
+	PUBLIC
+	lib/
+)
+
+target_link_libraries(
+	srat
+	PRIVATE
+	cull_flags
+)
+
+# ------------------------------------------------------------------------------
+# -- vkof (Vulkan object framework; depends on srat)
+# ------------------------------------------------------------------------------
+
+add_library(
+	vkof
+	STATIC
+	lib/vkof/vkof.cpp
+	lib/vkof/vma.cpp
+)
+
+target_link_libraries(
+	vkof
+	PUBLIC
+	srat
+	PRIVATE
+	cull_flags
+	Vulkan::Vulkan
+	vk-bootstrap::vk-bootstrap
+	glfw
+	GPUOpen::VulkanMemoryAllocator
+)
+
+target_include_directories(
+	vkof
+	SYSTEM PRIVATE
+	${vma_SOURCE_DIR}/include
+	${imgui_SOURCE_DIR}
+)
+
+target_precompile_headers(
+	vkof
+	PRIVATE
+	<vulkan/vulkan.hpp>
+	<VkBootstrap.h>
+	<vk_mem_alloc.h>
+	<GLFW/glfw3.h>
+)
+
+# ------------------------------------------------------------------------------
 # -- cull executable
 # ------------------------------------------------------------------------------
 
@@ -118,10 +202,7 @@ add_executable(
 	cull
 	app/main.cpp
 	app/gfx.cpp
-	app/srat/alloc-virtual-range.cpp
-	app/srat/vkof.cpp
 	app/cull.cpp
-	app/srat/vma.cpp
 )
 #add_dependencies(cull shaders)
 
@@ -139,6 +220,9 @@ target_sources(
 target_link_libraries(
 	cull
 	PRIVATE
+	cull_flags
+	srat
+	vkof
 	Vulkan::Vulkan
 	vk-bootstrap::vk-bootstrap
 	glfw
@@ -148,19 +232,14 @@ target_link_libraries(
 target_include_directories(
 	cull
 	SYSTEM PRIVATE
-	app/
 	${vma_SOURCE_DIR}/include
 	${imgui_SOURCE_DIR}
 )
 
-target_compile_options(
+target_precompile_headers(
 	cull
-	PRIVATE
-	-Wextra -Wpedantic
-	$<$<CONFIG:Debug>:-O0 -g3 -ggdb>
-	$<$<CONFIG:RelWithDebInfo>:-O2 -g3 -ggdb>
-	$<$<CONFIG:Release>:-O3>
-	${san_flags}
+	REUSE_FROM
+	vkof
 )
 
 target_link_options(
@@ -168,15 +247,6 @@ target_link_options(
 	PRIVATE
 	-fuse-ld=mold
 	${san_link}
-)
-
-target_precompile_headers(
-	cull
-	PRIVATE
-	<vulkan/vulkan.hpp>
-	<VkBootstrap.h>
-	<vk_mem_alloc.h>
-	<GLFW/glfw3.h>
 )
 
 # copy compiled shaders next to the binary so relative paths work
@@ -197,3 +267,9 @@ install(
 #	DIRECTORY ${SHADER_BIN_DIR}/
 #	DESTINATION bin/shaders
 #)
+
+# ------------------------------------------------------------------------------
+# -- unit tests
+# ------------------------------------------------------------------------------
+
+add_subdirectory(unit-test)
