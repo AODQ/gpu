@@ -121,13 +121,7 @@ TEST_CASE("image: image_storage_handle non-zero") {
 	vkof::image_destroy(img);
 }
 
-// 9. image_swapchain() returns the sentinel handle (id == u64(-1))
-TEST_CASE("image: image_swapchain sentinel id") {
-	auto sc = vkof::image_swapchain();
-	CHECK(sc.id == static_cast<u64>(-1));
-}
-
-// 10. Small (1×1) image
+// 9. Small (1×1) image
 TEST_CASE("image: 1x1 image") {
 	auto img = vkof::image_create({
 		.width		  = 1,

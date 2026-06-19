@@ -2,10 +2,13 @@
 #include <srat/core-handle.hpp>
 
 #include <imgui.h>
+#include <backends/imgui_impl_glfw.h>
+#include <backends/imgui_impl_vulkan.h>
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 #include <vk_mem_alloc.h>
 
+#include <chrono>
 #include <unordered_map>
 #include <filesystem>
 
@@ -47,13 +50,17 @@ static VkImageView image_storage_view_for_mip(
 static char const * shader_stage_flag(ShaderStage const & stage);
 static CompileResult system_capture(char const * cmd);
 static VkShaderModule compile_and_load_shader_module(
-	std::string const & glslPath, ShaderStage stage
+	std::string const & glslPath,
+	ShaderStage stage,
+	std::vector<std::string> const & defines,
+	std::vector<std::string> const & includePaths
 );
 static bool file_changed(
 	std::string const & path,
 	std::filesystem::file_time_type const & lastWriteTime
 );
 static void pipeline_hot_reload();
+static void profiler_init();
 
 static VkFormat to_vk_format(vkof::ImageFormat format) {
 	switch (format) {
@@ -236,6 +243,8 @@ namespace
 
 		std::string pathFragment;
 		std::string pathMesh;
+		std::vector<std::string> defines;
+		std::vector<std::string> includePaths;
 
 		std::filesystem::file_time_type lastWriteTimeFragment;
 		std::filesystem::file_time_type lastWriteTimeMesh;
@@ -246,17 +255,36 @@ namespace
 		VkPipeline pipeline;
 		VkPipelineLayout layout;
 		std::string pathCompute;
+		std::vector<std::string> defines;
+		std::vector<std::string> includePaths;
 		std::filesystem::file_time_type lastWriteTimeCompute;
 	};
 
 	struct PerFrameData {
 		VkCommandBuffer cmdGraphics;
 		VkSemaphore semaphoreAcquire;
-		VkSemaphore semaphoreRender;
 		VkFence fence;
 	};
 
 	static constexpr u32 kFramesInFlight = 2;
+	static constexpr u32 kMaxProfiledNodes = 16;
+
+	struct NodeTiming {
+		double cpuMs { 0.0 };
+		double gpuMs { 0.0 };
+	};
+
+	struct Profiler {
+		VkQueryPool queryPool { VK_NULL_HANDLE };
+		double timestampPeriodMs { 0.0 };
+		bool gpuSupported { false };
+		// how many nodes ran in the last use of each frame slot (for readback)
+		std::array<u32, kFramesInFlight> slotNodeCounts {};
+		// stable display data: gpu updated on readback, cpu updated each frame
+		std::array<NodeTiming, kMaxProfiledNodes> timings {};
+		u32 displayCount { 0 };
+		u32 frameNodeCount { 0 };
+	};
 
 	struct ImplDevice {
 		GLFWwindow * window;
@@ -268,6 +296,7 @@ namespace
 		std::vector<VkImageView> swapchainImageViews;
 		std::vector<VkImage> swapchainDepthImages;
 		std::vector<VkImageView> swapchainDepthImageViews;
+		std::vector<VmaAllocation> swapchainDepthAllocs;
 		// non-null only in headless mode; holds the fake swapchain image allocations
 		VmaAllocation headlessSwapchainAlloc { VK_NULL_HANDLE };
 		VmaAllocation headlessDepthAlloc { VK_NULL_HANDLE };
@@ -287,6 +316,9 @@ namespace
 		// per-frame-in-flight sync primitives
 		std::array<PerFrameData, kFramesInFlight> frameData;
 		u32 frameIndex { 0 };
+		// per-swapchain-image render semaphores (must not be per-frame-slot;
+		// reusing before WSI releases them triggers VUID-vkQueueSubmit2-semaphore-03868)
+		std::vector<VkSemaphore> semaphoresRender;
 
 		srat::HandlePool<vkof::Image, ImplTexture> imagePool;
 		srat::HandlePool<vkof::Buffer, ImplBuffer> bufferPool;
@@ -303,6 +335,10 @@ namespace
 			commandBufferPool;
 		srat::HandlePool<vkof::RenderNode, ImplRenderNode>
 			renderNodePool;
+
+		VkDescriptorPool imguiDescriptorPool { VK_NULL_HANDLE };
+		bool imguiFrameActive { false };
+		Profiler profiler;
 
 		// need a linear list of pipeline handles for hot reload iteration
 		std::vector<vkof::Pipeline> pipelineGraphicsHandles {};
@@ -918,11 +954,6 @@ u64 vkof::image_storage_handle(ImageStorageHandleInfo const & info)
 	return u64(pfnGetImageViewHandleNVX(sDevice->device, &handleInfo));
 }
 
-vkof::Image vkof::image_swapchain()
-{
-	return vkof::Image { .id = u64(-1), };
-}
-
 // -----------------------------------------------------------------------------
 // -- transient resources
 // -----------------------------------------------------------------------------
@@ -1154,7 +1185,7 @@ void vkof::init()
 			.geometryShader = true,
 			.tessellationShader = true,
 			.sampleRateShading = true,
-			.dualSrcBlend = true,
+			.dualSrcBlend = false,
 			.logicOp = true,
 			.multiDrawIndirect = true,
 			.drawIndirectFirstInstance = true,
@@ -1162,20 +1193,20 @@ void vkof::init()
 			.depthBiasClamp = true,
 			.fillModeNonSolid = true,
 			.depthBounds = true,
-			.wideLines = true,
-			.largePoints = true,
+			.wideLines = false,
+			.largePoints = false,
 			.alphaToOne = true,
 			.multiViewport = true,
 			.samplerAnisotropy = true,
-			.textureCompressionETC2 = true,
-			.textureCompressionASTC_LDR = true,
-			.textureCompressionBC = true,
-			.occlusionQueryPrecise = true,
-			.pipelineStatisticsQuery = true,
+			.textureCompressionETC2 = false,
+			.textureCompressionASTC_LDR = false,
+			.textureCompressionBC = false,
+			.occlusionQueryPrecise = false,
+			.pipelineStatisticsQuery = false,
 			.vertexPipelineStoresAndAtomics = true,
 			.fragmentStoresAndAtomics = true,
-			.shaderTessellationAndGeometryPointSize = true,
-			.shaderImageGatherExtended = true,
+			.shaderTessellationAndGeometryPointSize = false,
+			.shaderImageGatherExtended = false,
 			.shaderStorageImageExtendedFormats = true,
 			.shaderStorageImageMultisample = true,
 			.shaderStorageImageReadWithoutFormat = true,
@@ -1184,13 +1215,13 @@ void vkof::init()
 			.shaderSampledImageArrayDynamicIndexing = true,
 			.shaderStorageBufferArrayDynamicIndexing = true,
 			.shaderStorageImageArrayDynamicIndexing = true,
-			.shaderClipDistance = true,
-			.shaderCullDistance = true,
+			.shaderClipDistance = false,
+			.shaderCullDistance = false,
 			.shaderFloat64 = true,
 			.shaderInt64 = true,
 			.shaderInt16 = true,
-			.shaderResourceResidency = true,
-			.shaderResourceMinLod = true,
+			.shaderResourceResidency = false,
+			.shaderResourceMinLod = false,
 			.sparseBinding = false,
 			.sparseResidencyBuffer = false,
 			.sparseResidencyImage2D = false,
@@ -1292,15 +1323,15 @@ void vkof::init()
 			vkb::PhysicalDeviceSelector(instance)
 			.set_surface(surface)
 			.add_required_extension(VK_EXT_MESH_SHADER_EXTENSION_NAME)
-			// .set_required_features(features)
-			// .add_required_extension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)
-			// .add_required_extension(VK_KHR_MAINTENANCE_6_EXTENSION_NAME)
-			// .add_required_extension(VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME)
-			// .add_required_extension_features(meshShaderFeatures)
-			// .add_required_extension_features(maintenance4Features)
-			// .add_required_extension_features(dynamicRenderingFeatures)
-			// .add_required_extension_features(synchronization2Features)
-			// .add_required_extension_features(vulkan12Features)
+			.set_required_features(features)
+			.add_required_extension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)
+			.add_required_extension(VK_KHR_MAINTENANCE_6_EXTENSION_NAME)
+			.add_required_extension(VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME)
+			.add_required_extension_features(meshShaderFeatures)
+			.add_required_extension_features(maintenance4Features)
+			.add_required_extension_features(dynamicRenderingFeatures)
+			.add_required_extension_features(synchronization2Features)
+			.add_required_extension_features(vulkan12Features)
 			.select()
 		);
 		if (!physicalDeviceResults) {
@@ -1310,7 +1341,6 @@ void vkof::init()
 			);
 			exit(1);
 		}
-		exit(0);
 		auto const deviceResults = (
 			vkb::DeviceBuilder(physicalDeviceResults.value()).build()
 		);
@@ -1354,6 +1384,7 @@ void vkof::init()
 			vkb::SwapchainBuilder(device)
 			.set_desired_present_mode(VK_PRESENT_MODE_FIFO_KHR)
 			.set_desired_extent(windowWidth, windowHeight)
+			.add_image_usage_flags(VK_IMAGE_USAGE_TRANSFER_DST_BIT)
 			.build()
 		);
 		if (!swapchainResults) {
@@ -1387,6 +1418,7 @@ void vkof::init()
 	}();
 
 	// -- depth swapchain images
+	std::vector<VmaAllocation> depthSwapchainAllocs(swapchain.image_count);
 	auto depthSwapchainImages = [&]() -> std::vector<VkImage> {
 		std::vector<VkImage> images(swapchain.image_count);
 		for (size_t i = 0; i < images.size(); ++i) {
@@ -1424,7 +1456,6 @@ void vkof::init()
 				.pUserData = nullptr,
 				.priority = 0.0f,
 			};
-			VmaAllocation allocation;
 			VkImage image;
 			VkAssert(
 				vmaCreateImage(
@@ -1432,7 +1463,7 @@ void vkof::init()
 					&imageCreateInfo,
 					&allocationCreateInfo,
 					&image,
-					&allocation,
+					&depthSwapchainAllocs[i],
 					nullptr
 				)
 			);
@@ -1551,6 +1582,7 @@ void vkof::init()
 		.swapchainImageViews = swapchain.get_image_views().value(),
 		.swapchainDepthImages = depthSwapchainImages,
 		.swapchainDepthImageViews = depthSwapchainImageViews,
+		.swapchainDepthAllocs = depthSwapchainAllocs,
 		.swapchainImageIndex = 0,
 		.commandPoolGraphics = commandPoolGraphics,
 		.commandPoolCompute = commandPoolCompute,
@@ -1561,6 +1593,7 @@ void vkof::init()
 		.allocator = allocator,
 		.frameData = {},  // populated below after pool setup
 		.frameIndex = 0,
+		.semaphoresRender = {},
 		.imagePool = (
 			srat::HandlePool<vkof::Image, ImplTexture>::create(1024)
 		),
@@ -1594,6 +1627,7 @@ void vkof::init()
 			srat::HandlePool<vkof::RenderNode, ImplRenderNode>
 				::create(64)
 		),
+		.profiler = {},
 	};
 
 	pfnGetImageViewHandleNVX = (
@@ -1643,16 +1677,67 @@ void vkof::init()
 				)
 			);
 			VkAssert(
-				vkCreateSemaphore(
-					sDevice->device, &sci, nullptr, &fd.semaphoreRender
-				)
-			);
-			VkAssert(
 				vkCreateFence(sDevice->device, &fci, nullptr, &fd.fence)
 			);
 		}
+		sDevice->semaphoresRender.resize(sDevice->swapchain.image_count);
+		for (VkSemaphore & sem : sDevice->semaphoresRender) {
+			VkAssert(vkCreateSemaphore(sDevice->device, &sci, nullptr, &sem));
+		}
 	}
 	sDevice->frameIndex = 0;
+
+	// -- imgui
+	ImGui::CreateContext();
+	ImGui_ImplGlfw_InitForVulkan(window, true);
+
+	VkDescriptorPoolSize const imguiPoolSize = {
+		.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+		.descriptorCount = 1,
+	};
+	VkDescriptorPoolCreateInfo const imguiPoolCi = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+		.pNext = nullptr,
+		.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+		.maxSets = 1,
+		.poolSizeCount = 1,
+		.pPoolSizes = &imguiPoolSize,
+	};
+	VkAssert(
+		vkCreateDescriptorPool(
+			sDevice->device, &imguiPoolCi, nullptr, &sDevice->imguiDescriptorPool
+		)
+	);
+
+	VkFormat const swapchainFormat = sDevice->swapchain.image_format;
+	VkPipelineRenderingCreateInfo const imguiRenderingCi = {
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+		.pNext = nullptr,
+		.viewMask = 0,
+		.colorAttachmentCount = 1,
+		.pColorAttachmentFormats = &swapchainFormat,
+		.depthAttachmentFormat = VK_FORMAT_UNDEFINED,
+		.stencilAttachmentFormat = VK_FORMAT_UNDEFINED,
+	};
+	ImGui_ImplVulkan_InitInfo imguiVkInfo = {};
+	imguiVkInfo.Instance = sDevice->instance.instance;
+	imguiVkInfo.PhysicalDevice = sDevice->device.physical_device;
+	imguiVkInfo.Device = sDevice->device.device;
+	imguiVkInfo.QueueFamily = (
+		sDevice->device.get_queue_index(vkb::QueueType::graphics).value()
+	);
+	imguiVkInfo.Queue = sDevice->queueGraphics;
+	imguiVkInfo.DescriptorPool = sDevice->imguiDescriptorPool;
+	imguiVkInfo.RenderPass = VK_NULL_HANDLE;
+	imguiVkInfo.MinImageCount = 2;
+	imguiVkInfo.ImageCount = (u32)sDevice->swapchainImages.size();
+	imguiVkInfo.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+	imguiVkInfo.UseDynamicRendering = true;
+	imguiVkInfo.PipelineRenderingCreateInfo = imguiRenderingCi;
+	ImGui_ImplVulkan_Init(&imguiVkInfo);
+	ImGui_ImplVulkan_CreateFontsTexture();
+
+	profiler_init();
 }
 
 void vkof::init_headless(u32 width, u32 height)
@@ -2089,6 +2174,7 @@ void vkof::init_headless(u32 width, u32 height)
 		.swapchainImageViews = { headlessColorView },
 		.swapchainDepthImages = { headlessDepthImage },
 		.swapchainDepthImageViews = { headlessDepthView },
+		.swapchainDepthAllocs = {},
 		.headlessSwapchainAlloc = headlessColorAlloc,
 		.headlessDepthAlloc = headlessDepthAlloc,
 		.swapchainImageIndex = 0,
@@ -2101,6 +2187,7 @@ void vkof::init_headless(u32 width, u32 height)
 		.allocator = allocator,
 		.frameData = {},
 		.frameIndex = 0,
+		.semaphoresRender = {},
 		.imagePool = (
 			srat::HandlePool<vkof::Image, ImplTexture>::create(1024)
 		),
@@ -2134,6 +2221,7 @@ void vkof::init_headless(u32 width, u32 height)
 			srat::HandlePool<vkof::RenderNode, ImplRenderNode>
 				::create(64)
 		),
+		.profiler = {},
 	};
 
 	pfnGetImageViewHandleNVX = (
@@ -2182,22 +2270,35 @@ void vkof::init_headless(u32 width, u32 height)
 				)
 			);
 			VkAssert(
-				vkCreateSemaphore(
-					sDevice->device, &sci, nullptr, &fd.semaphoreRender
-				)
-			);
-			VkAssert(
 				vkCreateFence(sDevice->device, &fci, nullptr, &fd.fence)
 			);
 		}
 	}
 	sDevice->frameIndex = 0;
+	profiler_init();
+}
+
+void vkof::device_wait_idle()
+{
+	vkDeviceWaitIdle(sDevice->device);
 }
 
 void vkof::shutdown()
 {
-	// wait for the GPU to finish before destroying anything
 	vkDeviceWaitIdle(sDevice->device);
+
+	if (sDevice->profiler.queryPool != VK_NULL_HANDLE) {
+		vkDestroyQueryPool(sDevice->device, sDevice->profiler.queryPool, nullptr);
+	}
+
+	if (sDevice->window != nullptr) {
+		ImGui_ImplVulkan_Shutdown();
+		ImGui_ImplGlfw_Shutdown();
+		ImGui::DestroyContext();
+		vkDestroyDescriptorPool(
+			sDevice->device, sDevice->imguiDescriptorPool, nullptr
+		);
+	}
 
 	// -- destroy transient resources (owned by the transient pools)
 	for (auto const & h : sDevice->transientImageCleanupHandles) {
@@ -2207,12 +2308,14 @@ void vkof::shutdown()
 		vkof::buffer_destroy(h);
 	}
 
-	// -- destroy per-frame sync primitives
+	// -- destroy per-frame and per-image sync primitives
 	// (command buffers are freed when commandPoolGraphics is destroyed)
 	for (auto & fd : sDevice->frameData) {
 		vkDestroySemaphore(sDevice->device, fd.semaphoreAcquire, nullptr);
-		vkDestroySemaphore(sDevice->device, fd.semaphoreRender, nullptr);
 		vkDestroyFence(sDevice->device, fd.fence, nullptr);
+	}
+	for (VkSemaphore sem : sDevice->semaphoresRender) {
+		vkDestroySemaphore(sDevice->device, sem, nullptr);
 	}
 
 	for (VkImageView view : sDevice->swapchainDepthImageViews) {
@@ -2234,10 +2337,12 @@ void vkof::shutdown()
 			sDevice->headlessSwapchainAlloc
 		);
 	} else {
-		// windowed: depth images were allocated without storing the VmaAllocation
-		// (existing behaviour — allocation handle is lost, VMA reports the leak)
-		for (VkImage image : sDevice->swapchainDepthImages) {
-			vmaDestroyImage(sDevice->allocator, image, VK_NULL_HANDLE);
+		for (size_t i = 0; i < sDevice->swapchainDepthImages.size(); ++i) {
+			vmaDestroyImage(
+				sDevice->allocator,
+				sDevice->swapchainDepthImages[i],
+				sDevice->swapchainDepthAllocs[i]
+			);
 		}
 	}
 
@@ -2283,7 +2388,10 @@ static VkPipeline build_compute_pipeline(
 )
 {
 	VkShaderModule const computeShaderModule = (
-		compile_and_load_shader_module(impl.pathCompute, ShaderStage::compute)
+		compile_and_load_shader_module(
+			impl.pathCompute, ShaderStage::compute,
+			impl.defines, impl.includePaths
+		)
 	);
 	if (computeShaderModule == VK_NULL_HANDLE) {
 		return VK_NULL_HANDLE;
@@ -2329,10 +2437,16 @@ static VkPipeline build_graphics_pipeline(
 {
 	// -- compile mesh + fragment from GLSL source
 	VkShaderModule const meshModule = (
-		compile_and_load_shader_module(impl.pathMesh, ShaderStage::mesh)
+		compile_and_load_shader_module(
+			impl.pathMesh, ShaderStage::mesh,
+			impl.defines, impl.includePaths
+		)
 	);
 	VkShaderModule const fragmentModule = (
-		compile_and_load_shader_module(impl.pathFragment, ShaderStage::fragment)
+		compile_and_load_shader_module(
+			impl.pathFragment, ShaderStage::fragment,
+			impl.defines, impl.includePaths
+		)
 	);
 	if (meshModule == VK_NULL_HANDLE || fragmentModule == VK_NULL_HANDLE) {
 		// keep-old-on-failure: bail before creating anything.
@@ -2558,16 +2672,33 @@ static CompileResult system_capture(char const * cmd) {
 // VK_NULL_HANDLE and leaves sLastCompileError set (caller decides whether
 // to keep the old pipeline or abort).
 static VkShaderModule compile_and_load_shader_module(
-	std::string const & glslPath, ShaderStage stage
+	std::string const & glslPath,
+	ShaderStage stage,
+	std::vector<std::string> const & defines,
+	std::vector<std::string> const & includePaths
 ) {
-	std::string const spvPath = glslPath + ".spv";
+	std::string const shaderDir = (
+		glslPath.substr(0, glslPath.rfind('/') + 1)
+	);
+	std::string const baseName = (
+		glslPath.substr(glslPath.rfind('/') + 1)
+	);
+	std::string const binDir = shaderDir + "bin";
+	std::string const spvPath = binDir + "/" + baseName + ".spv";
+	std::filesystem::create_directories(binDir);
 
-	std::string const cmd = (
+	std::string cmd = (
 		std::string("glslangValidator -S ")
 		+ shader_stage_flag(stage)
-		+ " --target-env vulkan1.3 -Ishaders/ -o "
-		+ spvPath + " " + glslPath
+		+ " --target-env vulkan1.3"
 	);
+	for (std::string const & d : defines) {
+		cmd += " -D" + d;
+	}
+	for (std::string const & p : includePaths) {
+		cmd += " -I" + p;
+	}
+	cmd += " -o " + spvPath + " " + glslPath;
 	CompileResult const result = system_capture(cmd.c_str());
 	if (result.exitCode != 0) {
 		printf(
@@ -2735,6 +2866,14 @@ vkof::Pipeline vkof::pipeline_graphics_create(
 
 		.pathFragment = createInfo.pathFragment,
 		.pathMesh = createInfo.pathMesh,
+		.defines = std::vector<std::string>(
+			createInfo.defines.ptr(),
+			createInfo.defines.ptr() + createInfo.defines.size()
+		),
+		.includePaths = std::vector<std::string>(
+			createInfo.includePaths.ptr(),
+			createInfo.includePaths.ptr() + createInfo.includePaths.size()
+		),
 
 		.lastWriteTimeFragment = file_write_time(createInfo.pathFragment),
 		.lastWriteTimeMesh = file_write_time(createInfo.pathMesh),
@@ -2742,7 +2881,7 @@ vkof::Pipeline vkof::pipeline_graphics_create(
 	implPipeline.pipeline = build_graphics_pipeline(implPipeline);
 	if (implPipeline.pipeline == VK_NULL_HANDLE) {
 		printf(
-			"failed to create graphics pipeline '%s/%s'\n",
+			"failed to create graphics pipeline '%s | %s'\n",
 			createInfo.pathMesh, createInfo.pathFragment
 		);
 		return vkof::Pipeline { .id = 0 };
@@ -2759,6 +2898,14 @@ vkof::Pipeline vkof::pipeline_compute_create(
 ) {
 	ImplPipelineCompute implPipeline;
 	implPipeline.pathCompute = createInfo.pathCompute;
+	implPipeline.defines = std::vector<std::string>(
+		createInfo.defines.ptr(),
+		createInfo.defines.ptr() + createInfo.defines.size()
+	);
+	implPipeline.includePaths = std::vector<std::string>(
+		createInfo.includePaths.ptr(),
+		createInfo.includePaths.ptr() + createInfo.includePaths.size()
+	);
 	implPipeline.layout = sDevice->pipelineLayoutUniversal;
 	implPipeline.pipeline = build_compute_pipeline(implPipeline);
 	if (implPipeline.pipeline == VK_NULL_HANDLE) {
@@ -2990,9 +3137,52 @@ GLFWwindow * vkof::window()
 	return sDevice->window;
 }
 
+void vkof::imgui_begin()
+{
+	ImGui_ImplVulkan_NewFrame();
+	ImGui_ImplGlfw_NewFrame();
+	ImGui::NewFrame();
+	sDevice->imguiFrameActive = true;
+}
+
+static void profiler_init()
+{
+	VkPhysicalDeviceProperties props;
+	vkGetPhysicalDeviceProperties(sDevice->physicalDevice, &props);
+
+	u32 qfCount = 0;
+	vkGetPhysicalDeviceQueueFamilyProperties(
+		sDevice->physicalDevice, &qfCount, nullptr
+	);
+	std::vector<VkQueueFamilyProperties> qfProps(qfCount);
+	vkGetPhysicalDeviceQueueFamilyProperties(
+		sDevice->physicalDevice, &qfCount, qfProps.data()
+	);
+
+	auto const gfxFamilyResult = sDevice->device.get_queue_index(vkb::QueueType::graphics);
+	if (!gfxFamilyResult.has_value()) { return; }
+	u32 const gfxFamily = gfxFamilyResult.value();
+	if (gfxFamily >= qfCount || qfProps[gfxFamily].timestampValidBits == 0) { return; }
+
+	VkQueryPoolCreateInfo const ci = {
+		.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+		.pNext = nullptr,
+		.flags = 0,
+		.queryType = VK_QUERY_TYPE_TIMESTAMP,
+		.queryCount = kMaxProfiledNodes * 2 * kFramesInFlight,
+		.pipelineStatistics = 0,
+	};
+	if (vkCreateQueryPool(sDevice->device, &ci, nullptr, &sDevice->profiler.queryPool) != VK_SUCCESS) {
+		return;
+	}
+	sDevice->profiler.timestampPeriodMs = (double)props.limits.timestampPeriod / 1e6;
+	sDevice->profiler.gpuSupported = true;
+}
+
 void vkof::render_graph_execute(RenderGraphExecuteInfo const & exec)
 {
-	auto & fd = sDevice->frameData[sDevice->frameIndex % kFramesInFlight];
+	u32 const frameSlot = sDevice->frameIndex % kFramesInFlight;
+	auto & fd = sDevice->frameData[frameSlot];
 
 	// -- wait for the previous use of this frame slot to finish
 	VkAssert(
@@ -3001,6 +3191,31 @@ void vkof::render_graph_execute(RenderGraphExecuteInfo const & exec)
 		)
 	);
 	VkAssert(vkResetFences(sDevice->device, 1, &fd.fence));
+
+	// -- read back GPU timestamps from the previous use of this frame slot
+	//    (fence above guarantees GPU is done, so results are available)
+	Profiler & prof = sDevice->profiler;
+	{
+		u32 const prevCount = prof.slotNodeCounts[frameSlot];
+		if (prof.gpuSupported && prevCount > 0) {
+			std::array<u64, kMaxProfiledNodes * 2> ts {};
+			VkResult const qr = vkGetQueryPoolResults(
+				sDevice->device, prof.queryPool,
+				frameSlot * kMaxProfiledNodes * 2, prevCount * 2,
+				prevCount * 2 * sizeof(u64), ts.data(),
+				sizeof(u64), VK_QUERY_RESULT_64_BIT
+			);
+			if (qr == VK_SUCCESS) {
+				for (u32 i = 0; i < prevCount; ++i) {
+					u64 const t0 = ts[i * 2 + 0];
+					u64 const t1 = ts[i * 2 + 1];
+					prof.timings[i].gpuMs = (double)(t1 - t0) * prof.timestampPeriodMs;
+				}
+			}
+		}
+		prof.displayCount = prevCount;
+		prof.frameNodeCount = 0;
+	}
 
 	// -- acquire the next swapchain image (windowed only)
 	if (sDevice->window != nullptr) {
@@ -3025,6 +3240,14 @@ void vkof::render_graph_execute(RenderGraphExecuteInfo const & exec)
 		.pInheritanceInfo = nullptr,
 	};
 	VkAssert(vkBeginCommandBuffer(cmd, &beginInfo));
+
+	// -- reset timestamp queries for this frame slot
+	if (prof.gpuSupported) {
+		vkCmdResetQueryPool(
+			cmd, prof.queryPool,
+			frameSlot * kMaxProfiledNodes * 2, kMaxProfiledNodes * 2
+		);
+	}
 
 	// -- root push constants go in the [0, 128) window
 	if (exec.rootPushconstant.size() > 0) {
@@ -3174,6 +3397,17 @@ void vkof::render_graph_execute(RenderGraphExecuteInfo const & exec)
 	for (auto const & nodeHandle : exec.nodes) {
 		auto const node = sDevice->renderNodePool.get(nodeHandle);
 		if (!node) { continue; }
+
+		u32 const nodeIdx = prof.frameNodeCount++;
+		bool const canProfile = prof.gpuSupported && nodeIdx < kMaxProfiledNodes;
+		auto const cpuT0 = std::chrono::steady_clock::now();
+
+		if (canProfile) {
+			vkCmdWriteTimestamp2(
+				cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+				prof.queryPool, frameSlot * kMaxProfiledNodes * 2 + nodeIdx * 2
+			);
+		}
 
 		// barrier between nodes (skip before the very first)
 		if (!firstNode) {
@@ -3363,9 +3597,168 @@ void vkof::render_graph_execute(RenderGraphExecuteInfo const & exec)
 		if (hasColor || hasDepth) {
 			vkCmdEndRendering(cmd);
 		}
+
+		if (canProfile) {
+			vkCmdWriteTimestamp2(
+				cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+				prof.queryPool, frameSlot * kMaxProfiledNodes * 2 + nodeIdx * 2 + 1
+			);
+		}
+		if (nodeIdx < kMaxProfiledNodes) {
+			prof.timings[nodeIdx].cpuMs = std::chrono::duration<double, std::milli>(
+				std::chrono::steady_clock::now() - cpuT0
+			).count();
+		}
 	}
 
+	prof.slotNodeCounts[frameSlot] = prof.frameNodeCount;
+
 	sDevice->commandBufferPool.free(cmdHandle);
+
+	if (sDevice->window != nullptr && exec.finalImage.id != 0) {
+		vkCmdPipelineBarrier2(cmd, &nodeBoundaryDep);
+
+		vkof::Image const srcImg = vkof::transient_image_get_image(exec.finalImage);
+		VkImage srcVkImage;
+		u32 srcW, srcH;
+		if (resolve_image(srcImg, srcVkImage, srcW, srcH)) {
+			VkImage const dstVkImage = (
+				sDevice->swapchainImages[sDevice->swapchainImageIndex]
+			);
+			u32 const copyW = sDevice->swapchain.extent.width;
+			u32 const copyH = sDevice->swapchain.extent.height;
+			VkImageCopy const region = {
+				.srcSubresource = VkImageSubresourceLayers {
+					.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+					.mipLevel = 0,
+					.baseArrayLayer = 0,
+					.layerCount = 1,
+				},
+				.srcOffset = { 0, 0, 0 },
+				.dstSubresource = VkImageSubresourceLayers {
+					.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+					.mipLevel = 0,
+					.baseArrayLayer = 0,
+					.layerCount = 1,
+				},
+				.dstOffset = { 0, 0, 0 },
+				.extent = { copyW, copyH, 1 },
+			};
+			vkCmdCopyImage(
+				cmd,
+				srcVkImage, VK_IMAGE_LAYOUT_GENERAL,
+				dstVkImage, VK_IMAGE_LAYOUT_GENERAL,
+				1, &region
+			);
+		}
+	}
+
+	if (sDevice->window != nullptr && sDevice->imguiFrameActive) {
+		sDevice->imguiFrameActive = false;
+		vkCmdPipelineBarrier2(cmd, &nodeBoundaryDep);
+
+		// -- profiler window
+		if (prof.displayCount > 0) {
+			ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f), ImGuiCond_FirstUseEver);
+			ImGui::Begin("profiler", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+			ImGui::Text("%-6s  %8s  %8s", "node", "cpu ms", "gpu ms");
+			ImGui::Separator();
+			for (u32 i = 0; i < prof.displayCount; ++i) {
+				NodeTiming const & t = prof.timings[i];
+				ImGui::Text("node %-2u  %8.3f  %8.3f", i, t.cpuMs, t.gpuMs);
+			}
+			ImGui::End();
+		}
+
+		// -- vma memory dashboard
+		{
+			VkPhysicalDeviceMemoryProperties memProps;
+			vkGetPhysicalDeviceMemoryProperties(
+				sDevice->physicalDevice, &memProps
+			);
+			VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+			vmaGetHeapBudgets(sDevice->allocator, budgets);
+
+			ImGui::SetNextWindowPos(ImVec2(10.0f, 150.0f), ImGuiCond_FirstUseEver);
+			ImGui::Begin("memory", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+			for (u32 i = 0; i < memProps.memoryHeapCount; ++i) {
+				VmaBudget const & b = budgets[i];
+				bool const isDevice = (
+					(
+						memProps.memoryHeaps[i].flags
+						& VK_MEMORY_HEAP_DEVICE_LOCAL_BIT
+					) != 0
+				);
+				f32 const usedMb = (f32)b.usage / (1024.0f * 1024.0f);
+				f32 const budgetMb = (f32)b.budget / (1024.0f * 1024.0f);
+				f32 const fraction = budgetMb > 0.0f ? usedMb / budgetMb : 0.0f;
+				ImGui::Text("heap %u  %s", i, isDevice ? "device" : "host");
+				ImGui::ProgressBar(fraction, ImVec2(180.0f, 0.0f));
+				ImGui::SameLine();
+				ImGui::Text("%.0f / %.0f MB", usedMb, budgetMb);
+				ImGui::Text(
+					"  allocs %u  blocks %u",
+					b.statistics.allocationCount, b.statistics.blockCount
+				);
+			}
+			ImGui::End();
+		}
+
+		// -- shader error overlay
+		if (!sLastCompileError.empty()) {
+			ImGui::SetNextWindowPos(ImVec2(10.0f, 400.0f), ImGuiCond_FirstUseEver);
+			ImGui::SetNextWindowSize(ImVec2(620.0f, 260.0f), ImGuiCond_FirstUseEver);
+			ImGui::PushStyleColor(
+				ImGuiCol_TitleBg, ImVec4(0.5f, 0.05f, 0.05f, 1.0f)
+			);
+			ImGui::PushStyleColor(
+				ImGuiCol_TitleBgActive, ImVec4(0.7f, 0.05f, 0.05f, 1.0f)
+			);
+			ImGui::Begin("shader error", nullptr, 0);
+			ImGui::PopStyleColor(2);
+			ImGui::TextUnformatted(sLastCompileError.c_str());
+			ImGui::End();
+		}
+
+		ImGui::Render();
+		ImDrawData * const imguiDrawData = ImGui::GetDrawData();
+
+		VkRenderingAttachmentInfo const imguiColorAtt = {
+			.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+			.pNext = nullptr,
+			.imageView = sDevice->swapchainImageViews[sDevice->swapchainImageIndex],
+			.imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+			.resolveMode = VK_RESOLVE_MODE_NONE,
+			.resolveImageView = VK_NULL_HANDLE,
+			.resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+			.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+			.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+			.clearValue = {},
+		};
+		VkRenderingInfo const imguiRenderingInfo = {
+			.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+			.pNext = nullptr,
+			.flags = 0,
+			.renderArea = VkRect2D {
+				.offset = { 0, 0 },
+				.extent = {
+					sDevice->swapchain.extent.width,
+					sDevice->swapchain.extent.height,
+				},
+			},
+			.layerCount = 1,
+			.viewMask = 0,
+			.colorAttachmentCount = 1,
+			.pColorAttachments = &imguiColorAtt,
+			.pDepthAttachment = nullptr,
+			.pStencilAttachment = nullptr,
+		};
+		vkCmdBeginRendering(cmd, &imguiRenderingInfo);
+		if (imguiDrawData) {
+			ImGui_ImplVulkan_RenderDrawData(imguiDrawData, cmd);
+		}
+		vkCmdEndRendering(cmd);
+	}
 
 	// -- transition swapchain GENERAL -> PRESENT_SRC (windowed only)
 	if (sDevice->window != nullptr) {
@@ -3421,10 +3814,13 @@ void vkof::render_graph_execute(RenderGraphExecuteInfo const & exec)
 			.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
 			.deviceIndex = 0,
 		};
+		VkSemaphore const renderSem = (
+			sDevice->semaphoresRender[sDevice->swapchainImageIndex]
+		);
 		VkSemaphoreSubmitInfo const signalInfo = {
 			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
 			.pNext = nullptr,
-			.semaphore = fd.semaphoreRender,
+			.semaphore = renderSem,
 			.value = 0,
 			.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
 			.deviceIndex = 0,
@@ -3449,7 +3845,7 @@ void vkof::render_graph_execute(RenderGraphExecuteInfo const & exec)
 			.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
 			.pNext = nullptr,
 			.waitSemaphoreCount = 1,
-			.pWaitSemaphores = &fd.semaphoreRender,
+			.pWaitSemaphores = &renderSem,
 			.swapchainCount = 1,
 			.pSwapchains = &sDevice->swapchain.swapchain,
 			.pImageIndices = &sDevice->swapchainImageIndex,

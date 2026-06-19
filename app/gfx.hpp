@@ -5,6 +5,7 @@
 
 #include <filesystem>
 #include <VkBootstrap.h>
+#include <vk_mem_alloc.h>
 
 using u8 = uint8_t;
 using u16 = uint16_t;

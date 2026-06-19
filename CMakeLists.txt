@@ -65,6 +65,12 @@ FetchContent_Declare(
 	GIT_SHALLOW	TRUE
 )
 
+set(GLFW_BUILD_DOCS     OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+
+FetchContent_MakeAvailable(vk-bootstrap glfw vma)
+
 FetchContent_Declare(
 	imgui
 	GIT_REPOSITORY https://github.com/ocornut/imgui.git
@@ -72,11 +78,21 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(imgui)
 
-set(GLFW_BUILD_DOCS	 OFF CACHE BOOL "" FORCE)
-set(GLFW_BUILD_TESTS	OFF CACHE BOOL "" FORCE)
-set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+	cgltf
+	GIT_REPOSITORY https://github.com/jkuhlmann/cgltf.git
+	GIT_TAG        v1.14
+	GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(cgltf)
 
-FetchContent_MakeAvailable(vk-bootstrap glfw vma)
+FetchContent_Declare(
+	meshoptimizer
+	GIT_REPOSITORY https://github.com/zeux/meshoptimizer.git
+	GIT_TAG        v0.21
+	GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(meshoptimizer)
 
 # ------------------------------------------------------------------------------
 # -- Vulkan
@@ -141,6 +157,7 @@ add_library(
 	srat
 	STATIC
 	lib/srat/alloc-virtual-range.cpp
+	lib/srat/camera.cpp
 )
 
 target_include_directories(
@@ -164,6 +181,12 @@ add_library(
 	STATIC
 	lib/vkof/vkof.cpp
 	lib/vkof/vma.cpp
+	${imgui_SOURCE_DIR}/imgui.cpp
+	${imgui_SOURCE_DIR}/imgui_draw.cpp
+	${imgui_SOURCE_DIR}/imgui_tables.cpp
+	${imgui_SOURCE_DIR}/imgui_widgets.cpp
+	${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+	${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
 )
 
 target_link_libraries(
@@ -180,18 +203,42 @@ target_link_libraries(
 
 target_include_directories(
 	vkof
+	SYSTEM PUBLIC
+	${imgui_SOURCE_DIR}
 	SYSTEM PRIVATE
 	${vma_SOURCE_DIR}/include
-	${imgui_SOURCE_DIR}
 )
 
 target_precompile_headers(
 	vkof
 	PRIVATE
-	<vulkan/vulkan.hpp>
 	<VkBootstrap.h>
-	<vk_mem_alloc.h>
 	<GLFW/glfw3.h>
+)
+
+set_source_files_properties(
+	${imgui_SOURCE_DIR}/imgui.cpp
+	${imgui_SOURCE_DIR}/imgui_draw.cpp
+	${imgui_SOURCE_DIR}/imgui_tables.cpp
+	${imgui_SOURCE_DIR}/imgui_widgets.cpp
+	${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+	${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
+	PROPERTIES SKIP_PRECOMPILE_HEADERS ON
+)
+
+# ------------------------------------------------------------------------------
+# -- mor (glTF scene loading + meshlet building; depends on srat + vkof)
+# ------------------------------------------------------------------------------
+
+add_library(mor STATIC lib/mor/mor.cpp)
+
+target_include_directories(mor PUBLIC lib/)
+target_include_directories(mor SYSTEM PRIVATE ${cgltf_SOURCE_DIR})
+
+target_link_libraries(
+	mor
+	PUBLIC  srat vkof
+	PRIVATE cull_flags meshoptimizer
 )
 
 # ------------------------------------------------------------------------------
@@ -206,16 +253,6 @@ add_executable(
 )
 #add_dependencies(cull shaders)
 
-target_sources(
-	cull
-	PRIVATE
-	${imgui_SOURCE_DIR}/imgui.cpp
-	${imgui_SOURCE_DIR}/imgui_draw.cpp
-	${imgui_SOURCE_DIR}/imgui_tables.cpp
-	${imgui_SOURCE_DIR}/imgui_widgets.cpp
-	${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
-	${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
-)
 
 target_link_libraries(
 	cull
@@ -223,17 +260,23 @@ target_link_libraries(
 	cull_flags
 	srat
 	vkof
+	mor
 	Vulkan::Vulkan
 	vk-bootstrap::vk-bootstrap
 	glfw
 	GPUOpen::VulkanMemoryAllocator
 )
 
+target_compile_definitions(
+	cull
+	PRIVATE
+	ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets/"
+)
+
 target_include_directories(
 	cull
 	SYSTEM PRIVATE
 	${vma_SOURCE_DIR}/include
-	${imgui_SOURCE_DIR}
 )
 
 target_precompile_headers(

@@ -51,10 +51,14 @@ namespace vkof
 		DepthTest depthTest;
 		CullMode cullMode;
 		BlendMode blendMode;
+		srat::slice<char const * const> defines {};
+		srat::slice<char const * const> includePaths {};
 	};
 
 	struct PipelineComputeCreateInfo {
 		char const * pathCompute;
+		srat::slice<char const * const> defines {};
+		srat::slice<char const * const> includePaths {};
 	};
 
 	Pipeline pipeline_graphics_create(
@@ -169,8 +173,7 @@ namespace vkof
 	};
 	u64 image_storage_handle(ImageStorageHandleInfo const & info);
 
-	// returns the swapchain image for current frame
-	Image image_swapchain();
+
 }
 
 // -----------------------------------------------------------------------------
@@ -202,13 +205,13 @@ namespace vkof
 	struct CmdCopyImage {
 		CommandBuffer cmd;
 		Image srcImage;
-		u32 srcBaseMipLevel;
-		u32 srcOffsetX;
-		u32 srcOffsetY;
+		u32 srcBaseMipLevel { 0 };
+		u32 srcOffsetX { 0 };
+		u32 srcOffsetY { 0 };
 		Image dstImage;
-		u32 dstBaseMipLevel;
-		u32 dstOffsetX;
-		u32 dstOffsetY;
+		u32 dstBaseMipLevel { 0 };
+		u32 dstOffsetX { 0 };
+		u32 dstOffsetY { 0 };
 		u32 width;
 		u32 height;
 	};
@@ -308,6 +311,8 @@ namespace vkof
 	struct RenderGraphExecuteInfo {
 		srat::slice<RenderNode const> nodes;
 		srat::slice<u8 const> rootPushconstant;
+		// if set, vkof copies this image to the swapchain before ImGui
+		TransientImage finalImage { 0 };
 	};
 	void render_graph_execute(RenderGraphExecuteInfo const & executeInfo);
 }
@@ -324,7 +329,12 @@ namespace vkof
 	// render_graph_execute skips acquire/present in this mode.
 	void init_headless(u32 width = 512, u32 height = 512);
 	void shutdown();
+	void device_wait_idle();
 	GLFWwindow * window();
+
+	// Call once per frame before building any ImGui widgets.
+	// render_graph_execute renders and presents the UI automatically.
+	void imgui_begin();
 }
 
 // -----------------------------------------------------------------------------

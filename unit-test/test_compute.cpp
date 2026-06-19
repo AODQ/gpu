@@ -63,9 +63,9 @@ TEST_CASE("compute: fill_u32 zero value") {
 	// Pre-fill with a sentinel so we can verify the zero-fill actually ran
 	std::vector<u32> sentinel(kCount, 0xDEADBEEFu);
 	vkof::buffer_upload({
-		.buffer	 = buf,
+		.buffer = buf,
 		.byteOffset = 0,
-		.data	   = srat::slice<u8 const>(
+		.data   = srat::slice<u8 const>(
 			reinterpret_cast<u8 const *>(sentinel.data()),
 			kCount * sizeof(u32)
 		),

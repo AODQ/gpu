@@ -26,6 +26,7 @@ add_executable(
 	test_compute.cpp
 	test_transient.cpp
 	test_rendernode.cpp
+	test_mor.cpp
 )
 
 # Bake the absolute path to the test shaders directory into the binary
@@ -47,6 +48,7 @@ target_link_libraries(
 	PRIVATE
 	cull_flags
 	vkof
+	mor
 	Vulkan::Vulkan
 	vk-bootstrap::vk-bootstrap
 	glfw

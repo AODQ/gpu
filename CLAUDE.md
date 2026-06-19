@@ -103,6 +103,7 @@ Tests use **doctest v2.4.11** and the `vkof::init_headless()` path — no window
 - **`enum struct`** for strongly-typed enums, not unscoped `enum`.
 - **`object oriented design`** avoid completely. Use free functions and POD with handles to hide implementation details.
 - **`alignment`** do not ever align parameters or struct fields, except in outstanding cases such as matrices which often have a natural column alignment.
+- **`comments`** never place a comment on the same line as code. comments always go on their own line, above the code they describe.
 - **`indent parameter blocks`** if a list of items -- for a function call, function signature, if statement, etc -- breaks into multiple lines, then break into a new line and indent the block. Do not ever align them.
 
 ### C++ idioms
