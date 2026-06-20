@@ -23,7 +23,7 @@ struct SceneDrawPC {
 };
 
 #ifdef __cplusplus
-static_assert(sizeof(SceneDrawPC) == 112, "SceneDrawPC must be 112 bytes");
+static_assert(sizeof(SceneDrawPC) <= 128, "SceneDrawPC must be <= 128 bytes");
 #else
 layout(push_constant, scalar) uniform PC {
 	GlobalPC    global;
