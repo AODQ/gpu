@@ -11,6 +11,10 @@
 
 #include <stb_image_write.h>
 
+#if defined(VKOF_AFTERMATH)
+#include "aftermath.hpp"
+#endif
+
 int vkof_write_png_uncompressed(
 	char const * path, int w, int h, int comp,
 	void const * data, int stride
@@ -21,11 +25,19 @@ int vkof_write_png_uncompressed(
 #include <filesystem>
 
 #define VkAssert(x) { \
-	if ((x != VK_SUCCESS)) { \
-		printf("assertion failed: %s [%d]\n", #x, x); \
+	VkResult const vkr_ = (x); \
+	if (vkr_ != VK_SUCCESS) { \
+		if (vkr_ == VK_ERROR_DEVICE_LOST) { \
+			vkof_aftermath_on_device_lost(); \
+		} \
+		printf("assertion failed: %s [%d]\n", #x, (int)vkr_); \
 		std::abort(); \
 	} \
 }
+
+#if !defined(VKOF_AFTERMATH)
+static void vkof_aftermath_on_device_lost() {}
+#endif
 
 // -----------------------------------------------------------------------------
 // -- shader probe
@@ -96,6 +108,7 @@ namespace {
 }
 
 static std::filesystem::file_time_type file_write_time(std::string const & p);
+
 static VkImageView image_storage_view_for_mip(
 	ImplTexture const & implTexture, u32 mipLevel
 );
@@ -116,6 +129,8 @@ static void profiler_init();
 
 static VkFormat to_vk_format(vkof::ImageFormat format) {
 	switch (format) {
+		case vkof::ImageFormat::r32ui:
+			return VK_FORMAT_R32_UINT;
 		case vkof::ImageFormat::r8g8b8a8_unorm:
 			return VK_FORMAT_R8G8B8A8_UNORM;
 		case vkof::ImageFormat::r8g8b8a8_srgb:
@@ -186,7 +201,10 @@ namespace
 	}
 
 	// usage depends on whether the format is depth or color
-	VkImageUsageFlags format_usage(VkPhysicalDevice const physicalDevice, VkFormat const format) {
+	VkImageUsageFlags format_usage(
+		VkPhysicalDevice const physicalDevice,
+		VkFormat const format
+	) {
 		VkImageUsageFlags usage = (
 			  VK_IMAGE_USAGE_SAMPLED_BIT
 			| VK_IMAGE_USAGE_TRANSFER_SRC_BIT
@@ -216,6 +234,7 @@ namespace
 		std::vector<VkImageView> imageViewPerMip;
 		u32 width;
 		u32 height;
+		VkFormat vkFormat;
 	};
 
 	struct ImplBuffer
@@ -353,7 +372,8 @@ namespace
 		std::vector<VkImage> swapchainDepthImages;
 		std::vector<VkImageView> swapchainDepthImageViews;
 		std::vector<VmaAllocation> swapchainDepthAllocs;
-		// non-null only in headless mode; holds the fake swapchain image allocations
+		// non-null only in headless mode;
+		//   holds the fake swapchain image allocations
 		VmaAllocation headlessSwapchainAlloc { VK_NULL_HANDLE };
 		VmaAllocation headlessDepthAlloc { VK_NULL_HANDLE };
 
@@ -372,8 +392,9 @@ namespace
 		// per-frame-in-flight sync primitives
 		std::array<PerFrameData, kFramesInFlight> frameData;
 		u32 frameIndex { 0 };
-		// per-swapchain-image render semaphores (must not be per-frame-slot;
-		// reusing before WSI releases them triggers VUID-vkQueueSubmit2-semaphore-03868)
+		// per-swapchain-image render semaphores. must not be per-frame-slot;
+		//   reusing before WSI releases them triggers
+		//   VUID-vkQueueSubmit2-semaphore-03868)
 		std::vector<VkSemaphore> semaphoresRender;
 
 		srat::HandlePool<vkof::Image, ImplTexture> imagePool;
@@ -404,6 +425,10 @@ namespace
 		std::vector<vkof::Image> transientImageCleanupHandles {};
 		std::vector<vkof::Buffer> transientBufferCleanupHandles {};
 
+#if defined(VKOF_AFTERMATH)
+		PFN_vkCmdSetCheckpointNV pfnCmdSetCheckpointNV { nullptr };
+		PFN_vkGetQueueCheckpointDataNV pfnGetQueueCheckpointDataNV { nullptr };
+#endif
 	};
 }
 static std::filesystem::file_time_type file_write_time(std::string const & p) {
@@ -415,13 +440,53 @@ static std::filesystem::file_time_type file_write_time(std::string const & p) {
 static ImplDevice * sDevice;
 
 static PFN_vkCmdDrawMeshTasksEXT pfnVkCmdDrawMeshTasksEXT;
+static PFN_vkSetDebugUtilsObjectNameEXT pfnSetDebugName;
+
+static void set_debug_name(
+	VkObjectType type,
+	u64 handle,
+	std::source_location const & loc
+) {
+	if (!pfnSetDebugName) { return; }
+	std::string const path = loc.file_name();
+	std::string const file = path.substr(path.rfind('/') + 1u);
+	std::string const name = file + ":" + std::to_string(loc.line());
+	VkDebugUtilsObjectNameInfoEXT const info = {
+		.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT,
+		.pNext = nullptr,
+		.objectType = type,
+		.objectHandle = handle,
+		.pObjectName = name.c_str(),
+	};
+	pfnSetDebugName(sDevice->device, &info);
+}
 
 static VkDescriptorSetLayout sBindlessSetLayout = VK_NULL_HANDLE;
 static VkDescriptorPool sBindlessPool = VK_NULL_HANDLE;
 static VkDescriptorSet sBindlessSet = VK_NULL_HANDLE;
 static u32 sBindlessSamplerNextSlot = 1u;
-static u32 sBindlessStorageNextSlot = 1u;
+static u32 sBindlessStorageUintNextSlot = 1u;
+static u32 sBindlessStorageFloatNextSlot = 1u;
 static constexpr u32 skBindlessMaxSlots = 65536u;
+// maps (TransientImage.id << 8 | mipLevel) -> allocated bindless slot
+static std::unordered_map<u64, u32> sTransientStorageSlotCache;
+
+static bool format_is_uint(VkFormat const fmt) {
+	switch (fmt) {
+		case VK_FORMAT_R32_UINT:
+		case VK_FORMAT_R32G32_UINT:
+		case VK_FORMAT_R32G32B32A32_UINT:
+		case VK_FORMAT_R16_UINT:
+		case VK_FORMAT_R16G16_UINT:
+		case VK_FORMAT_R16G16B16A16_UINT:
+		case VK_FORMAT_R8_UINT:
+		case VK_FORMAT_R8G8_UINT:
+		case VK_FORMAT_R8G8B8A8_UINT:
+			return true;
+		default:
+			return false;
+	}
+}
 
 static VkDescriptorSetLayout create_bindless_set_layout(VkDevice const device)
 {
@@ -440,6 +505,13 @@ static VkDescriptorSetLayout create_bindless_set_layout(VkDevice const device)
 			.stageFlags = VK_SHADER_STAGE_ALL,
 			.pImmutableSamplers = nullptr,
 		},
+		{
+			.binding = 2,
+			.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+			.descriptorCount = skBindlessMaxSlots,
+			.stageFlags = VK_SHADER_STAGE_ALL,
+			.pImmutableSamplers = nullptr,
+		},
 	};
 	VkDescriptorBindingFlags const bindingFlags[] = {
 		(
@@ -450,18 +522,24 @@ static VkDescriptorSetLayout create_bindless_set_layout(VkDevice const device)
 			VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT
 			| VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT
 		),
+		(
+			VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT
+			| VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT
+		),
 	};
 	VkDescriptorSetLayoutBindingFlagsCreateInfo const bindingFlagsInfo = {
-		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
+		.sType = (
+			VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO
+		),
 		.pNext = nullptr,
-		.bindingCount = 2u,
+		.bindingCount = 3u,
 		.pBindingFlags = bindingFlags,
 	};
 	VkDescriptorSetLayoutCreateInfo const ci = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
 		.pNext = &bindingFlagsInfo,
 		.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT,
-		.bindingCount = 2u,
+		.bindingCount = 3u,
 		.pBindings = bindings,
 	};
 	VkDescriptorSetLayout layout;
@@ -477,8 +555,9 @@ static void create_bindless_pool_and_set(VkDevice const device)
 			.descriptorCount = skBindlessMaxSlots,
 		},
 		{
+			// binding 1 (uint storage) + binding 2 (float storage)
 			.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-			.descriptorCount = skBindlessMaxSlots,
+			.descriptorCount = skBindlessMaxSlots * 2u,
 		},
 	};
 	VkDescriptorPoolCreateInfo const poolCi = {
@@ -506,7 +585,8 @@ static void create_bindless_pool_and_set(VkDevice const device)
 // -----------------------------------------------------------------------------
 
 vkof::Buffer vkof::buffer_create(
-	vkof::BufferCreateInfo const & ci
+	vkof::BufferCreateInfo const & ci,
+	std::source_location loc
 ) {
 	ImplBuffer implBuffer;
 	VkBufferCreateInfo const bufferCreateInfo = {
@@ -579,7 +659,13 @@ vkof::Buffer vkof::buffer_create(
 	implBuffer.mapped = (isHost ? allocationInfo.pMappedData : nullptr);
 	implBuffer.byteCount = ci.byteCount;
 
-	return sDevice->bufferPool.allocate(implBuffer);
+	vkof::Buffer const handle = sDevice->bufferPool.allocate(implBuffer);
+	set_debug_name(
+		VK_OBJECT_TYPE_BUFFER,
+		(u64)implBuffer.buffer,
+		loc
+	);
+	return handle;
 }
 
 void vkof::buffer_destroy(Buffer const & buffer)
@@ -833,7 +919,10 @@ void vkof::buffer_download(BufferDownloadInfo const & info)
 // -- image
 // -----------------------------------------------------------------------------
 
-vkof::Image vkof::image_create(vkof::ImageCreateInfo const & createInfo)
+vkof::Image vkof::image_create(
+	vkof::ImageCreateInfo const & createInfo,
+	std::source_location loc
+)
 {
 	ImplTexture implTexture;
 	VkFormat const vkFormat = to_vk_format(createInfo.format);
@@ -1099,7 +1188,15 @@ vkof::Image vkof::image_create(vkof::ImageCreateInfo const & createInfo)
 		vmaDestroyBuffer(sDevice->allocator, stagingBuffer, stagingAlloc);
 	}
 
-	return sDevice->imagePool.allocate(implTexture);
+	implTexture.vkFormat = vkFormat;
+
+	vkof::Image const handle = sDevice->imagePool.allocate(implTexture);
+	set_debug_name(
+		VK_OBJECT_TYPE_IMAGE,
+		(u64)implTexture.image,
+		loc
+	);
+	return handle;
 }
 
 void vkof::image_destroy(Image const & image)
@@ -1194,7 +1291,7 @@ void vkof::sampler_destroy(Sampler const & sampler)
 	}
 }
 
-u64 vkof::image_sampler_handle(ImageSamplerHandleInfo const & info)
+u32 vkof::image_sampler_handle(ImageSamplerHandleInfo const & info)
 {
 	auto const implTexture = sDevice->imagePool.get(info.image);
 	auto const implSampler = sDevice->samplerPool.get(info.sampler);
@@ -1222,7 +1319,7 @@ u64 vkof::image_sampler_handle(ImageSamplerHandleInfo const & info)
 		.pTexelBufferView = nullptr,
 	};
 	vkUpdateDescriptorSets(sDevice->device, 1u, &write, 0u, nullptr);
-	return u64(slot);
+	return slot;
 }
 
 static VkImageView image_storage_view_for_mip(
@@ -1235,7 +1332,7 @@ static VkImageView image_storage_view_for_mip(
 	return implTexture.imageViewPerMip[mipLevel];
 }
 
-u64 vkof::image_storage_handle(ImageStorageHandleInfo const & info)
+u32 vkof::image_storage_handle(ImageStorageHandleInfo const & info)
 {
 	auto const implTexture = sDevice->imagePool.get(info.image);
 	if (!implTexture) {
@@ -1248,7 +1345,12 @@ u64 vkof::image_storage_handle(ImageStorageHandleInfo const & info)
 		: image_storage_view_for_mip(*implTexture, info.mipLevel)
 	);
 
-	u32 const slot = sBindlessStorageNextSlot++;
+	bool const isUint = format_is_uint(implTexture->vkFormat);
+	u32 const binding = isUint ? 1u : 2u;
+	u32 & slotCounter = (
+		isUint ? sBindlessStorageUintNextSlot : sBindlessStorageFloatNextSlot
+	);
+	u32 const slot = slotCounter++;
 	VkDescriptorImageInfo const imageInfo = {
 		.sampler = VK_NULL_HANDLE,
 		.imageView = view,
@@ -1258,7 +1360,7 @@ u64 vkof::image_storage_handle(ImageStorageHandleInfo const & info)
 		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
 		.pNext = nullptr,
 		.dstSet = sBindlessSet,
-		.dstBinding = 1u,
+		.dstBinding = binding,
 		.dstArrayElement = slot,
 		.descriptorCount = 1u,
 		.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
@@ -1267,7 +1369,56 @@ u64 vkof::image_storage_handle(ImageStorageHandleInfo const & info)
 		.pTexelBufferView = nullptr,
 	};
 	vkUpdateDescriptorSets(sDevice->device, 1u, &write, 0u, nullptr);
-	return u64(slot);
+	return slot;
+}
+
+u32 vkof::transient_image_storage_handle(
+	TransientImageStorageHandleInfo const & info
+) {
+	vkof::Image const img = vkof::transient_image_get_image(info.image);
+	auto const implTexture = sDevice->imagePool.get(img);
+	if (!implTexture) { return 0u; }
+
+	VkImageView const view = (
+		info.mipLevel == 0u
+		? implTexture->imageViewFull
+		: image_storage_view_for_mip(*implTexture, info.mipLevel)
+	);
+	bool const isUint = format_is_uint(implTexture->vkFormat);
+	u32 const binding = isUint ? 1u : 2u;
+
+	u64 const cacheKey = (info.image.id << 8u) | u64(info.mipLevel);
+	auto const it = sTransientStorageSlotCache.find(cacheKey);
+	u32 slot;
+	if (it == sTransientStorageSlotCache.end()) {
+		u32 & slotCounter = (
+			isUint ? sBindlessStorageUintNextSlot : sBindlessStorageFloatNextSlot
+		);
+		slot = slotCounter++;
+		sTransientStorageSlotCache.emplace(cacheKey, slot);
+	} else {
+		slot = it->second;
+	}
+
+	VkDescriptorImageInfo const imageInfo = {
+		.sampler = VK_NULL_HANDLE,
+		.imageView = view,
+		.imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+	};
+	VkWriteDescriptorSet const write = {
+		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		.pNext = nullptr,
+		.dstSet = sBindlessSet,
+		.dstBinding = binding,
+		.dstArrayElement = slot,
+		.descriptorCount = 1u,
+		.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+		.pImageInfo = &imageInfo,
+		.pBufferInfo = nullptr,
+		.pTexelBufferView = nullptr,
+	};
+	vkUpdateDescriptorSets(sDevice->device, 1u, &write, 0u, nullptr);
+	return slot;
 }
 
 // -----------------------------------------------------------------------------
@@ -1277,17 +1428,24 @@ u64 vkof::image_storage_handle(ImageStorageHandleInfo const & info)
 vkof::TransientImage vkof::transient_image_create(
 	TransientImageCreateInfo const & createInfo
 ) {
-	u32 const w = (u32)(sDevice->swapchain.extent.width  * createInfo.scaleWidth);
-	u32 const h = (u32)(sDevice->swapchain.extent.height * createInfo.scaleHeight);
+	auto const w = (u32)(
+		sDevice->swapchain.extent.width  * createInfo.scaleWidth
+	);
+	auto const h = (u32)(
+		sDevice->swapchain.extent.height * createInfo.scaleHeight
+	);
 
-	ImplTransientImage impl;
-	impl.format         = createInfo.format;
-	impl.scaleWidth     = createInfo.scaleWidth;
-	impl.scaleHeight    = createInfo.scaleHeight;
-	impl.mipLevels      = createInfo.mipLevels;
-	impl.isDoubleBuffered = createInfo.isDoubleBuffered;
-	impl.handles[0] = { .id = 0 };
-	impl.handles[1] = { .id = 0 };
+	ImplTransientImage impl = {
+		.format = createInfo.format,
+		.scaleWidth = createInfo.scaleWidth,
+		.scaleHeight = createInfo.scaleHeight,
+		.mipLevels = createInfo.mipLevels,
+		.isDoubleBuffered = createInfo.isDoubleBuffered,
+		.handles = {
+			vkof::Image { .id = 0 },
+			vkof::Image { .id = 0 },
+		},
+	};
 
 	auto const allocSlot = [&](u32 slot) {
 		vkof::ImageCreateInfo const ci {
@@ -1415,10 +1573,18 @@ void vkof::render_node_attachment_color(
 	att.loadOp    = info.loadOp;
 	att.mipLevel  = info.mipLevel;
 	att.colorIndex = info.colorIndex;
-	att.clearColor[0] = (info.clearColor.size() > 0) ? info.clearColor.ptr()[0] : 0.0f;
-	att.clearColor[1] = (info.clearColor.size() > 1) ? info.clearColor.ptr()[1] : 0.0f;
-	att.clearColor[2] = (info.clearColor.size() > 2) ? info.clearColor.ptr()[2] : 0.0f;
-	att.clearColor[3] = (info.clearColor.size() > 3) ? info.clearColor.ptr()[3] : 1.0f;
+	att.clearColor[0] = (
+		(info.clearColor.size() > 0) ? info.clearColor.ptr()[0] : 0.0f
+	);
+	att.clearColor[1] = (
+		(info.clearColor.size() > 1) ? info.clearColor.ptr()[1] : 0.0f
+	);
+	att.clearColor[2] = (
+		(info.clearColor.size() > 2) ? info.clearColor.ptr()[2] : 0.0f
+	);
+	att.clearColor[3] = (
+		(info.clearColor.size() > 3) ? info.clearColor.ptr()[3] : 1.0f
+	);
 	node->colorAttachments.push_back(att);
 }
 
@@ -1431,7 +1597,9 @@ void vkof::render_node_attachment_depth(
 		.image      = info.image,
 		.loadOp     = info.loadOp,
 		.mipLevel   = info.mipLevel,
-		.clearDepth = (info.clearDepth.size() > 0) ? info.clearDepth.ptr()[0] : 1.0f,
+		.clearDepth = (
+			(info.clearDepth.size() > 0) ? info.clearDepth.ptr()[0] : 1.0f
+		),
 	};
 }
 
@@ -1446,42 +1614,58 @@ void vkof::render_node_callback(RenderNodeCallbackInfo const & info)
 // -- creation/destruction
 // -----------------------------------------------------------------------------
 
-void vkof::init()
+static void init_impl(
+	bool const isHeadless, u32 const & width, u32 const & height
+)
 {
-	glfwInit();
-	glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-	glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
-	u32 const windowWidth = 1280;
-	u32 const windowHeight = 720;
-	GLFWwindow * window = (
-		glfwCreateWindow(windowWidth, windowHeight, "vkof", nullptr, nullptr)
-	);
+#if defined(VKOF_AFTERMATH)
+	vkof_aftermath_enable();
+#endif
+
+	// -- window (windowed only)
+	GLFWwindow * window = nullptr;
+	if (!isHeadless) {
+		glfwInit();
+		glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+		glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
+		window = (
+			glfwCreateWindow(
+				(i32)width, (i32)height, "vkof", nullptr, nullptr
+			)
+		);
+	}
 
 	// -- instance
 	auto instance = [&]() -> vkb::Instance {
-		auto const instanceResults = (
-			vkb::InstanceBuilder()
-			.set_app_name("demo")
+		vkb::InstanceBuilder builder;
+		builder
+			.set_app_name(isHeadless ? "vkof-test" : "demo")
 			.request_validation_layers(true)
 			.set_debug_callback(debugMessengerCallback)
-			.add_debug_messenger_severity(VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT)
-			.add_validation_feature_enable(VK_VALIDATION_FEATURE_ENABLE_DEBUG_PRINTF_EXT)
-			.require_api_version(1, 3, 0)
-			.build()
-		);
-		if (!instanceResults) {
+			.add_debug_messenger_severity(
+				VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT
+			)
+			.add_validation_feature_enable(
+				VK_VALIDATION_FEATURE_ENABLE_DEBUG_PRINTF_EXT
+			)
+			.require_api_version(1, 3, 0);
+		if (isHeadless) {
+			builder.set_headless(true);
+		}
+		auto const r = builder.build();
+		if (!r) {
 			printf(
 				"failed to create instance: %s\n",
-				instanceResults.error().message().c_str()
+				r.error().message().c_str()
 			);
 			exit(1);
 		}
-		return instanceResults.value();
+		return r.value();
 	}();
 
-	// -- surface
-	auto const surface = [&]() -> VkSurfaceKHR {
-		VkSurfaceKHR surface;
+	// -- surface (windowed only)
+	VkSurfaceKHR surface = VK_NULL_HANDLE;
+	if (!isHeadless) {
 		VkAssert(
 			glfwCreateWindowSurface(
 				instance.instance,
@@ -1490,8 +1674,7 @@ void vkof::init()
 				&surface
 			)
 		);
-		return surface;
-	}();
+	}
 
 	// -- device
 	auto device = [&]() -> vkb::Device {
@@ -1637,9 +1820,15 @@ void vkof::init()
 			.shaderOutputLayer = VK_TRUE,
 			.subgroupBroadcastDynamicId = VK_TRUE,
 		};
-		auto const physicalDeviceResults = (
-			vkb::PhysicalDeviceSelector(instance)
-			.set_surface(surface)
+		vkb::PhysicalDeviceSelector selector(instance);
+		if (isHeadless) {
+			selector.defer_surface_initialization();
+			selector.require_present(false);
+		} else {
+			selector.set_surface(surface);
+		}
+		auto const physResult = (
+			selector
 			.add_required_extension(VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME)
 			.add_required_extension(VK_EXT_MESH_SHADER_EXTENSION_NAME)
 			.set_required_features(features)
@@ -1650,26 +1839,52 @@ void vkof::init()
 			.add_required_extension_features(dynamicRenderingFeatures)
 			.add_required_extension_features(synchronization2Features)
 			.add_required_extension_features(vulkan12Features)
+#if defined(VKOF_AFTERMATH)
+			.add_required_extension(
+				VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME
+			)
+			.add_required_extension(
+				VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME
+			)
+#endif
 			.select()
 		);
-		if (!physicalDeviceResults) {
+		if (!physResult) {
 			printf(
 				"failed to select physical device: %s\n",
-				physicalDeviceResults.error().message().c_str()
+				physResult.error().message().c_str()
 			);
 			exit(1);
 		}
-		auto const deviceResults = (
-			vkb::DeviceBuilder(physicalDeviceResults.value()).build()
+		vkb::DeviceBuilder devBuilder(physResult.value());
+#if defined(VKOF_AFTERMATH)
+		VkDeviceDiagnosticsConfigCreateInfoNV const diagnosticsConfigCi = {
+			.sType = (
+				VK_STRUCTURE_TYPE_DEVICE_DIAGNOSTICS_CONFIG_CREATE_INFO_NV
+			),
+			.pNext = nullptr,
+			.flags = (
+				VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_SHADER_DEBUG_INFO_BIT_NV |
+				VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_RESOURCE_TRACKING_BIT_NV |
+				VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_AUTOMATIC_CHECKPOINTS_BIT_NV |
+				VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_SHADER_ERROR_REPORTING_BIT_NV
+			),
+		};
+		devBuilder.add_pNext(
+			const_cast<VkDeviceDiagnosticsConfigCreateInfoNV *>(
+				&diagnosticsConfigCi
+			)
 		);
-		if (!deviceResults) {
+#endif
+		auto const devResult = devBuilder.build();
+		if (!devResult) {
 			printf(
 				"failed to create logical device: %s\n",
-				deviceResults.error().message().c_str()
+				devResult.error().message().c_str()
 			);
 			exit(1);
 		}
-		return deviceResults.value();
+		return devResult.value();
 	}();
 
 	// -- queues
@@ -1696,28 +1911,9 @@ void vkof::init()
 		return r.value();
 	}();
 
-	// -- swapchain (match the window size)
-	auto swapchain = [&]() -> vkb::Swapchain {
-		auto const swapchainResults = (
-			vkb::SwapchainBuilder(device)
-			.set_desired_present_mode(VK_PRESENT_MODE_FIFO_KHR)
-			.set_desired_extent(windowWidth, windowHeight)
-			.add_image_usage_flags(VK_IMAGE_USAGE_TRANSFER_DST_BIT)
-			.build()
-		);
-		if (!swapchainResults) {
-			printf(
-				"failed to create swapchain: %s\n",
-				swapchainResults.error().message().c_str()
-			);
-			exit(1);
-		}
-		return swapchainResults.value();
-	}();
-
 	// -- vma allocator
 	auto const allocator = [&]() -> VmaAllocator {
-		VmaAllocatorCreateInfo const allocatorCreateInfo = {
+		VmaAllocatorCreateInfo const allocatorCi = {
 			.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
 			.physicalDevice = device.physical_device,
 			.device = device.device,
@@ -1730,17 +1926,198 @@ void vkof::init()
 			.vulkanApiVersion = VK_API_VERSION_1_3,
 			.pTypeExternalMemoryHandleTypes = nullptr,
 		};
-		VmaAllocator allocator;
-		VkAssert(vmaCreateAllocator(&allocatorCreateInfo, &allocator));
-		return allocator;
+		VmaAllocator a;
+		VkAssert(vmaCreateAllocator(&allocatorCi, &a));
+		return a;
 	}();
 
-	// -- depth swapchain images
-	std::vector<VmaAllocation> depthSwapchainAllocs(swapchain.image_count);
-	auto depthSwapchainImages = [&]() -> std::vector<VkImage> {
-		std::vector<VkImage> images(swapchain.image_count);
-		for (size_t i = 0; i < images.size(); ++i) {
-			VkImageCreateInfo const imageCreateInfo = {
+	// -- swapchain + depth images
+	vkb::Swapchain swapchain;
+	std::vector<VkImage> swapchainImages;
+	std::vector<VkImageView> swapchainImageViews;
+	std::vector<VkImage> depthImages;
+	std::vector<VkImageView> depthImageViews;
+	std::vector<VmaAllocation> depthAllocs;
+	VmaAllocation headlessColorAlloc = {};
+	VmaAllocation headlessDepthAlloc = {};
+
+	if (isHeadless) {
+		swapchain.device = device.device;
+		swapchain.swapchain = VK_NULL_HANDLE;
+		swapchain.image_count = 1;
+		swapchain.image_format = VK_FORMAT_B8G8R8A8_UNORM;
+		swapchain.extent = VkExtent2D { width, height };
+
+		VkImage colorImage;
+		VkImageView colorView;
+		{
+			VkImageCreateInfo const imageCi = {
+				.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+				.pNext = nullptr,
+				.flags = 0,
+				.imageType = VK_IMAGE_TYPE_2D,
+				.format = VK_FORMAT_B8G8R8A8_UNORM,
+				.extent = VkExtent3D { width, height, 1 },
+				.mipLevels = 1,
+				.arrayLayers = 1,
+				.samples = VK_SAMPLE_COUNT_1_BIT,
+				.tiling = VK_IMAGE_TILING_OPTIMAL,
+				.usage = (
+					  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+					| VK_IMAGE_USAGE_SAMPLED_BIT
+					| VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+					| VK_IMAGE_USAGE_TRANSFER_DST_BIT
+					| VK_IMAGE_USAGE_STORAGE_BIT
+				),
+				.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+				.queueFamilyIndexCount = 0,
+				.pQueueFamilyIndices = nullptr,
+				.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+			};
+			VmaAllocationCreateInfo const allocCi = {
+				.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
+				.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+				.requiredFlags = 0,
+				.preferredFlags = 0,
+				.memoryTypeBits = 0,
+				.pool = nullptr,
+				.pUserData = nullptr,
+				.priority = 0.0f,
+			};
+			VkAssert(
+				vmaCreateImage(
+					allocator,
+					&imageCi,
+					&allocCi,
+					&colorImage,
+					&headlessColorAlloc,
+					nullptr
+				)
+			);
+			VkImageViewCreateInfo const viewCi = {
+				.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+				.pNext = nullptr,
+				.flags = 0,
+				.image = colorImage,
+				.viewType = VK_IMAGE_VIEW_TYPE_2D,
+				.format = VK_FORMAT_B8G8R8A8_UNORM,
+				.components = VkComponentMapping {
+					.r = VK_COMPONENT_SWIZZLE_IDENTITY,
+					.g = VK_COMPONENT_SWIZZLE_IDENTITY,
+					.b = VK_COMPONENT_SWIZZLE_IDENTITY,
+					.a = VK_COMPONENT_SWIZZLE_IDENTITY,
+				},
+				.subresourceRange = VkImageSubresourceRange {
+					.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+					.baseMipLevel = 0,
+					.levelCount = 1,
+					.baseArrayLayer = 0,
+					.layerCount = 1,
+				},
+			};
+			VkAssert(
+				vkCreateImageView(device.device, &viewCi, nullptr, &colorView)
+			);
+		}
+		swapchainImages = { colorImage };
+		swapchainImageViews = { colorView };
+
+		VkImage depthImage;
+		VkImageView depthView;
+		{
+			VkImageCreateInfo const imageCi = {
+				.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+				.pNext = nullptr,
+				.flags = 0,
+				.imageType = VK_IMAGE_TYPE_2D,
+				.format = VK_FORMAT_D32_SFLOAT,
+				.extent = VkExtent3D { width, height, 1 },
+				.mipLevels = 1,
+				.arrayLayers = 1,
+				.samples = VK_SAMPLE_COUNT_1_BIT,
+				.tiling = VK_IMAGE_TILING_OPTIMAL,
+				.usage = (
+					VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
+					| VK_IMAGE_USAGE_SAMPLED_BIT
+				),
+				.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+				.queueFamilyIndexCount = 0,
+				.pQueueFamilyIndices = nullptr,
+				.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+			};
+			VmaAllocationCreateInfo const allocCi = {
+				.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
+				.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+				.requiredFlags = 0,
+				.preferredFlags = 0,
+				.memoryTypeBits = 0,
+				.pool = nullptr,
+				.pUserData = nullptr,
+				.priority = 0.0f,
+			};
+			VkAssert(
+				vmaCreateImage(
+					allocator,
+					&imageCi,
+					&allocCi,
+					&depthImage,
+					&headlessDepthAlloc,
+					nullptr
+				)
+			);
+			VkImageViewCreateInfo const viewCi = {
+				.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+				.pNext = nullptr,
+				.flags = 0,
+				.image = depthImage,
+				.viewType = VK_IMAGE_VIEW_TYPE_2D,
+				.format = VK_FORMAT_D32_SFLOAT,
+				.components = VkComponentMapping {
+					.r = VK_COMPONENT_SWIZZLE_IDENTITY,
+					.g = VK_COMPONENT_SWIZZLE_IDENTITY,
+					.b = VK_COMPONENT_SWIZZLE_IDENTITY,
+					.a = VK_COMPONENT_SWIZZLE_IDENTITY,
+				},
+				.subresourceRange = VkImageSubresourceRange {
+					.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
+					.baseMipLevel = 0,
+					.levelCount = 1,
+					.baseArrayLayer = 0,
+					.layerCount = 1,
+				},
+			};
+			VkAssert(
+				vkCreateImageView(device.device, &viewCi, nullptr, &depthView)
+			);
+		}
+		depthImages = { depthImage };
+		depthImageViews = { depthView };
+	} else {
+		swapchain = [&]() -> vkb::Swapchain {
+			auto const r = (
+				vkb::SwapchainBuilder(device)
+				.set_desired_present_mode(VK_PRESENT_MODE_FIFO_KHR)
+				.set_desired_extent(width, height)
+				.add_image_usage_flags(VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+				.build()
+			);
+			if (!r) {
+				printf(
+					"failed to create swapchain: %s\n",
+					r.error().message().c_str()
+				);
+				exit(1);
+			}
+			return r.value();
+		}();
+		swapchainImages = swapchain.get_images().value();
+		swapchainImageViews = swapchain.get_image_views().value();
+
+		depthAllocs.resize(swapchain.image_count);
+		depthImages.resize(swapchain.image_count);
+		depthImageViews.resize(swapchain.image_count);
+		for (size_t i = 0; i < depthImages.size(); ++i) {
+			VkImageCreateInfo const imageCi = {
 				.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
 				.pNext = nullptr,
 				.flags = 0,
@@ -1764,7 +2141,7 @@ void vkof::init()
 				.pQueueFamilyIndices = nullptr,
 				.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 			};
-			VmaAllocationCreateInfo const allocationCreateInfo = {
+			VmaAllocationCreateInfo const allocCi = {
 				.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
 				.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
 				.requiredFlags = 0,
@@ -1774,29 +2151,21 @@ void vkof::init()
 				.pUserData = nullptr,
 				.priority = 0.0f,
 			};
-			VkImage image;
 			VkAssert(
 				vmaCreateImage(
 					allocator,
-					&imageCreateInfo,
-					&allocationCreateInfo,
-					&image,
-					&depthSwapchainAllocs[i],
+					&imageCi,
+					&allocCi,
+					&depthImages[i],
+					&depthAllocs[i],
 					nullptr
 				)
 			);
-			images[i] = image;
-		}
-		return images;
-	}();
-	auto depthSwapchainImageViews = [&]() -> std::vector<VkImageView> {
-		std::vector<VkImageView> imageViews(depthSwapchainImages.size());
-		for (size_t i = 0; i < imageViews.size(); ++i) {
-			VkImageViewCreateInfo const imageViewCreateInfo = {
+			VkImageViewCreateInfo const viewCi = {
 				.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
 				.pNext = nullptr,
 				.flags = 0,
-				.image = depthSwapchainImages[i],
+				.image = depthImages[i],
 				.viewType = VK_IMAGE_VIEW_TYPE_2D,
 				.format = VK_FORMAT_D32_SFLOAT,
 				.components = VkComponentMapping {
@@ -1815,20 +2184,16 @@ void vkof::init()
 			};
 			VkAssert(
 				vkCreateImageView(
-					device.device,
-					&imageViewCreateInfo,
-					nullptr,
-					&imageViews[i]
+					device.device, &viewCi, nullptr, &depthImageViews[i]
 				)
 			);
 		}
-		return imageViews;
-	}();
+	}
 
-	// -- comand pool
+	// -- command pools
 	VkCommandPool commandPoolGraphics;
 	{
-		VkCommandPoolCreateInfo const commandPoolCreateInfo = {
+		VkCommandPoolCreateInfo const ci = {
 			.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
 			.pNext = nullptr,
 			.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
@@ -1837,18 +2202,13 @@ void vkof::init()
 			),
 		};
 		VkAssert(
-			vkCreateCommandPool(
-				device.device,
-				&commandPoolCreateInfo,
-				nullptr,
-				&commandPoolGraphics
-			)
+			vkCreateCommandPool(device.device, &ci, nullptr, &commandPoolGraphics)
 		);
 	}
 
 	VkCommandPool commandPoolCompute;
 	{
-		VkCommandPoolCreateInfo const commandPoolCreateInfo = {
+		VkCommandPoolCreateInfo const ci = {
 			.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
 			.pNext = nullptr,
 			.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
@@ -1857,23 +2217,19 @@ void vkof::init()
 			),
 		};
 		VkAssert(
-			vkCreateCommandPool(
-				device.device,
-				&commandPoolCreateInfo,
-				nullptr,
-				&commandPoolCompute
-			)
+			vkCreateCommandPool(device.device, &ci, nullptr, &commandPoolCompute)
 		);
 	}
 
 	sBindlessSetLayout = create_bindless_set_layout(device.device);
 
-	VkPushConstantRange universalPushConstantRange {
+	// [0,128) = root/frame constants; [128,256) = per-draw
+	VkPushConstantRange const universalPushConstantRange = {
 		.stageFlags = VK_SHADER_STAGE_ALL,
 		.offset = 0,
-		.size = 256, // [0,128) = root/frame constants; [128,256) = per-draw
+		.size = 256,
 	};
-	VkPipelineLayoutCreateInfo const universalPipelineLayoutCreateInfo = {
+	VkPipelineLayoutCreateInfo const universalPipelineLayoutCi = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
 		.pNext = nullptr,
 		.flags = 0,
@@ -1886,8 +2242,8 @@ void vkof::init()
 	VkAssert(
 		vkCreatePipelineLayout(
 			device.device,
-			/*createInfo=*/ &universalPipelineLayoutCreateInfo,
-			/*allocator=*/ nullptr,
+			&universalPipelineLayoutCi,
+			nullptr,
 			&pipelineLayoutUniversal
 		)
 	);
@@ -1898,12 +2254,14 @@ void vkof::init()
 		.physicalDevice = device.physical_device,
 		.device = device,
 		.swapchain = swapchain,
-		.swapchainImages = swapchain.get_images().value(),
-		.swapchainImageViews = swapchain.get_image_views().value(),
-		.swapchainDepthImages = depthSwapchainImages,
-		.swapchainDepthImageViews = depthSwapchainImageViews,
-		.swapchainDepthAllocs = depthSwapchainAllocs,
-		.swapchainImageIndex = 0,
+		.swapchainImages = swapchainImages,
+		.swapchainImageViews = swapchainImageViews,
+		.swapchainDepthImages = depthImages,
+		.swapchainDepthImageViews = depthImageViews,
+		.swapchainDepthAllocs = depthAllocs,
+		.headlessSwapchainAlloc = headlessColorAlloc,
+		.headlessDepthAlloc = headlessDepthAlloc,
+		.swapchainImageIndex = 0u,
 		.commandPoolGraphics = commandPoolGraphics,
 		.commandPoolCompute = commandPoolCompute,
 		.pipelineLayoutUniversal = pipelineLayoutUniversal,
@@ -1911,8 +2269,8 @@ void vkof::init()
 		.queueGraphics = graphicsQueue,
 		.queueCompute = computeQueue,
 		.allocator = allocator,
-		.frameData = {},  // populated below after pool setup
-		.frameIndex = 0,
+		.frameData = {},
+		.frameIndex = 0u,
 		.semaphoresRender = {},
 		.imagePool = (
 			srat::HandlePool<vkof::Image, ImplTexture>::create(1024)
@@ -1958,6 +2316,35 @@ void vkof::init()
 			"vkCmdDrawMeshTasksEXT"
 		)
 	);
+	pfnSetDebugName = (
+		(PFN_vkSetDebugUtilsObjectNameEXT)
+		vkGetDeviceProcAddr(
+			sDevice->device,
+			"vkSetDebugUtilsObjectNameEXT"
+		)
+	);
+
+#if defined(VKOF_AFTERMATH)
+	sDevice->pfnCmdSetCheckpointNV = (
+		(PFN_vkCmdSetCheckpointNV)
+		vkGetDeviceProcAddr(
+			sDevice->device,
+			"vkCmdSetCheckpointNV"
+		)
+	);
+	sDevice->pfnGetQueueCheckpointDataNV = (
+		(PFN_vkGetQueueCheckpointDataNV)
+		vkGetDeviceProcAddr(
+			sDevice->device,
+			"vkGetQueueCheckpointDataNV"
+		)
+	);
+	vkof_aftermath_set_handles(
+		sDevice->device.device,
+		graphicsQueue,
+		sDevice->pfnGetQueueCheckpointDataNV
+	);
+#endif
 
 	// -- per-frame-in-flight: command buffers, semaphores, fences
 	{
@@ -1994,600 +2381,83 @@ void vkof::init()
 				vkCreateFence(sDevice->device, &fci, nullptr, &fd.fence)
 			);
 		}
-		sDevice->semaphoresRender.resize(sDevice->swapchain.image_count);
-		for (VkSemaphore & sem : sDevice->semaphoresRender) {
-			VkAssert(vkCreateSemaphore(sDevice->device, &sci, nullptr, &sem));
+		if (!isHeadless) {
+			sDevice->semaphoresRender.resize(sDevice->swapchain.image_count);
+			for (VkSemaphore & sem : sDevice->semaphoresRender) {
+				VkAssert(
+					vkCreateSemaphore(sDevice->device, &sci, nullptr, &sem)
+				);
+			}
 		}
 	}
-	sDevice->frameIndex = 0;
+	sDevice->frameIndex = 0u;
 
-	// -- imgui
-	ImGui::CreateContext();
-	ImGui_ImplGlfw_InitForVulkan(window, true);
+	// -- imgui (windowed only)
+	if (!isHeadless) {
+		ImGui::CreateContext();
+		ImGui_ImplGlfw_InitForVulkan(window, true);
 
-	VkDescriptorPoolSize const imguiPoolSize = {
-		.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-		.descriptorCount = 1,
-	};
-	VkDescriptorPoolCreateInfo const imguiPoolCi = {
-		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-		.pNext = nullptr,
-		.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-		.maxSets = 1,
-		.poolSizeCount = 1,
-		.pPoolSizes = &imguiPoolSize,
-	};
-	VkAssert(
-		vkCreateDescriptorPool(
-			sDevice->device, &imguiPoolCi, nullptr, &sDevice->imguiDescriptorPool
-		)
-	);
+		VkDescriptorPoolSize const imguiPoolSize = {
+			.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+			.descriptorCount = 1,
+		};
+		VkDescriptorPoolCreateInfo const imguiPoolCi = {
+			.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+			.pNext = nullptr,
+			.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+			.maxSets = 1,
+			.poolSizeCount = 1,
+			.pPoolSizes = &imguiPoolSize,
+		};
+		VkAssert(
+			vkCreateDescriptorPool(
+				sDevice->device,
+				&imguiPoolCi,
+				nullptr,
+				&sDevice->imguiDescriptorPool
+			)
+		);
 
-	VkFormat const swapchainFormat = sDevice->swapchain.image_format;
-	VkPipelineRenderingCreateInfo const imguiRenderingCi = {
-		.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
-		.pNext = nullptr,
-		.viewMask = 0,
-		.colorAttachmentCount = 1,
-		.pColorAttachmentFormats = &swapchainFormat,
-		.depthAttachmentFormat = VK_FORMAT_UNDEFINED,
-		.stencilAttachmentFormat = VK_FORMAT_UNDEFINED,
-	};
-	ImGui_ImplVulkan_InitInfo imguiVkInfo = {};
-	imguiVkInfo.Instance = sDevice->instance.instance;
-	imguiVkInfo.PhysicalDevice = sDevice->device.physical_device;
-	imguiVkInfo.Device = sDevice->device.device;
-	imguiVkInfo.QueueFamily = (
-		sDevice->device.get_queue_index(vkb::QueueType::graphics).value()
-	);
-	imguiVkInfo.Queue = sDevice->queueGraphics;
-	imguiVkInfo.DescriptorPool = sDevice->imguiDescriptorPool;
-	imguiVkInfo.RenderPass = VK_NULL_HANDLE;
-	imguiVkInfo.MinImageCount = 2;
-	imguiVkInfo.ImageCount = (u32)sDevice->swapchainImages.size();
-	imguiVkInfo.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
-	imguiVkInfo.UseDynamicRendering = true;
-	imguiVkInfo.PipelineRenderingCreateInfo = imguiRenderingCi;
-	ImGui_ImplVulkan_Init(&imguiVkInfo);
-	ImGui_ImplVulkan_CreateFontsTexture();
+		VkFormat const swapchainFormat = sDevice->swapchain.image_format;
+		VkPipelineRenderingCreateInfo const imguiRenderingCi = {
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+			.pNext = nullptr,
+			.viewMask = 0,
+			.colorAttachmentCount = 1,
+			.pColorAttachmentFormats = &swapchainFormat,
+			.depthAttachmentFormat = VK_FORMAT_UNDEFINED,
+			.stencilAttachmentFormat = VK_FORMAT_UNDEFINED,
+		};
+		ImGui_ImplVulkan_InitInfo imguiVkInfo = {};
+		imguiVkInfo.Instance = sDevice->instance.instance;
+		imguiVkInfo.PhysicalDevice = sDevice->device.physical_device;
+		imguiVkInfo.Device = sDevice->device.device;
+		imguiVkInfo.QueueFamily = (
+			sDevice->device.get_queue_index(vkb::QueueType::graphics).value()
+		);
+		imguiVkInfo.Queue = sDevice->queueGraphics;
+		imguiVkInfo.DescriptorPool = sDevice->imguiDescriptorPool;
+		imguiVkInfo.RenderPass = VK_NULL_HANDLE;
+		imguiVkInfo.MinImageCount = 2;
+		imguiVkInfo.ImageCount = (u32)sDevice->swapchainImages.size();
+		imguiVkInfo.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+		imguiVkInfo.UseDynamicRendering = true;
+		imguiVkInfo.PipelineRenderingCreateInfo = imguiRenderingCi;
+		ImGui_ImplVulkan_Init(&imguiVkInfo);
+		ImGui_ImplVulkan_CreateFontsTexture();
+	}
 
 	profiler_init();
 }
 
-void vkof::init_headless(u32 width, u32 height)
+void vkof::init()
 {
-	// -- instance (headless: suppress all windowing extensions)
-	auto instance = [&]() -> vkb::Instance {
-		auto const r = vkb::InstanceBuilder()
-			.set_app_name("vkof-test")
-			.request_validation_layers(true)
-			.set_debug_callback(debugMessengerCallback)
-			.add_debug_messenger_severity(VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT)
-			.add_validation_feature_enable(VK_VALIDATION_FEATURE_ENABLE_DEBUG_PRINTF_EXT)
-			.require_api_version(1, 3, 0)
-			.set_headless(true)
-			.build();
-		if (!r) {
-			printf(
-				"failed to create headless instance: %s\n",
-				r.error().message().c_str()
-			);
-			exit(1);
-		}
-		return r.value();
-	}();
+	init_impl(false, 1280u, 720u);
+}
 
-	// -- physical device + logical device (no surface)
-	auto device = [&]() -> vkb::Device {
-		VkPhysicalDeviceFeatures features {
-			.robustBufferAccess = true,
-			.fullDrawIndexUint32 = true,
-			.imageCubeArray = true,
-			.independentBlend = true,
-			.geometryShader = true,
-			.tessellationShader = true,
-			.sampleRateShading = true,
-			.dualSrcBlend = true,
-			.logicOp = true,
-			.multiDrawIndirect = true,
-			.drawIndirectFirstInstance = true,
-			.depthClamp = true,
-			.depthBiasClamp = true,
-			.fillModeNonSolid = true,
-			.depthBounds = true,
-			.wideLines = true,
-			.largePoints = true,
-			.alphaToOne = true,
-			.multiViewport = true,
-			.samplerAnisotropy = true,
-			.textureCompressionETC2 = false,
-			.textureCompressionASTC_LDR = false,
-			.textureCompressionBC = true,
-			.occlusionQueryPrecise = true,
-			.pipelineStatisticsQuery = true,
-			.vertexPipelineStoresAndAtomics = true,
-			.fragmentStoresAndAtomics = true,
-			.shaderTessellationAndGeometryPointSize = true,
-			.shaderImageGatherExtended = true,
-			.shaderStorageImageExtendedFormats = true,
-			.shaderStorageImageMultisample = true,
-			.shaderStorageImageReadWithoutFormat = true,
-			.shaderStorageImageWriteWithoutFormat = true,
-			.shaderUniformBufferArrayDynamicIndexing = true,
-			.shaderSampledImageArrayDynamicIndexing = true,
-			.shaderStorageBufferArrayDynamicIndexing = true,
-			.shaderStorageImageArrayDynamicIndexing = true,
-			.shaderClipDistance = true,
-			.shaderCullDistance = true,
-			.shaderFloat64 = true,
-			.shaderInt64 = true,
-			.shaderInt16 = true,
-			.shaderResourceResidency = true,
-			.shaderResourceMinLod = true,
-			.sparseBinding = false,
-			.sparseResidencyBuffer = false,
-			.sparseResidencyImage2D = false,
-			.sparseResidencyImage3D = false,
-			.sparseResidency2Samples = false,
-			.sparseResidency4Samples = false,
-			.sparseResidency8Samples = false,
-			.sparseResidency16Samples = false,
-			.sparseResidencyAliased = false,
-			.variableMultisampleRate = false,
-			.inheritedQueries = false,
-		};
-		VkPhysicalDeviceMeshShaderFeaturesEXT const meshShaderFeatures = {
-			.sType = (
-				VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT
-			),
-			.pNext = nullptr,
-			.taskShader = VK_TRUE,
-			.meshShader = VK_TRUE,
-			.multiviewMeshShader = VK_FALSE,
-			.primitiveFragmentShadingRateMeshShader = VK_FALSE,
-			.meshShaderQueries = VK_FALSE,
-		};
-		VkPhysicalDeviceMaintenance4Features const maintenance4Features = {
-			.sType = (
-				VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES
-			),
-			.pNext = nullptr,
-			.maintenance4 = VK_TRUE,
-		};
-		VkPhysicalDeviceDynamicRenderingFeatures const
-			dynamicRenderingFeatures = {
-				.sType = (
-					VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES
-				),
-				.pNext = nullptr,
-				.dynamicRendering = VK_TRUE,
-			};
-		VkPhysicalDeviceSynchronization2Features const
-			synchronization2Features = {
-				.sType = (
-					VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES
-				),
-				.pNext = nullptr,
-				.synchronization2 = VK_TRUE,
-			};
-		VkPhysicalDeviceVulkan12Features const vulkan12Features {
-			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
-			.pNext = nullptr,
-			.samplerMirrorClampToEdge = VK_TRUE,
-			.drawIndirectCount = VK_TRUE,
-			.storageBuffer8BitAccess = VK_TRUE,
-			.uniformAndStorageBuffer8BitAccess = VK_TRUE,
-			.storagePushConstant8 = VK_TRUE,
-			.shaderBufferInt64Atomics = VK_TRUE,
-			.shaderSharedInt64Atomics = VK_TRUE,
-			.shaderFloat16 = VK_TRUE,
-			.shaderInt8 = VK_TRUE,
-			.descriptorIndexing = VK_TRUE,
-			.shaderInputAttachmentArrayDynamicIndexing = VK_TRUE,
-			.shaderUniformTexelBufferArrayDynamicIndexing = VK_TRUE,
-			.shaderStorageTexelBufferArrayDynamicIndexing = VK_TRUE,
-			.shaderUniformBufferArrayNonUniformIndexing = VK_TRUE,
-			.shaderSampledImageArrayNonUniformIndexing = VK_TRUE,
-			.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE,
-			.shaderStorageImageArrayNonUniformIndexing = VK_TRUE,
-			.shaderInputAttachmentArrayNonUniformIndexing = VK_TRUE,
-			.shaderUniformTexelBufferArrayNonUniformIndexing = VK_TRUE,
-			.shaderStorageTexelBufferArrayNonUniformIndexing = VK_TRUE,
-			.descriptorBindingUniformBufferUpdateAfterBind = VK_TRUE,
-			.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE,
-			.descriptorBindingStorageImageUpdateAfterBind = VK_TRUE,
-			.descriptorBindingStorageBufferUpdateAfterBind = VK_TRUE,
-			.descriptorBindingUniformTexelBufferUpdateAfterBind = VK_TRUE,
-			.descriptorBindingStorageTexelBufferUpdateAfterBind = VK_TRUE,
-			.descriptorBindingUpdateUnusedWhilePending = VK_TRUE,
-			.descriptorBindingPartiallyBound = VK_TRUE,
-			.descriptorBindingVariableDescriptorCount = VK_TRUE,
-			.runtimeDescriptorArray = VK_TRUE,
-			.samplerFilterMinmax = VK_TRUE,
-			.scalarBlockLayout = VK_TRUE,
-			.imagelessFramebuffer = VK_TRUE,
-			.uniformBufferStandardLayout = VK_TRUE,
-			.shaderSubgroupExtendedTypes = VK_TRUE,
-			.separateDepthStencilLayouts = VK_TRUE,
-			.hostQueryReset = VK_TRUE,
-			.timelineSemaphore = VK_TRUE,
-			.bufferDeviceAddress = VK_TRUE,
-			.bufferDeviceAddressCaptureReplay = VK_TRUE,
-			.bufferDeviceAddressMultiDevice = VK_TRUE,
-			.vulkanMemoryModel = VK_TRUE,
-			.vulkanMemoryModelDeviceScope = VK_TRUE,
-			.vulkanMemoryModelAvailabilityVisibilityChains = VK_TRUE,
-			.shaderOutputViewportIndex = VK_TRUE,
-			.shaderOutputLayer = VK_TRUE,
-			.subgroupBroadcastDynamicId = VK_TRUE,
-		};
-		auto const physResult = (
-			vkb::PhysicalDeviceSelector(instance)
-			.defer_surface_initialization()
-			.require_present(false)
-			.add_required_extension(VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME)
-			.add_required_extension(VK_EXT_MESH_SHADER_EXTENSION_NAME)
-			.set_required_features(features)
-			.add_required_extension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)
-			.add_required_extension(VK_KHR_MAINTENANCE_6_EXTENSION_NAME)
-			.add_required_extension_features(meshShaderFeatures)
-			.add_required_extension_features(maintenance4Features)
-			.add_required_extension_features(dynamicRenderingFeatures)
-			.add_required_extension_features(synchronization2Features)
-			.add_required_extension_features(vulkan12Features)
-			.select()
-		);
-		if (!physResult) {
-			printf(
-				"failed to select headless physical device: %s\n",
-				physResult.error().message().c_str()
-			);
-			exit(1);
-		}
-		auto const devResult = (
-			vkb::DeviceBuilder(physResult.value()).build()
-		);
-		if (!devResult) {
-			printf(
-				"failed to create headless logical device: %s\n",
-				devResult.error().message().c_str()
-			);
-			exit(1);
-		}
-		return devResult.value();
-	}();
-
-	// -- queues
-	auto const graphicsQueue = [&]() -> VkQueue {
-		auto const r = device.get_queue(vkb::QueueType::graphics);
-		if (!r) {
-			printf(
-				"failed to get graphics queue: %s\n",
-				r.error().message().c_str()
-			);
-			exit(1);
-		}
-		return r.value();
-	}();
-	auto const computeQueue = [&]() -> VkQueue {
-		auto const r = device.get_queue(vkb::QueueType::compute);
-		if (!r) {
-			printf(
-				"failed to get compute queue: %s\n",
-				r.error().message().c_str()
-			);
-			exit(1);
-		}
-		return r.value();
-	}();
-
-	// -- VMA allocator
-	auto const allocator = [&]() -> VmaAllocator {
-		VmaAllocatorCreateInfo const allocatorCreateInfo = {
-			.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
-			.physicalDevice = device.physical_device,
-			.device = device.device,
-			.preferredLargeHeapBlockSize = 0,
-			.pAllocationCallbacks = nullptr,
-			.pDeviceMemoryCallbacks = nullptr,
-			.pHeapSizeLimit = nullptr,
-			.pVulkanFunctions = nullptr,
-			.instance = instance.instance,
-			.vulkanApiVersion = VK_API_VERSION_1_3,
-			.pTypeExternalMemoryHandleTypes = nullptr,
-		};
-		VmaAllocator a;
-		VkAssert(vmaCreateAllocator(&allocatorCreateInfo, &a));
-		return a;
-	}();
-
-	// -- fake swapchain color image (slot 0, no real swapchain)
-	VkImage headlessColorImage;
-	VmaAllocation headlessColorAlloc;
-	VkImageView headlessColorView;
-	{
-		VkImageCreateInfo const ci = {
-			.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-			.pNext = nullptr,
-			.flags = 0,
-			.imageType = VK_IMAGE_TYPE_2D,
-			.format = VK_FORMAT_B8G8R8A8_UNORM,
-			.extent = VkExtent3D { width, height, 1 },
-			.mipLevels = 1,
-			.arrayLayers = 1,
-			.samples = VK_SAMPLE_COUNT_1_BIT,
-			.tiling = VK_IMAGE_TILING_OPTIMAL,
-			.usage = (
-				  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
-				| VK_IMAGE_USAGE_SAMPLED_BIT
-				| VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-				| VK_IMAGE_USAGE_TRANSFER_DST_BIT
-				| VK_IMAGE_USAGE_STORAGE_BIT
-			),
-			.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-			.queueFamilyIndexCount = 0,
-			.pQueueFamilyIndices = nullptr,
-			.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-		};
-		VmaAllocationCreateInfo const aci = {
-			.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
-			.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-			.requiredFlags = 0,
-			.preferredFlags = 0,
-			.memoryTypeBits = 0,
-			.pool = nullptr,
-			.pUserData = nullptr,
-			.priority = 0.0f,
-		};
-		VkAssert(vmaCreateImage(allocator, &ci, &aci, &headlessColorImage, &headlessColorAlloc, nullptr));
-		VkImageViewCreateInfo const vci = {
-			.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-			.pNext = nullptr,
-			.flags = 0,
-			.image = headlessColorImage,
-			.viewType = VK_IMAGE_VIEW_TYPE_2D,
-			.format = VK_FORMAT_B8G8R8A8_UNORM,
-			.components = VkComponentMapping {
-				VK_COMPONENT_SWIZZLE_IDENTITY,
-				VK_COMPONENT_SWIZZLE_IDENTITY,
-				VK_COMPONENT_SWIZZLE_IDENTITY,
-				VK_COMPONENT_SWIZZLE_IDENTITY,
-			},
-			.subresourceRange = VkImageSubresourceRange {
-				.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-				.baseMipLevel = 0,
-				.levelCount = 1,
-				.baseArrayLayer = 0,
-				.layerCount = 1,
-			},
-		};
-		VkAssert(vkCreateImageView(device.device, &vci, nullptr, &headlessColorView));
-	}
-
-	// -- fake depth image (slot 0)
-	VkImage headlessDepthImage;
-	VmaAllocation headlessDepthAlloc;
-	VkImageView headlessDepthView;
-	{
-		VkImageCreateInfo const ci = {
-			.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-			.pNext = nullptr,
-			.flags = 0,
-			.imageType = VK_IMAGE_TYPE_2D,
-			.format = VK_FORMAT_D32_SFLOAT,
-			.extent = VkExtent3D { width, height, 1 },
-			.mipLevels = 1,
-			.arrayLayers = 1,
-			.samples = VK_SAMPLE_COUNT_1_BIT,
-			.tiling = VK_IMAGE_TILING_OPTIMAL,
-			.usage = (
-				  VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
-				| VK_IMAGE_USAGE_SAMPLED_BIT
-			),
-			.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-			.queueFamilyIndexCount = 0,
-			.pQueueFamilyIndices = nullptr,
-			.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-		};
-		VmaAllocationCreateInfo const aci = {
-			.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
-			.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-			.requiredFlags = 0,
-			.preferredFlags = 0,
-			.memoryTypeBits = 0,
-			.pool = nullptr,
-			.pUserData = nullptr,
-			.priority = 0.0f,
-		};
-		VkAssert(vmaCreateImage(allocator, &ci, &aci, &headlessDepthImage, &headlessDepthAlloc, nullptr));
-		VkImageViewCreateInfo const vci = {
-			.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-			.pNext = nullptr,
-			.flags = 0,
-			.image = headlessDepthImage,
-			.viewType = VK_IMAGE_VIEW_TYPE_2D,
-			.format = VK_FORMAT_D32_SFLOAT,
-			.components = VkComponentMapping {
-				VK_COMPONENT_SWIZZLE_IDENTITY,
-				VK_COMPONENT_SWIZZLE_IDENTITY,
-				VK_COMPONENT_SWIZZLE_IDENTITY,
-				VK_COMPONENT_SWIZZLE_IDENTITY,
-			},
-			.subresourceRange = VkImageSubresourceRange {
-				.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
-				.baseMipLevel = 0,
-				.levelCount = 1,
-				.baseArrayLayer = 0,
-				.layerCount = 1,
-			},
-		};
-		VkAssert(vkCreateImageView(device.device, &vci, nullptr, &headlessDepthView));
-	}
-
-	// -- command pools
-	VkCommandPool commandPoolGraphics;
-	{
-		VkCommandPoolCreateInfo const ci = {
-			.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-			.pNext = nullptr,
-			.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-			.queueFamilyIndex = (
-				device.get_queue_index(vkb::QueueType::graphics).value()
-			),
-		};
-		VkAssert(vkCreateCommandPool(device.device, &ci, nullptr, &commandPoolGraphics));
-	}
-	VkCommandPool commandPoolCompute;
-	{
-		VkCommandPoolCreateInfo const ci = {
-			.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-			.pNext = nullptr,
-			.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-			.queueFamilyIndex = (
-				device.get_queue_index(vkb::QueueType::compute).value()
-			),
-		};
-		VkAssert(vkCreateCommandPool(device.device, &ci, nullptr, &commandPoolCompute));
-	}
-
-	// -- universal push-constant layout
-	sBindlessSetLayout = create_bindless_set_layout(device.device);
-
-	VkPushConstantRange universalPushConstantRange {
-		.stageFlags = VK_SHADER_STAGE_ALL,
-		.offset = 0,
-		.size = 256,
-	};
-	VkPipelineLayoutCreateInfo const universalLayoutCi = {
-		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-		.pNext = nullptr,
-		.flags = 0,
-		.setLayoutCount = 1u,
-		.pSetLayouts = &sBindlessSetLayout,
-		.pushConstantRangeCount = 1,
-		.pPushConstantRanges = &universalPushConstantRange,
-	};
-	VkPipelineLayout pipelineLayoutUniversal;
-	VkAssert(
-		vkCreatePipelineLayout(
-			device.device, &universalLayoutCi, nullptr, &pipelineLayoutUniversal
-		)
-	);
-
-	// -- minimal vkb::Swapchain stub so existing code reads extent/image_count
-	vkb::Swapchain headlessSwapchain {};
-	headlessSwapchain.device = device.device;
-	headlessSwapchain.swapchain = VK_NULL_HANDLE;
-	headlessSwapchain.image_count = 1;
-	headlessSwapchain.image_format = VK_FORMAT_B8G8R8A8_UNORM;
-	headlessSwapchain.extent = VkExtent2D { width, height };
-
-	sDevice = new ImplDevice {
-		.window = nullptr,
-		.instance = instance,
-		.physicalDevice = device.physical_device,
-		.device = device,
-		.swapchain = headlessSwapchain,
-		.swapchainImages = { headlessColorImage },
-		.swapchainImageViews = { headlessColorView },
-		.swapchainDepthImages = { headlessDepthImage },
-		.swapchainDepthImageViews = { headlessDepthView },
-		.swapchainDepthAllocs = {},
-		.headlessSwapchainAlloc = headlessColorAlloc,
-		.headlessDepthAlloc = headlessDepthAlloc,
-		.swapchainImageIndex = 0,
-		.commandPoolGraphics = commandPoolGraphics,
-		.commandPoolCompute = commandPoolCompute,
-		.pipelineLayoutUniversal = pipelineLayoutUniversal,
-		.surface = VK_NULL_HANDLE,
-		.queueGraphics = graphicsQueue,
-		.queueCompute = computeQueue,
-		.allocator = allocator,
-		.frameData = {},
-		.frameIndex = 0,
-		.semaphoresRender = {},
-		.imagePool = (
-			srat::HandlePool<vkof::Image, ImplTexture>::create(1024)
-		),
-		.bufferPool = (
-			srat::HandlePool<vkof::Buffer, ImplBuffer>::create(1024)
-		),
-		.samplerPool = (
-			srat::HandlePool<vkof::Sampler, ImplSampler>::create(1024)
-		),
-		.transientImagePool = (
-			srat::HandlePool<vkof::TransientImage, ImplTransientImage>
-				::create(32)
-		),
-		.transientBufferPool = (
-			srat::HandlePool<vkof::TransientBuffer, ImplTransientBuffer>
-				::create(32)
-		),
-		.pipelineGraphicsPool = (
-			srat::HandlePool<vkof::Pipeline, ImplPipelineGraphics>
-				::create(128)
-		),
-		.pipelineComputePool = (
-			srat::HandlePool<vkof::Pipeline, ImplPipelineCompute>
-				::create(128)
-		),
-		.commandBufferPool = (
-			srat::HandlePool<vkof::CommandBuffer, ImplCommandBuffer>
-				::create(256)
-		),
-		.renderNodePool = (
-			srat::HandlePool<vkof::RenderNode, ImplRenderNode>
-				::create(64)
-		),
-		.profiler = {},
-	};
-
-	create_bindless_pool_and_set(sDevice->device);
-	pfnVkCmdDrawMeshTasksEXT = (
-		(PFN_vkCmdDrawMeshTasksEXT)
-		vkGetDeviceProcAddr(
-			sDevice->device,
-			"vkCmdDrawMeshTasksEXT"
-		)
-	);
-
-	// -- per-frame-in-flight sync (same as windowed)
-	{
-		VkCommandBufferAllocateInfo const cbai = {
-			.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-			.pNext = nullptr,
-			.commandPool = sDevice->commandPoolGraphics,
-			.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-			.commandBufferCount = 1,
-		};
-		VkSemaphoreCreateInfo const sci = {
-			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
-			.pNext = nullptr,
-			.flags = 0,
-		};
-		VkFenceCreateInfo const fci = {
-			.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-			.pNext = nullptr,
-			.flags = VK_FENCE_CREATE_SIGNALED_BIT,
-		};
-		for (auto & fd : sDevice->frameData) {
-			VkAssert(
-				vkAllocateCommandBuffers(
-					sDevice->device, &cbai, &fd.cmdGraphics
-				)
-			);
-			VkAssert(
-				vkCreateSemaphore(
-					sDevice->device, &sci, nullptr, &fd.semaphoreAcquire
-				)
-			);
-			VkAssert(
-				vkCreateFence(sDevice->device, &fci, nullptr, &fd.fence)
-			);
-		}
-	}
-	sDevice->frameIndex = 0;
-	profiler_init();
+void vkof::init_headless(u32 const width, u32 const height)
+{
+	init_impl(true, width, height);
 }
 
 void vkof::device_wait_idle()
@@ -2674,7 +2544,9 @@ void vkof::shutdown()
 	sBindlessSet = VK_NULL_HANDLE;
 	sBindlessSetLayout = VK_NULL_HANDLE;
 	sBindlessSamplerNextSlot = 1u;
-	sBindlessStorageNextSlot = 1u;
+	sBindlessStorageUintNextSlot = 1u;
+	sBindlessStorageFloatNextSlot = 1u;
+	sTransientStorageSlotCache.clear();
 	vkDestroyPipelineLayout(
 		sDevice->device, sDevice->pipelineLayoutUniversal, nullptr
 	);
@@ -2687,6 +2559,9 @@ void vkof::shutdown()
 		vkb::destroy_swapchain(sDevice->swapchain);
 		vkb::destroy_surface(sDevice->instance, sDevice->surface);
 	}
+#if defined(VKOF_AFTERMATH)
+	vkof_aftermath_disable();
+#endif
 	vkb::destroy_device(sDevice->device);
 	vkb::destroy_instance(sDevice->instance);
 	if (sDevice->window != nullptr) {
@@ -3010,6 +2885,9 @@ static VkShaderModule compile_and_load_shader_module(
 		std::string("glslangValidator -S ")
 		+ shader_stage_flag(stage)
 		+ " --target-env vulkan1.3"
+#if defined(VKOF_AFTERMATH)
+		+ " -gVS"
+#endif
 	);
 	for (std::string const & d : defines) {
 		cmd += " -D" + d;
@@ -3040,6 +2918,10 @@ static VkShaderModule compile_and_load_shader_module(
 	std::vector<u8> code(size);
 	fread(code.data(), 1, size, f);
 	fclose(f);
+
+#if defined(VKOF_AFTERMATH)
+	vkof_aftermath_register_spirv(code.data(), (uint32_t)code.size());
+#endif
 
 	VkShaderModuleCreateInfo const ci = {
 		.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
@@ -3925,6 +3807,13 @@ void vkof::render_graph_execute(RenderGraphExecuteInfo const & exec)
 		}
 
 		// -- invoke the node's recording callback
+#if defined(VKOF_AFTERMATH)
+		if (sDevice->pfnCmdSetCheckpointNV) {
+			sDevice->pfnCmdSetCheckpointNV(
+				cmd, (void *)(uintptr_t)nodeIdx
+			);
+		}
+#endif
 		if (node->callback) {
 			node->callback(cmdHandle);
 		}

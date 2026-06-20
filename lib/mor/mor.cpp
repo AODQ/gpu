@@ -182,7 +182,7 @@ static u32 load_texture(
 	}
 	vkof::Sampler const sampler = cacheIt->second;
 
-	u32 const handle = (u32)vkof::image_sampler_handle({
+	u32 const handle = vkof::image_sampler_handle({
 		.image = image,
 		.sampler = sampler,
 	});

@@ -1,0 +1,86 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_shader_image_load_formatted : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "mor/mor_shared.h"
+#include "resolve_pc.h"
+#include "probe.glsl"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 1) uniform uimage2D vkofImagesU[];
+layout(set = 0, binding = 2) uniform image2D   vkofImages[];
+
+vec3 index_color(uint idx) {
+	uint h = idx * 2654435761u;
+	h ^= h >> 16u;
+	return (
+		vec3(
+			float((h >>  0u) & 0xFFu),
+			float((h >>  8u) & 0xFFu),
+			float((h >> 16u) & 0xFFu)
+		) / 255.0
+	);
+	}
+
+void main() {
+	const ivec2 coord  = ivec2(gl_GlobalInvocationID.xy);
+	const uint packed = (
+		imageLoad(vkofImagesU[pc.resolve.visibilityImageHandle], coord).r
+	);
+
+	if (packed == 0u) {
+		imageStore(
+			vkofImages[pc.resolve.outputImageHandle],
+			coord,
+			vec4(0.05, 0.05, 0.1, 1.0)
+		);
+		return;
+	}
+
+	const uint triangleId = packed & 0x7Fu;
+	const uint meshletId = ((packed >> 7u) & 0x1FFFFu) - 1u;
+	const uint modelId = (packed >> 24u) & 0xFFu;
+
+	ModelIndirectDescBuf modelDescs = ModelIndirectDescBuf(pc.resolve.models);
+	const ModelIndirectDesc modelDesc = modelDescs.data[modelId];
+
+	MeshletBuf meshletBuf = MeshletBuf(modelDesc.meshlets);
+	const Meshlet meshlet = meshletBuf.data[meshletId];
+
+	vec3 color = index_color(meshletId);
+	switch (pc.global.debugMode) {
+		case MOR_DEBUG_VIEW_MESHLET_ID: {
+			color = index_color(meshletId);
+			break;
+		}
+		case MOR_DEBUG_VIEW_MODEL_ID: {
+			color = index_color(modelId);
+			break;
+		}
+		case MOR_DEBUG_VIEW_TRIANGLE_ID: {
+			// color = index_color(triangleId);
+			color = index_color(meshlet.vertexOffset);
+			break;
+		}
+	}
+
+	if (shader_probe_is_active_pixel(ivec2(gl_GlobalInvocationID.xy))) {
+		debugPrintfEXT(
+			"meshlet %lu material %lu",
+			modelDesc.meshlets,
+			modelDesc.materials
+		);
+		color = vec3(1.0, 0.0, 1.0);
+	}
+
+	imageStore(
+		vkofImages[pc.resolve.outputImageHandle],
+		coord,
+		vec4(color, 1.0)
+	);
+}

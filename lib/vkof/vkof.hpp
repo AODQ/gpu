@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <source_location>
 
 #include <srat/core-array.hpp>
 #include <srat/core-types.hpp>
@@ -17,6 +18,7 @@ namespace vkof
 
 	enum struct ImageFormat {
 		none,
+		r32ui,
 		r8g8b8a8_unorm,
 		r8g8b8a8_srgb,
 		r16g16b16a16_sfloat,
@@ -101,7 +103,10 @@ namespace vkof
 		BufferMemory memory;
 	};
 
-	Buffer buffer_create(BufferCreateInfo const & createInfo);
+	Buffer buffer_create(
+		BufferCreateInfo const & createInfo,
+		std::source_location loc = std::source_location::current()
+	);
 	void buffer_destroy(Buffer const & buffer);
 
 	u64 buffer_virtual_address(Buffer const & buffer);
@@ -131,7 +136,10 @@ namespace vkof
 		srat::slice<u8 const> optInitialData;
 	};
 
-	Image image_create(ImageCreateInfo const & createInfo);
+	Image image_create(
+		ImageCreateInfo const & createInfo,
+		std::source_location loc = std::source_location::current()
+	);
 	void image_destroy(Image const & image);
 
 	u32 image_width(Image const & image);
@@ -165,16 +173,14 @@ namespace vkof
 		Image image;
 		Sampler sampler;
 	};
-	u64 image_sampler_handle(ImageSamplerHandleInfo const & info);
+	u32 image_sampler_handle(ImageSamplerHandleInfo const & info);
 
 	// for use with image2d
 	struct ImageStorageHandleInfo {
 		Image image;
 		u32 mipLevel;
 	};
-	u64 image_storage_handle(ImageStorageHandleInfo const & info);
-
-
+	u32 image_storage_handle(ImageStorageHandleInfo const & info);
 }
 
 // -----------------------------------------------------------------------------
@@ -183,7 +189,6 @@ namespace vkof
 
 namespace vkof
 {
-
 	struct CmdDraw {
 		CommandBuffer cmd;
 		Pipeline pipeline;
@@ -259,6 +264,14 @@ namespace vkof
 
 	Image transient_image_get_image(TransientImage const & transientImage);
 	Buffer transient_buffer_get_buffer(TransientBuffer const & transientBuffer);
+
+	struct TransientImageStorageHandleInfo {
+		TransientImage image;
+		u32 mipLevel;
+	};
+	u32 transient_image_storage_handle(
+		TransientImageStorageHandleInfo const & info
+	);
 
 	struct RenderNodeCreateInfo {
 		CommandQueue queue;

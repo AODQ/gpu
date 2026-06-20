@@ -120,6 +120,16 @@ FetchContent_MakeAvailable(rapidjson)
 find_package(Vulkan REQUIRED)
 
 # ------------------------------------------------------------------------------
+# -- NVIDIA Aftermath (optional GPU crash dump support)
+# ------------------------------------------------------------------------------
+
+option(VKOF_AFTERMATH "Enable NVIDIA Aftermath GPU crash dumps" OFF)
+if(VKOF_AFTERMATH)
+	list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
+	find_package(Aftermath REQUIRED)
+endif()
+
+# ------------------------------------------------------------------------------
 # -- shader compilation
 # ------------------------------------------------------------------------------
 
@@ -209,6 +219,13 @@ add_library(
 	${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
 )
 
+if(VKOF_AFTERMATH)
+	target_sources(vkof PRIVATE lib/vkof/aftermath.cpp)
+	target_compile_definitions(vkof PRIVATE VKOF_AFTERMATH)
+	target_link_libraries(vkof PRIVATE Aftermath::Aftermath)
+	install(FILES "${Aftermath_LIBRARY}" DESTINATION bin)
+endif()
+
 target_link_libraries(
 	vkof
 	PUBLIC
@@ -294,6 +311,7 @@ target_compile_definitions(
 	cull
 	PRIVATE
 	ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets/"
+	$<$<BOOL:${VKOF_AFTERMATH}>:VKOF_AFTERMATH>
 )
 
 target_include_directories(
@@ -315,6 +333,10 @@ target_link_options(
 	-fuse-ld=mold
 	${san_link}
 )
+
+if(VKOF_AFTERMATH)
+	set_target_properties(cull PROPERTIES INSTALL_RPATH "$ORIGIN")
+endif()
 
 # copy compiled shaders next to the binary so relative paths work
 #add_custom_command(

@@ -2,6 +2,10 @@
 #pragma once
 #endif
 
+#define MOR_DEBUG_VIEW_MESHLET_ID 1
+#define MOR_DEBUG_VIEW_MODEL_ID 2
+#define MOR_DEBUG_VIEW_TRIANGLE_ID 3
+
 #ifdef __cplusplus
 #include <srat/core-math.hpp>
 #include <srat/core-types.hpp>
@@ -10,6 +14,7 @@
 #define f32   float
 #define f32v2 vec2
 #define f32v3 vec3
+#define f32v4 vec4
 #define f32m44 mat4
 #define u32 uint
 #endif

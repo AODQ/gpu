@@ -1,4 +1,5 @@
 #include "shaders/scene_shared.h"
+#include "shaders/resolve_pc.h"
 #include "asset_library.hpp"
 #include "scene_desc.hpp"
 
@@ -34,6 +35,7 @@ struct LoadedModel
 {
 	mor::Scene scene;
 	mor::GpuScene gpuScene;
+	u32 modelId;
 };
 
 static f32m44 make_model_matrix(SceneInstance const & inst)
@@ -94,7 +96,9 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 
 	AssetLibrary const assetLib = asset_library_create(assetsDir);
 
-	std::filesystem::path sceneFilePath = scenePath ? std::filesystem::path(scenePath) : std::filesystem::path{};
+	std::filesystem::path sceneFilePath = (
+		scenePath ? std::filesystem::path(scenePath) : std::filesystem::path{}
+	);
 	SceneDesc sceneDesc = scenePath
 		? scene_desc_load(sceneFilePath)
 		: SceneDesc{};
@@ -103,6 +107,13 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 	std::string const fragPath = (shaderDir / "scene.frag").string();
 	std::string const libDirStr = libDir.string();
 
+	vkof::TransientImage const visibilityTarget = vkof::transient_image_create({
+		.format = vkof::ImageFormat::r32ui,
+		.scaleWidth = 1.0f,
+		.scaleHeight = 1.0f,
+		.mipLevels = 1,
+		.isDoubleBuffered = !headless,
+	});
 	vkof::TransientImage const colorTarget = vkof::transient_image_create({
 		.format = vkof::ImageFormat::r8g8b8a8_unorm,
 		.scaleWidth = 1.0f,
@@ -120,18 +131,28 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 
 	char const * const kIncludePaths[] = { libDirStr.c_str() };
 	static constexpr vkof::ImageFormat kColorFmts[] = {
-		vkof::ImageFormat::r8g8b8a8_unorm,
+		vkof::ImageFormat::r32ui,
 	};
-	vkof::Pipeline const pipeline = vkof::pipeline_graphics_create({
-		.pathMesh = meshPath.c_str(),
-		.pathFragment = fragPath.c_str(),
-		.attachmentColorFormats = srat::slice<vkof::ImageFormat const>(kColorFmts, 1),
-		.attachmentDepthStencilFormat = vkof::ImageFormat::d24_unorm_s8_uint,
-		.depthTest = vkof::DepthTest::write_on_test_on,
-		.cullMode = vkof::CullMode::back,
-		.blendMode = vkof::BlendMode::none,
-		.includePaths = { kIncludePaths, 1 },
-	});
+	vkof::Pipeline const visibilityPipeline = (
+		vkof::pipeline_graphics_create({
+			.pathMesh = meshPath.c_str(),
+			.pathFragment = fragPath.c_str(),
+			.attachmentColorFormats = (
+				srat::slice<vkof::ImageFormat const>(kColorFmts, 1u)
+			),
+			.attachmentDepthStencilFormat = vkof::ImageFormat::d24_unorm_s8_uint,
+			.depthTest = vkof::DepthTest::write_on_test_on,
+			.cullMode = vkof::CullMode::back,
+			.blendMode = vkof::BlendMode::none,
+			.includePaths = srat::slice { kIncludePaths, 1u },
+		})
+	);
+	vkof::Pipeline const resolvePipeline = (
+		vkof::pipeline_compute_create({
+			.pathCompute = (shaderDir / "resolve.comp").string().c_str(),
+			.includePaths = srat::slice { kIncludePaths, 1u },
+		})
+	);
 	if (headless) { tick("pipeline (shader compile)", t); }
 
 	srat::CameraOrbit cam = {
@@ -145,103 +166,6 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 		.far = 1000.0f,
 	};
 
-	if (headless) {
-		mor::Scene const scene = mor::scene_create();
-		mor::scene_load_gltf(scene, gltfPath);
-		tick("scene load", t);
-
-		mor::GpuScene const gpuScene = mor::scene_gpu_upload(scene);
-		tick("gpu upload", t);
-
-		u32 const meshletCount = mor::scene_gpu_meshlet_count(gpuScene);
-		mor::Buffers const sceneBufs = mor::scene_gpu_buffers(gpuScene);
-
-		cam.aspect = (f32)kScreenW / (f32)kScreenH;
-		GlobalPC const globalPC {
-			.time = 0.0f,
-			.probeX = 0,
-			.probeY = 0,
-			.probeActive = 0u,
-			.debugMode = 0u,
-			.cameraPos = srat::camera_orbit_eye(cam),
-			._pad = {},
-			.viewProj = srat::camera_orbit_proj(cam) * srat::camera_orbit_view(cam),
-		};
-		SceneDrawPC const drawPC {
-			.meshlets = sceneBufs.meshlets,
-			.materials = sceneBufs.materials,
-			.textures = sceneBufs.textures,
-			.instances = sceneBufs.instances,
-			.positions = sceneBufs.positions,
-			.attributes = sceneBufs.attributes,
-			.meshletVerts = sceneBufs.meshletVerts,
-			.meshletTris = sceneBufs.meshletTris,
-			.modelMatrix = f32m44_identity(),
-		};
-
-		{
-			vkof::RenderNode const drawNode = vkof::render_node_create({
-				.queue = vkof::CommandQueue::graphics,
-			});
-			static constexpr f32 kClearColor[] = { 0.05f, 0.05f, 0.1f, 1.0f };
-			static constexpr f32 kDepthClear = 1.0f;
-			vkof::render_node_attachment_color({
-				.node = drawNode,
-				.image = colorTarget,
-				.loadOp = vkof::RenderNodeLoadOp::clear,
-				.mipLevel = 0,
-				.colorIndex = 0,
-				.clearColor = srat::slice<f32 const>(kClearColor, 4),
-			});
-			vkof::render_node_attachment_depth({
-				.node = drawNode,
-				.image = depthTarget,
-				.loadOp = vkof::RenderNodeLoadOp::clear,
-				.mipLevel = 0,
-				.clearDepth = srat::slice<f32 const>(&kDepthClear, 1),
-			});
-			vkof::render_node_callback({
-				.node = drawNode,
-				.callback = [&](vkof::CommandBuffer const & cmd) {
-					vkof::cmd_draw({
-						.cmd = cmd,
-						.pipeline = pipeline,
-						.pushconstant = srat::slice<u8 const>(
-							reinterpret_cast<u8 const *>(&drawPC), sizeof(drawPC)
-						),
-						.vertexCount = meshletCount,
-						.instanceCount = 1,
-					});
-				},
-			});
-			vkof::RenderNode const nodes[] = { drawNode };
-			vkof::render_graph_execute({
-				.nodes = srat::slice<vkof::RenderNode const>(nodes, 1),
-				.rootPushconstant = srat::slice<u8 const>(
-					reinterpret_cast<u8 const *>(&globalPC), sizeof(globalPC)
-				),
-				.finalImage = colorTarget,
-			});
-			vkof::render_node_destroy(drawNode);
-		}
-		tick("render (submit)", t);
-
-		vkof::device_wait_idle();
-		tick("gpu wait (jit+render)", t);
-
-		vkof::screenshot(colorTarget, screenshotPath);
-		tick("screenshot (copy+png)", t);
-
-		vkof::device_wait_idle();
-		mor::scene_destroy(scene);
-		mor::scene_gpu_destroy(gpuScene);
-		vkof::pipeline_destroy(pipeline);
-		mor::sampler_cache_destroy();
-		vkof::shutdown();
-		tick("shutdown", t);
-		return 0;
-	}
-
 	bool const singleModelMode = (gltfPath != nullptr && scenePath == nullptr);
 	if (singleModelMode) {
 		scene_desc_add_instance(
@@ -250,9 +174,36 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 		);
 	}
 
-	std::unordered_map<std::string, LoadedModel> loadedModels;
+	std::unordered_map<std::string, size_t> loadedModels;
+	std::vector<LoadedModel> modelList;
 
-	auto const ensure_model_loaded = [&](std::string const & filename) {
+	static constexpr u32 kMaxModels = 256u;
+	vkof::Buffer const modelsIndirectBuffer = vkof::buffer_create({
+		.byteCount = sizeof(ModelIndirectDesc) * kMaxModels,
+		.memory = vkof::BufferMemory::DeviceOnly,
+	});
+
+	auto const fnUploadModelsIndirectBuffer = [&]() {
+		std::vector<ModelIndirectDesc> descs(modelList.size());
+		for (size_t i = 0u; i < modelList.size(); ++i) {
+			mor::Buffers const bufs = mor::scene_gpu_buffers(modelList[i].gpuScene);
+			descs[i] = ModelIndirectDesc {
+				.meshlets = bufs.meshlets,
+				.materials = bufs.materials,
+			};
+		}
+		if (descs.empty()) { return; }
+		vkof::buffer_upload({
+			.buffer = modelsIndirectBuffer,
+			.byteOffset = 0u,
+			.data = srat::slice<u8 const>(
+				reinterpret_cast<u8 const *>(descs.data()),
+				descs.size() * sizeof(ModelIndirectDesc)
+			),
+		});
+	};
+
+	auto const fnVerifyModelLoaded = [&](std::string const & filename) {
 		if (loadedModels.count(filename)) { return; }
 		std::filesystem::path p(filename);
 		if (p.is_relative()) { p = repoDir / p; }
@@ -260,14 +211,21 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			printf("[warn] model not found: %s\n", p.c_str());
 			return;
 		}
-		mor::Scene s = mor::scene_create();
-		mor::scene_load_gltf(s, p.c_str());
-		mor::GpuScene gs = mor::scene_gpu_upload(s);
-		loadedModels[filename] = { s, gs };
+		mor::Scene const scene = mor::scene_create();
+		mor::scene_load_gltf(scene, p.c_str());
+		mor::GpuScene const sceneGpu = mor::scene_gpu_upload(scene);
+		u32 const modelId = modelList.size();
+		loadedModels[filename] = modelId;
+		modelList.push_back({
+			.scene = scene,
+			.gpuScene = sceneGpu,
+			.modelId = modelId,
+		});
+		fnUploadModelsIndirectBuffer();
 	};
 
 	for (SceneInstance const & inst : sceneDesc.instances) {
-		ensure_model_loaded(inst.filename);
+		fnVerifyModelLoaded(inst.filename);
 	}
 
 	GLFWwindow * const window = vkof::window();
@@ -320,7 +278,7 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 		cam.aspect = (f32)winW / (f32)winH;
 
 		for (SceneInstance const & inst : sceneDesc.instances) {
-			ensure_model_loaded(inst.filename);
+			fnVerifyModelLoaded(inst.filename);
 		}
 
 		bool const rightClick = (
@@ -345,7 +303,7 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 				std::filesystem::path(uri), repoDir
 			).string();
 			scene_desc_add_instance(sceneDesc, relPath);
-			ensure_model_loaded(relPath);
+			fnVerifyModelLoaded(relPath);
 		}
 
 		if (!singleModelMode) {
@@ -368,14 +326,16 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			cam.azimuth = 0.0f;
 			cam.elevation = 0.3f;
 		}
+		// these match MOR_DEBUG_VIEW* in mor_shared.h
 		static constexpr char const * kDebugModes[] = {
 			"none",
 			"meshlet index",
-			"material index",
-			"instance index",
-			"depth",
+			"model index",
+			"triangle index",
 		};
-		ImGui::Combo("debug", &sDebugMode, kDebugModes, 5);
+		ImGui::Combo(
+			"debug", &sDebugMode, kDebugModes, IM_ARRAYSIZE(kDebugModes)
+		);
 		ImGui::End();
 
 		if (char const * msg = vkof::probe_message()) {
@@ -392,7 +352,7 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			static constexpr f32 kDepthClear = 1.0f;
 			vkof::render_node_attachment_color({
 				.node = drawNode,
-				.image = colorTarget,
+				.image = visibilityTarget,
 				.loadOp = vkof::RenderNodeLoadOp::clear,
 				.mipLevel = 0,
 				.colorIndex = 0,
@@ -411,22 +371,25 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 					for (SceneInstance const & inst : sceneDesc.instances) {
 						auto const it = loadedModels.find(inst.filename);
 						if (it == loadedModels.end()) { continue; }
-						mor::Buffers const bufs = mor::scene_gpu_buffers(it->second.gpuScene);
-						u32 const count = mor::scene_gpu_meshlet_count(it->second.gpuScene);
+						LoadedModel const & model = modelList[it->second];
+						mor::Buffers const bufs = (
+							mor::scene_gpu_buffers(model.gpuScene)
+						);
+						u32 const count = (
+							mor::scene_gpu_meshlet_count(model.gpuScene)
+						);
 						SceneDrawPC const drawPC {
+							.modelId = model.modelId,
 							.meshlets = bufs.meshlets,
-							.materials = bufs.materials,
-							.textures = bufs.textures,
-							.instances = bufs.instances,
 							.positions = bufs.positions,
-							.attributes = bufs.attributes,
+							.instances = bufs.instances,
 							.meshletVerts = bufs.meshletVerts,
 							.meshletTris = bufs.meshletTris,
 							.modelMatrix = make_model_matrix(inst),
 						};
 						vkof::cmd_draw({
 							.cmd = cmd,
-							.pipeline = pipeline,
+							.pipeline = visibilityPipeline,
 							.pushconstant = srat::slice<u8 const>(
 								reinterpret_cast<u8 const *>(&drawPC), sizeof(drawPC)
 							),
@@ -436,24 +399,84 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 					}
 				},
 			});
-			vkof::RenderNode const nodes[] = { drawNode };
+
+			u32 const visibilityHandle = (
+				vkof::transient_image_storage_handle({
+					.image = visibilityTarget,
+					.mipLevel = 0,
+				})
+			);
+			u32 const colorHandle = (
+				vkof::transient_image_storage_handle({
+					.image = colorTarget,
+					.mipLevel = 0,
+				})
+			);
+
+			// TODO try compute queue (will require synchronization)
+			vkof::RenderNode const resolveNode = vkof::render_node_create({
+				.queue = vkof::CommandQueue::graphics,
+			});
+			vkof::render_node_add_image({
+				.node = resolveNode,
+				.image = visibilityTarget,
+				.access = vkof::RenderNodeAccess::read,
+			});
+			vkof::render_node_add_image({
+				.node = resolveNode,
+				.image = colorTarget,
+				.access = vkof::RenderNodeAccess::write,
+			});
+			vkof::render_node_callback({
+				.node = resolveNode,
+				.callback = [&](vkof::CommandBuffer const & cmd) {
+					ResolvePC const resolvePC {
+						.visibilityImageHandle = visibilityHandle,
+						.outputImageHandle = colorHandle,
+						.models = vkof::buffer_virtual_address(modelsIndirectBuffer),
+					};
+					ImGui::Begin("Resolve PC");
+					ImGui::Text("vis handle: %u", visibilityHandle);
+					ImGui::Text("color handle: %u", colorHandle);
+					ImGui::Text("models buffer: %lu", resolvePC.models);
+					ImGui::End();
+					vkof::cmd_dispatch(vkof::CmdDispatch {
+						.cmd = cmd,
+						.pipeline = resolvePipeline,
+						.pushconstant = srat::slice<u8 const>(
+							reinterpret_cast<u8 const *>(&resolvePC), sizeof(resolvePC)
+						),
+						.groupCountX = (kScreenW + 15) / 16,
+						.groupCountY = (kScreenH + 15) / 16,
+						.groupCountZ = 1,
+					});
+				}
+			});
+
+			vkof::RenderNode const nodes[] = { drawNode, resolveNode, };
 			vkof::render_graph_execute({
-				.nodes = srat::slice<vkof::RenderNode const>(nodes, 1),
+				.nodes = srat::slice<vkof::RenderNode const>(nodes, 2u),
 				.rootPushconstant = srat::slice<u8 const>(
 					reinterpret_cast<u8 const *>(&globalPC), sizeof(globalPC)
 				),
 				.finalImage = colorTarget,
 			});
 			vkof::render_node_destroy(drawNode);
+			vkof::render_node_destroy(resolveNode);
 		}
 	}
 
 	vkof::device_wait_idle();
-	for (auto & [filename, model] : loadedModels) {
+	for (auto & [filename, modelIndex] : loadedModels) {
+		LoadedModel const & model = modelList[modelIndex];
 		mor::scene_destroy(model.scene);
 		mor::scene_gpu_destroy(model.gpuScene);
 	}
-	vkof::pipeline_destroy(pipeline);
+	loadedModels.clear();
+	modelList.clear();
+	vkof::buffer_destroy(modelsIndirectBuffer);
+	vkof::pipeline_destroy(visibilityPipeline);
+	vkof::pipeline_destroy(resolvePipeline);
 	mor::sampler_cache_destroy();
 	vkof::shutdown();
 	return 0;

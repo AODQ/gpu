@@ -11,12 +11,21 @@
 #endif
 
 struct SceneDrawPC {
+	u32 modelId;
 	u64 meshlets;
-	u64 materials;
-	u64 textures;
+	u64 positions;
 	u64 instances;
+	u64 meshletVerts;
+	u64 meshletTris;
+	f32m44 modelMatrix;
+};
+
+struct DeferredDrawInfo {
+	u64 meshlets;
 	u64 positions;
 	u64 attributes;
+	u64 materials;
+	u64 instances;
 	u64 meshletVerts;
 	u64 meshletTris;
 	f32m44 modelMatrix;
@@ -26,7 +35,7 @@ struct SceneDrawPC {
 static_assert(sizeof(SceneDrawPC) <= 128, "SceneDrawPC must be <= 128 bytes");
 #else
 layout(push_constant, scalar) uniform PC {
-	GlobalPC    global;
+	GlobalPC global;
 	SceneDrawPC draw;
 } pc;
 #endif

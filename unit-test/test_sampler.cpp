@@ -146,8 +146,8 @@ TEST_CASE("sampler: different samplers produce different handles") {
 		.addressModeV = vkof::SamplerAddressMode::clamp_to_edge,
 		.addressModeW = vkof::SamplerAddressMode::clamp_to_edge,
 	});
-	u64 const h0 = vkof::image_sampler_handle({ .image = img, .sampler = s0 });
-	u64 const h1 = vkof::image_sampler_handle({ .image = img, .sampler = s1 });
+	u32 const h0 = vkof::image_sampler_handle({ .image = img, .sampler = s0 });
+	u32 const h1 = vkof::image_sampler_handle({ .image = img, .sampler = s1 });
 	CHECK(h0 != h1);
 	vkof::sampler_destroy(s0);
 	vkof::sampler_destroy(s1);
