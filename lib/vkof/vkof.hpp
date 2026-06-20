@@ -18,6 +18,7 @@ namespace vkof
 	enum struct ImageFormat {
 		none,
 		r8g8b8a8_unorm,
+		r8g8b8a8_srgb,
 		r16g16b16a16_sfloat,
 		r32_float,
 		d24_unorm_s8_uint,
@@ -335,6 +336,10 @@ namespace vkof
 	// Call once per frame before building any ImGui widgets.
 	// render_graph_execute renders and presents the UI automatically.
 	void imgui_begin();
+
+	// Save a transient image to a PNG file. Blocks until the GPU is idle.
+	// Intended for headless rendering — call after render_graph_execute.
+	void screenshot(TransientImage const & image, char const * const path);
 }
 
 // -----------------------------------------------------------------------------

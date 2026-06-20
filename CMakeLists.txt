@@ -94,6 +94,14 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(meshoptimizer)
 
+FetchContent_Declare(
+	stb
+	GIT_REPOSITORY https://github.com/nothings/stb.git
+	GIT_TAG        master
+	GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(stb)
+
 # ------------------------------------------------------------------------------
 # -- Vulkan
 # ------------------------------------------------------------------------------
@@ -181,6 +189,7 @@ add_library(
 	STATIC
 	lib/vkof/vkof.cpp
 	lib/vkof/vma.cpp
+	lib/vkof/stb_image_write.cpp
 	${imgui_SOURCE_DIR}/imgui.cpp
 	${imgui_SOURCE_DIR}/imgui_draw.cpp
 	${imgui_SOURCE_DIR}/imgui_tables.cpp
@@ -207,6 +216,7 @@ target_include_directories(
 	${imgui_SOURCE_DIR}
 	SYSTEM PRIVATE
 	${vma_SOURCE_DIR}/include
+	${stb_SOURCE_DIR}
 )
 
 target_precompile_headers(
@@ -230,10 +240,10 @@ set_source_files_properties(
 # -- mor (glTF scene loading + meshlet building; depends on srat + vkof)
 # ------------------------------------------------------------------------------
 
-add_library(mor STATIC lib/mor/mor.cpp)
+add_library(mor STATIC lib/mor/mor.cpp lib/mor/stb_image.cpp)
 
 target_include_directories(mor PUBLIC lib/)
-target_include_directories(mor SYSTEM PRIVATE ${cgltf_SOURCE_DIR})
+target_include_directories(mor SYSTEM PRIVATE ${cgltf_SOURCE_DIR} ${stb_SOURCE_DIR})
 
 target_link_libraries(
 	mor

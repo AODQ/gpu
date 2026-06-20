@@ -19,14 +19,11 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 
 	vkof::init();
 
-	mor::Scene * const scene = mor::scene_create();
+	mor::Scene const scene = mor::scene_create();
 	mor::scene_load_gltf(scene, argv[1]);
-	mor::GpuScene const gpuScene    = mor::scene_gpu_upload(scene);
-	u32 const meshletCount          = mor::scene_gpu_meshlet_count(gpuScene);
-	u32 const instanceCount         = mor::scene_instance_count(scene);
-	u32 const vertexCount           = mor::scene_vertex_count(scene);
-	mor::Buffers const sceneBufs    = mor::scene_gpu_buffers(gpuScene);
-	mor::scene_destroy(scene);
+	mor::GpuScene const gpuScene = mor::scene_gpu_upload(scene);
+	u32 const meshletCount = mor::scene_gpu_meshlet_count(gpuScene);
+	mor::Buffers const sceneBufs = mor::scene_gpu_buffers(gpuScene);
 
 	std::filesystem::path const appDir = (
 		std::filesystem::canonical(std::filesystem::path(__FILE__).parent_path())
@@ -90,7 +87,12 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 	glfwGetCursorPos(window, &prevMouseX, &prevMouseY);
 
 	while (!glfwWindowShouldClose(window)) {
-		glfwPollEvents();
+		if (glfwGetWindowAttrib(window, GLFW_FOCUSED)) {
+			glfwPollEvents();
+		} else {
+			glfwWaitEventsTimeout(0.1);
+			continue;
+		}
 
 		if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
 			glfwSetWindowShouldClose(window, GLFW_TRUE);
@@ -129,6 +131,8 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 		};
 		SceneDrawPC const drawPC {
 			.meshlets     = sceneBufs.meshlets,
+			.materials    = sceneBufs.materials,
+			.textures     = sceneBufs.textures,
 			.instances    = sceneBufs.instances,
 			.positions    = sceneBufs.positions,
 			.attributes   = sceneBufs.attributes,
@@ -139,10 +143,10 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 
 		vkof::imgui_begin();
 		ImGui::Begin("scene");
-		ImGui::Text("fps:       %.1f", ImGui::GetIO().Framerate);
-		ImGui::Text("instances: %u",   instanceCount);
-		ImGui::Text("meshlets:  %u",   meshletCount);
-		ImGui::Text("vertices:  %u",   vertexCount);
+		ImGui::Text("fps: %.1f", ImGui::GetIO().Framerate);
+		ImGui::Separator();
+		mor::scene_imgui_debug(scene);
+		ImGui::Separator();
 		if (ImGui::Button("reset camera")) {
 			cam.target    = { 0.0f, 0.0f, 0.0f };
 			cam.distance  = 5.0f;
@@ -199,6 +203,7 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 	}
 
 	vkof::device_wait_idle();
+	mor::scene_destroy(scene);
 	mor::scene_gpu_destroy(gpuScene);
 	vkof::pipeline_destroy(pipeline);
 	vkof::shutdown();

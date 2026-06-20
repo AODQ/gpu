@@ -37,6 +37,7 @@ mor::scene_gpu_destroy(gpu);
 | field | content |
 |---|---|
 | `meshlets` | `Meshlet[]` — vertex/triangle offsets + instance index |
+| `materials` | `Material[]` — materials |
 | `instances` | `Instance[]` — world transform + meshlet range |
 | `positions` | `f32v3[]` — vertex positions |
 | `attributes` | `VertexAttr[]` — normals, UVs |

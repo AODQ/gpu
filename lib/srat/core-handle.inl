@@ -37,6 +37,15 @@ srat::HandlePool<Handle, InternalResource>::create(
 template <typename Handle, typename InternalResource>
 void srat::HandlePool<Handle, InternalResource>::deleteInternal() const {
 	if (resourceAllocations == nullptr) { return; }
+#if SRAT_DEBUG()
+	for (auto const & [id, loc] : locationMap) {
+		printf(
+			"handle leak: id=0x%llx allocated at %s:%u\n",
+			(unsigned long long)id, loc.file_name(), loc.line()
+		);
+	}
+	SRAT_ASSERT(locationMap.empty());
+#endif
 	for (u32 i = 0; i < maxHandles; ++i) {
 		if (allocator.isIndexAlive(i)) {
 			u64 const elementOffset = allocator.elementOffset(i);
@@ -81,7 +90,8 @@ srat::HandlePool<Handle, InternalResource>::operator=(HandlePool && o)
 
 template <typename Handle, typename InternalResource>
 Handle srat::HandlePool<Handle, InternalResource>::allocate(
-	InternalResource const & resource
+	InternalResource const & resource,
+	std::source_location const loc
 ) {
 	srat::AllocVirtualRangeBlock const handleId = (
 		allocator.allocate({.elementCount = 1})
@@ -89,16 +99,19 @@ Handle srat::HandlePool<Handle, InternalResource>::allocate(
 	auto const elementOffset = handleId.elementOffset;
 	SRAT_ASSERT(elementOffset < maxHandles);
 	if (!handleId.valid(allocator)) {
-		return Handle{0}; // invalid handle
-		
+		return Handle { 0 };
 	}
-	new (&resourceAllocations[elementOffset])InternalResource(resource);
-	return { handleId.handle };
+	new (&resourceAllocations[elementOffset]) InternalResource(resource);
+#if SRAT_DEBUG()
+	locationMap.emplace(handleId.handle, loc);
+#endif
+	return Handle { handleId.handle };
 }
 
 template <typename Handle, typename InternalResource>
 Handle srat::HandlePool<Handle, InternalResource>::allocate(
-	InternalResource && resource
+	InternalResource && resource,
+	std::source_location const loc
 ) {
 	srat::AllocVirtualRangeBlock const handleId = (
 		allocator.allocate({.elementCount = 1})
@@ -106,10 +119,13 @@ Handle srat::HandlePool<Handle, InternalResource>::allocate(
 	auto const elementOffset = handleId.elementOffset;
 	SRAT_ASSERT(elementOffset < maxHandles);
 	if (!handleId.valid(allocator)) {
-		return Handle{0}; // invalid handle
+		return Handle { 0 };
 	}
 	new (&resourceAllocations[elementOffset])
 		InternalResource(std::move(resource));
+#if SRAT_DEBUG()
+	locationMap.emplace(handleId.handle, loc);
+#endif
 	return Handle { handleId.handle };
 }
 
@@ -117,11 +133,12 @@ template <typename Handle, typename InternalResource>
 void srat::HandlePool<Handle, InternalResource>::free(Handle const & handle)
 {
 	if (!valid(handle)) { return; }
-	// free the resource
 	u64 const offset = allocator.elementOffset(srat::handle_index(handle.id));
 	SRAT_ASSERT(offset < maxHandles);
 	resourceAllocations[offset].~InternalResource();
-	// free the handle from virtual range allocator
+#if SRAT_DEBUG()
+	locationMap.erase(handle.id);
+#endif
 	allocator.free(handle.id);
 }
 

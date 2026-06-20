@@ -1,12 +1,18 @@
 #define CGLTF_IMPLEMENTATION
 #include <cgltf.h>
 
+#include <stb_image.h>
+
+
 #include <meshoptimizer.h>
 
 #include <mor/mor.hpp>
 #include <srat/core-math.hpp>
 #include <vkof/vkof.hpp>
 
+#include <imgui.h>
+
+#include <unordered_map>
 #include <vector>
 
 // ----------------------------------------------------------------------------
@@ -22,6 +28,14 @@ struct ImplScene {
 	std::vector<u8> meshletTris;
 	std::vector<Meshlet> meshlets;
 	std::vector<Instance> instances;
+
+	std::unordered_map<cgltf_texture const *, u64> textureHandles;
+	std::vector<vkof::Image> images;
+	std::vector<vkof::Sampler> samplers;
+
+	std::unordered_map<cgltf_material const *, u32> materialIndices;
+
+	std::vector<Material> materials;
 };
 
 struct ImplGpuScene {
@@ -31,6 +45,8 @@ struct ImplGpuScene {
 	vkof::Buffer meshletTris;
 	vkof::Buffer meshlets;
 	vkof::Buffer instances;
+	vkof::Buffer materials;
+	vkof::Buffer textures;
 	u32 meshletCount;
 };
 
@@ -42,6 +58,92 @@ static constexpr u32 skMaxMeshletTris = 124;
 // ----------------------------------------------------------------------------
 // -- private helpers
 // ----------------------------------------------------------------------------
+
+static u64 load_texture(
+	ImplScene & s,
+	cgltf_texture const * tex,
+	bool const srgb
+) {
+	if (!tex || !tex->image || !tex->image->buffer_view) return 0;
+
+	auto const it = s.textureHandles.find(tex);
+	if (it != s.textureHandles.end()) return it->second;
+
+	cgltf_image const * img = tex->image;
+	u8 const * encoded = (
+		(u8 const *)img->buffer_view->buffer->data
+		+ img->buffer_view->offset
+	);
+	int const encodedLen = (int)img->buffer_view->size;
+
+	int w, h, channels;
+	stbi_uc * const pixels = stbi_load_from_memory(
+		encoded, encodedLen, &w, &h, &channels, 4
+	);
+	if (!pixels) return 0;
+
+	vkof::Image const image = vkof::image_create({
+		.width = (u32)w,
+		.height = (u32)h,
+		.format = (
+			srgb
+			? vkof::ImageFormat::r8g8b8a8_srgb
+			: vkof::ImageFormat::r8g8b8a8_unorm
+		),
+		.mipLevels = 1,
+		.optInitialData = srat::slice<u8 const>(
+			pixels, (u64)w * h * 4
+		),
+	});
+	stbi_image_free(pixels);
+
+	auto const toFilter = [](int gl) -> vkof::SamplerFilter {
+		if (gl == 9728 || gl == 9984 || gl == 9986) {
+			return vkof::SamplerFilter::nearest;
+		}
+		return vkof::SamplerFilter::linear;
+	};
+	auto const toWrap = [](int gl) -> vkof::SamplerAddressMode {
+		if (gl == 33071) return vkof::SamplerAddressMode::clamp_to_edge;
+		if (gl == 33648) return vkof::SamplerAddressMode::mirrored_repeat;
+		return vkof::SamplerAddressMode::repeat;
+	};
+
+	cgltf_sampler const * cgSamp = tex->sampler;
+	vkof::Sampler const sampler = vkof::sampler_create({
+		.magFilter = (
+			cgSamp
+			? toFilter(cgSamp->mag_filter)
+			: vkof::SamplerFilter::linear
+		),
+		.minFilter = (
+			cgSamp
+			? toFilter(cgSamp->min_filter)
+			: vkof::SamplerFilter::linear
+		),
+		.addressModeU = (
+			cgSamp
+			? toWrap(cgSamp->wrap_s)
+			: vkof::SamplerAddressMode::repeat
+		),
+		.addressModeV = (
+			cgSamp
+			? toWrap(cgSamp->wrap_t)
+			: vkof::SamplerAddressMode::repeat
+		),
+		.addressModeW = vkof::SamplerAddressMode::repeat,
+	});
+
+	u64 const handle = vkof::image_sampler_handle({
+		.image = image,
+		.sampler = sampler,
+	});
+
+	s.images.push_back(image);
+	s.samplers.push_back(sampler);
+	s.textureHandles.emplace(tex, handle);
+	return handle;
+}
 
 static void load_primitive(
 	ImplScene * s,
@@ -103,6 +205,50 @@ static void load_primitive(
 		indices[i] = (u32)cgltf_accessor_read_index(prim.indices, i);
 	}
 
+	// -- materials
+	u32 materialIndex = 0;
+	if (prim.material) {
+		auto const it = s->materialIndices.find(prim.material);
+		if (it != s->materialIndices.end()) {
+			materialIndex = it->second;
+		} else {
+			materialIndex = (u32)s->materials.size();
+			cgltf_material const & mat = *prim.material;
+			cgltf_pbr_metallic_roughness const & mr = (
+				mat.pbr_metallic_roughness
+			);
+			s->materials.push_back({
+				.baseColor = {
+					mr.base_color_factor[0],
+					mr.base_color_factor[1],
+					mr.base_color_factor[2],
+					mr.base_color_factor[3],
+				},
+				.metallic = mr.metallic_factor,
+				.roughness = mr.roughness_factor,
+				.emissive = {
+					mat.emissive_factor[0],
+					mat.emissive_factor[1],
+					mat.emissive_factor[2],
+				},
+				.textureBaseColor = load_texture(
+					*s, mr.base_color_texture.texture, true
+				),
+				.textureNormal = load_texture(
+					*s, mat.normal_texture.texture, false
+				),
+				.textureMetallicRoughness = load_texture(
+					*s, mr.metallic_roughness_texture.texture, false
+				),
+				.textureEmissive = load_texture(
+					*s, mat.emissive_texture.texture, true
+				),
+				.flags = 0,
+			});
+			s->materialIndices.emplace(prim.material, materialIndex);
+		}
+	}
+
 	// -- meshlets
 	size_t const maxMeshlets = meshopt_buildMeshletsBound(
 		indexCount, skMaxMeshletVerts, skMaxMeshletTris
@@ -142,6 +288,7 @@ static void load_primitive(
 			.triangleOffset = triOffsetBase + m.triangle_offset,
 			.triangleCount = m.triangle_count,
 			.instanceIndex = instanceIndex,
+			.materialIndex = (u32)materialIndex,
 		});
 	}
 }
@@ -190,28 +337,98 @@ static vkof::Buffer upload_buffer(void const * data, u64 byteCount) {
 // -- public API
 // ----------------------------------------------------------------------------
 
-mor::Scene * mor::scene_create() {
-	return reinterpret_cast<mor::Scene *>(new ImplScene());
+mor::Scene mor::scene_create() {
+	return mor::Scene { .id = reinterpret_cast<u64>(new ImplScene()) };
 }
 
-void mor::scene_destroy(mor::Scene * scene) {
-	delete reinterpret_cast<ImplScene *>(scene);
+void mor::scene_destroy(mor::Scene const & scene) {
+	ImplScene * const s = reinterpret_cast<ImplScene *>(scene.id);
+	for (vkof::Image const & img : s->images) {
+		vkof::image_destroy(img);
+	}
+	for (vkof::Sampler const & samp : s->samplers) {
+		vkof::sampler_destroy(samp);
+	}
+	delete s;
 }
 
-u32 mor::scene_instance_count(mor::Scene const * scene) {
-	return (u32)reinterpret_cast<ImplScene const *>(scene)->instances.size();
+u32 mor::scene_instance_count(mor::Scene const & scene) {
+	return (u32)reinterpret_cast<ImplScene const *>(scene.id)->instances.size();
 }
 
-u32 mor::scene_meshlet_count(mor::Scene const * scene) {
-	return (u32)reinterpret_cast<ImplScene const *>(scene)->meshlets.size();
+u32 mor::scene_meshlet_count(mor::Scene const & scene) {
+	return (u32)reinterpret_cast<ImplScene const *>(scene.id)->meshlets.size();
 }
 
-u32 mor::scene_vertex_count(mor::Scene const * scene) {
-	return (u32)reinterpret_cast<ImplScene const *>(scene)->positions.size();
+u32 mor::scene_vertex_count(mor::Scene const & scene) {
+	return (u32)reinterpret_cast<ImplScene const *>(scene.id)->positions.size();
 }
 
-void mor::scene_load_gltf(mor::Scene * scene, char const * path) {
-	ImplScene * s = reinterpret_cast<ImplScene *>(scene);
+void mor::scene_imgui_debug(mor::Scene const & scene) {
+	ImplScene const * const s = reinterpret_cast<ImplScene const *>(scene.id);
+
+	u32 const instanceCount = (u32)s->instances.size();
+	u32 const meshletCount = (u32)s->meshlets.size();
+	u32 const vertexCount = (u32)s->positions.size();
+	u32 const materialCount = (u32)s->materials.size();
+	u32 const textureCount = (u32)s->images.size();
+
+	char label[64];
+
+	snprintf(label, sizeof(label), "instances (%u)", instanceCount);
+	if (ImGui::TreeNode(label)) {
+		for (u32 i = 0; i < instanceCount; ++i) {
+			Instance const & inst = s->instances[i];
+			ImGui::Text(
+				"[%u] meshlets: %u  offset: %u",
+				i, inst.meshletCount, inst.meshletOffset
+			);
+		}
+		ImGui::TreePop();
+	}
+
+	snprintf(label, sizeof(label), "meshlets (%u)", meshletCount);
+	if (ImGui::TreeNode(label)) {
+		for (u32 i = 0; i < meshletCount; ++i) {
+			Meshlet const & m = s->meshlets[i];
+			ImGui::Text(
+				"[%u] verts: %u  tris: %u  inst: %u  mat: %u",
+				i, m.vertexCount, m.triangleCount, m.instanceIndex, m.materialIndex
+			);
+		}
+		ImGui::TreePop();
+	}
+
+	ImGui::Text("vertices:  %u", vertexCount);
+
+	snprintf(label, sizeof(label), "materials (%u)", materialCount);
+	if (ImGui::TreeNode(label)) {
+		for (u32 i = 0; i < materialCount; ++i) {
+			Material const & mat = s->materials[i];
+			ImGui::Text(
+				"[%u] base: (%.2f %.2f %.2f %.2f)  metal: %.2f  rough: %.2f",
+				i,
+				mat.baseColor.x, mat.baseColor.y,
+				mat.baseColor.z, mat.baseColor.w,
+				mat.metallic, mat.roughness
+			);
+		}
+		ImGui::TreePop();
+	}
+
+	snprintf(label, sizeof(label), "textures (%u)", textureCount);
+	if (ImGui::TreeNode(label)) {
+		u32 i = 0u;
+		for (auto const & [tex, handle] : s->textureHandles) {
+			ImGui::Text("[%u] handle: 0x%llx", i, (unsigned long long)handle);
+			++i;
+		}
+		ImGui::TreePop();
+	}
+}
+
+void mor::scene_load_gltf(mor::Scene const & scene, char const * const path) {
+	ImplScene * const s = reinterpret_cast<ImplScene *>(scene.id);
 
 	cgltf_options const options {};
 	cgltf_data * data = nullptr;
@@ -232,8 +449,8 @@ void mor::scene_load_gltf(mor::Scene * scene, char const * path) {
 	cgltf_free(data);
 }
 
-mor::GpuScene mor::scene_gpu_upload(mor::Scene const * scene) {
-	ImplScene const * s = reinterpret_cast<ImplScene const *>(scene);
+mor::GpuScene mor::scene_gpu_upload(mor::Scene const & scene) {
+	ImplScene const * const s = reinterpret_cast<ImplScene const *>(scene.id);
 	ImplGpuScene * gpu = new ImplGpuScene();
 
 	gpu->positions = upload_buffer(
@@ -254,26 +471,50 @@ mor::GpuScene mor::scene_gpu_upload(mor::Scene const * scene) {
 	gpu->instances = upload_buffer(
 		s->instances.data(), s->instances.size() * sizeof(Instance)
 	);
+	if (!s->materials.empty()) {
+		gpu->materials = upload_buffer(
+			s->materials.data(), s->materials.size() * sizeof(Material)
+		);
+	}
+	{
+		std::vector<u64> handles;
+		handles.reserve(s->images.size());
+		for (size_t i = 0; i < s->images.size(); ++i) {
+			handles.emplace_back(vkof::image_sampler_handle({
+				.image = s->images[i],
+				.sampler = s->samplers[i],
+			}));
+		}
+		if (!handles.empty()) {
+			gpu->textures = upload_buffer(
+				handles.data(), handles.size() * sizeof(u64)
+			);
+		}
+	}
 	gpu->meshletCount = (u32)s->meshlets.size();
 
 	return mor::GpuScene { .id = reinterpret_cast<u64>(gpu) };
 }
 
-void mor::scene_gpu_destroy(mor::GpuScene scene) {
-	ImplGpuScene * gpu = reinterpret_cast<ImplGpuScene *>(scene.id);
+void mor::scene_gpu_destroy(mor::GpuScene const & scene) {
+	ImplGpuScene * const gpu = reinterpret_cast<ImplGpuScene *>(scene.id);
 	vkof::buffer_destroy(gpu->positions);
 	vkof::buffer_destroy(gpu->attributes);
 	vkof::buffer_destroy(gpu->meshletVerts);
 	vkof::buffer_destroy(gpu->meshletTris);
 	vkof::buffer_destroy(gpu->meshlets);
 	vkof::buffer_destroy(gpu->instances);
+	vkof::buffer_destroy(gpu->materials);
+	vkof::buffer_destroy(gpu->textures);
 	delete gpu;
 }
 
-mor::Buffers mor::scene_gpu_buffers(mor::GpuScene scene) {
-	ImplGpuScene const * gpu = reinterpret_cast<ImplGpuScene const *>(scene.id);
+mor::Buffers mor::scene_gpu_buffers(mor::GpuScene const & scene) {
+	ImplGpuScene const * const gpu = reinterpret_cast<ImplGpuScene const *>(scene.id);
 	return {
 		.meshlets = vkof::buffer_virtual_address(gpu->meshlets),
+		.materials = vkof::buffer_virtual_address(gpu->materials),
+		.textures = vkof::buffer_virtual_address(gpu->textures),
 		.instances = vkof::buffer_virtual_address(gpu->instances),
 		.positions = vkof::buffer_virtual_address(gpu->positions),
 		.attributes = vkof::buffer_virtual_address(gpu->attributes),
@@ -282,6 +523,6 @@ mor::Buffers mor::scene_gpu_buffers(mor::GpuScene scene) {
 	};
 }
 
-u32 mor::scene_gpu_meshlet_count(mor::GpuScene scene) {
+u32 mor::scene_gpu_meshlet_count(mor::GpuScene const & scene) {
 	return reinterpret_cast<ImplGpuScene const *>(scene.id)->meshletCount;
 }

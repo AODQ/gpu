@@ -8,6 +8,8 @@
 #include <GLFW/glfw3.h>
 #include <vk_mem_alloc.h>
 
+#include <stb_image_write.h>
+
 #include <chrono>
 #include <unordered_map>
 #include <filesystem>
@@ -66,6 +68,8 @@ static VkFormat to_vk_format(vkof::ImageFormat format) {
 	switch (format) {
 		case vkof::ImageFormat::r8g8b8a8_unorm:
 			return VK_FORMAT_R8G8B8A8_UNORM;
+		case vkof::ImageFormat::r8g8b8a8_srgb:
+			return VK_FORMAT_R8G8B8A8_SRGB;
 		case vkof::ImageFormat::r16g16b16a16_sfloat:
 			return VK_FORMAT_R16G16B16A16_SFLOAT;
 		case vkof::ImageFormat::r32_float:
@@ -3874,4 +3878,203 @@ void vkof::render_graph_execute(RenderGraphExecuteInfo const & exec)
 
 	++sDevice->frameIndex;
 	pipeline_hot_reload();
+}
+
+void vkof::screenshot(
+	vkof::TransientImage const & image,
+	char const * const path
+) {
+	vkof::device_wait_idle();
+
+	vkof::Image const img = vkof::transient_image_get_image(image);
+	VkImage vkImg;
+	u32 w, h;
+	if (!resolve_image(img, vkImg, w, h)) { return; }
+
+	u64 const byteCount = (u64)w * h * 4u;
+
+	VkBuffer stagingBuf;
+	VmaAllocation stagingAlloc;
+	VmaAllocationInfo allocInfo {};
+	{
+		VkBufferCreateInfo const bci = {
+			.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+			.pNext = nullptr,
+			.flags = 0,
+			.size = byteCount,
+			.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+			.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+			.queueFamilyIndexCount = 0,
+			.pQueueFamilyIndices = nullptr,
+		};
+		VmaAllocationCreateInfo const aci = {
+			.flags = (
+				VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+				| VMA_ALLOCATION_CREATE_MAPPED_BIT
+			),
+			.usage = VMA_MEMORY_USAGE_AUTO,
+			.requiredFlags = 0,
+			.preferredFlags = 0,
+			.memoryTypeBits = 0,
+			.pool = nullptr,
+			.pUserData = nullptr,
+			.priority = 0.0f,
+		};
+		VkAssert(vmaCreateBuffer(
+			sDevice->allocator, &bci, &aci, &stagingBuf, &stagingAlloc, &allocInfo
+		));
+	}
+
+	VkCommandPool const pool = sDevice->commandPoolGraphics;
+	VkCommandBuffer cmd;
+	{
+		VkCommandBufferAllocateInfo const cmdAlloc = {
+			.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+			.pNext = nullptr,
+			.commandPool = pool,
+			.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+			.commandBufferCount = 1u,
+		};
+		VkAssert(vkAllocateCommandBuffers(sDevice->device, &cmdAlloc, &cmd));
+	}
+
+	{
+		VkCommandBufferBeginInfo const beginInfo = {
+			.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+			.pNext = nullptr,
+			.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+			.pInheritanceInfo = nullptr,
+		};
+		VkAssert(vkBeginCommandBuffer(cmd, &beginInfo));
+	}
+
+	VkImageSubresourceRange const fullImage = {
+		.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+		.baseMipLevel = 0u,
+		.levelCount = 1u,
+		.baseArrayLayer = 0u,
+		.layerCount = 1u,
+	};
+
+	{
+		VkImageMemoryBarrier2 const barrier = {
+			.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+			.pNext = nullptr,
+			.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+			.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+			.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+			.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT,
+			.oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+			.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.image = vkImg,
+			.subresourceRange = fullImage,
+		};
+		VkDependencyInfo const dep = {
+			.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+			.pNext = nullptr,
+			.dependencyFlags = 0,
+			.memoryBarrierCount = 0,
+			.pMemoryBarriers = nullptr,
+			.bufferMemoryBarrierCount = 0,
+			.pBufferMemoryBarriers = nullptr,
+			.imageMemoryBarrierCount = 1u,
+			.pImageMemoryBarriers = &barrier,
+		};
+		vkCmdPipelineBarrier2(cmd, &dep);
+	}
+
+	{
+		VkBufferImageCopy const region = {
+			.bufferOffset = 0u,
+			.bufferRowLength = 0u,
+			.bufferImageHeight = 0u,
+			.imageSubresource = {
+				.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+				.mipLevel = 0u,
+				.baseArrayLayer = 0u,
+				.layerCount = 1u,
+			},
+			.imageOffset = { 0, 0, 0 },
+			.imageExtent = { w, h, 1u },
+		};
+		vkCmdCopyImageToBuffer(
+			cmd, vkImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			stagingBuf, 1u, &region
+		);
+	}
+
+	{
+		VkImageMemoryBarrier2 const barrier = {
+			.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+			.pNext = nullptr,
+			.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+			.srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT,
+			.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+			.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT,
+			.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			.newLayout = VK_IMAGE_LAYOUT_GENERAL,
+			.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.image = vkImg,
+			.subresourceRange = fullImage,
+		};
+		VkDependencyInfo const dep = {
+			.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+			.pNext = nullptr,
+			.dependencyFlags = 0,
+			.memoryBarrierCount = 0,
+			.pMemoryBarriers = nullptr,
+			.bufferMemoryBarrierCount = 0,
+			.pBufferMemoryBarriers = nullptr,
+			.imageMemoryBarrierCount = 1u,
+			.pImageMemoryBarriers = &barrier,
+		};
+		vkCmdPipelineBarrier2(cmd, &dep);
+	}
+
+	VkAssert(vkEndCommandBuffer(cmd));
+
+	VkFence fence;
+	{
+		VkFenceCreateInfo const fci = {
+			.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+			.pNext = nullptr,
+			.flags = 0,
+		};
+		VkAssert(vkCreateFence(sDevice->device, &fci, nullptr, &fence));
+	}
+
+	{
+		VkCommandBufferSubmitInfo const cmdSubmit = {
+			.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+			.pNext = nullptr,
+			.commandBuffer = cmd,
+			.deviceMask = 0,
+		};
+		VkSubmitInfo2 const submitInfo = {
+			.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+			.pNext = nullptr,
+			.flags = 0,
+			.waitSemaphoreInfoCount = 0,
+			.pWaitSemaphoreInfos = nullptr,
+			.commandBufferInfoCount = 1u,
+			.pCommandBufferInfos = &cmdSubmit,
+			.signalSemaphoreInfoCount = 0,
+			.pSignalSemaphoreInfos = nullptr,
+		};
+		VkAssert(vkQueueSubmit2(sDevice->queueGraphics, 1u, &submitInfo, fence));
+	}
+
+	VkAssert(vkWaitForFences(sDevice->device, 1u, &fence, VK_TRUE, UINT64_MAX));
+
+	vkDestroyFence(sDevice->device, fence, nullptr);
+	vkFreeCommandBuffers(sDevice->device, pool, 1u, &cmd);
+
+	stbi_write_png(
+		path, (int)w, (int)h, 4, allocInfo.pMappedData, (int)(w * 4u)
+	);
+
+	vmaDestroyBuffer(sDevice->allocator, stagingBuf, stagingAlloc);
 }

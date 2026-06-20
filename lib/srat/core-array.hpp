@@ -14,7 +14,7 @@ struct slice {
 private:
 	// -- data
 	T * data { nullptr };
-	size_t elemCount { N };
+	size_t elemCount { N == skSliceDynamicExtent ? size_t(0) : N };
 public:
 	// -- constructors
 	constexpr slice() = default;

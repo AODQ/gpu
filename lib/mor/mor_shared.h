@@ -26,12 +26,25 @@ struct Meshlet {
 	u32 triangleOffset;
 	u32 triangleCount;
 	u32 instanceIndex;
+	u32 materialIndex;
+};
+
+struct Material {
+	f32v4 baseColor;
+	f32 metallic;
+	f32 roughness;
+	f32v3 emissive;
+	u64 textureBaseColor;
+	u64 textureNormal;
+	u64 textureMetallicRoughness;
+	u64 textureEmissive;
+	u32 flags;
 };
 
 struct Instance {
 	f32m44 transform;
-	u32    meshletOffset;
-	u32    meshletCount;
+	u32 meshletOffset;
+	u32 meshletCount;
 };
 
 #ifndef __cplusplus
@@ -41,4 +54,5 @@ layout(buffer_reference, scalar) buffer PositionBuf    { f32v3      data[]; };
 layout(buffer_reference, scalar) buffer AttrBuf        { VertexAttr data[]; };
 layout(buffer_reference, scalar) buffer MeshletVertBuf { u32        data[]; };
 layout(buffer_reference, scalar) buffer MeshletTriBuf  { uint8_t    data[]; };
+layout(buffer_reference, scalar) buffer MaterialBuf    { Material   data[]; };
 #endif

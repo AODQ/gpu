@@ -3,7 +3,12 @@
 #include <srat/core-types.hpp>
 #include <srat/alloc-virtual-range.hpp>
 
+#include <source_location>
 #include <type_traits>
+
+#if SRAT_DEBUG()
+#include <unordered_map>
+#endif
 
 // handle system for internal resource management
 
@@ -29,8 +34,14 @@ struct HandlePool
 	HandlePool(HandlePool &&);
 	HandlePool & operator=(HandlePool &&);
 
-	Handle allocate(InternalResource const & resource);
-	Handle allocate(InternalResource && resource);
+	Handle allocate(
+		InternalResource const & resource,
+		std::source_location loc = std::source_location::current()
+	);
+	Handle allocate(
+		InternalResource && resource,
+		std::source_location loc = std::source_location::current()
+	);
 	void free(Handle const & handle);
 	bool valid(Handle const & handle) const;
 	InternalResource * get(Handle const & handle);
@@ -56,6 +67,10 @@ private:
 
 	// this is the handle pool gen, there is also a per-handle gen as part of
 	//   its virtual range block
+
+#if SRAT_DEBUG()
+	std::unordered_map<u64, std::source_location> locationMap;
+#endif
 };
 
 inline u64 handle_make(u32 const index, u32 const generation) {

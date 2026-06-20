@@ -7,12 +7,16 @@
 
 #include "scene_shared.h"
 
-layout(location = 0) in  vec3 inNormal;
+layout(location = 0) in vec3 inNormal;
+layout(location = 1) in flat int inMaterialIndex;
+
 layout(location = 0) out vec4 outColor;
 
 void main() {
-	const vec3  n    = normalize(inNormal);
-	const vec3  sun  = normalize(vec3(0.4, 1.0, 0.6));
+	MaterialBuf materialBuf = MaterialBuf(pc.draw.materials);
+	const Material mat = materialBuf.data[inMaterialIndex];
+	const vec3 n = normalize(inNormal);
+	const vec3 sun = normalize(vec3(0.4, 1.0, 0.6));
 	const float diff = max(dot(n, sun), 0.0);
-	outColor = vec4(vec3(0.15 + diff * 0.85), 1.0);
+	outColor = vec4(vec3(0.15 + diff * 0.85), 1.0) * mat.baseColor;
 }

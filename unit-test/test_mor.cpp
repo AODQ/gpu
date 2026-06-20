@@ -55,22 +55,22 @@ static std::string write_triangle_gltf() {
 TEST_SUITE("[headless]") {
 
 TEST_CASE("mor: scene create/destroy") {
-	mor::Scene * scene = mor::scene_create();
-	CHECK(scene != nullptr);
+	mor::Scene const scene = mor::scene_create();
+	CHECK(scene.id != 0);
 	mor::scene_destroy(scene);
 }
 
 TEST_CASE("mor: empty scene has zero counts") {
-	mor::Scene * scene = mor::scene_create();
+	mor::Scene const scene = mor::scene_create();
 	CHECK(mor::scene_instance_count(scene) == 0);
-	CHECK(mor::scene_meshlet_count(scene)  == 0);
-	CHECK(mor::scene_vertex_count(scene)   == 0);
+	CHECK(mor::scene_meshlet_count(scene) == 0);
+	CHECK(mor::scene_vertex_count(scene) == 0);
 	mor::scene_destroy(scene);
 }
 
 TEST_CASE("mor: single triangle — 1 instance") {
 	std::string const path = write_triangle_gltf();
-	mor::Scene * scene = mor::scene_create();
+	mor::Scene const scene = mor::scene_create();
 	mor::scene_load_gltf(scene, path.c_str());
 	CHECK(mor::scene_instance_count(scene) == 1);
 	mor::scene_destroy(scene);
@@ -78,7 +78,7 @@ TEST_CASE("mor: single triangle — 1 instance") {
 
 TEST_CASE("mor: single triangle — 1 meshlet") {
 	std::string const path = write_triangle_gltf();
-	mor::Scene * scene = mor::scene_create();
+	mor::Scene const scene = mor::scene_create();
 	mor::scene_load_gltf(scene, path.c_str());
 	CHECK(mor::scene_meshlet_count(scene) == 1);
 	mor::scene_destroy(scene);
@@ -86,7 +86,7 @@ TEST_CASE("mor: single triangle — 1 meshlet") {
 
 TEST_CASE("mor: single triangle — 3 vertices") {
 	std::string const path = write_triangle_gltf();
-	mor::Scene * scene = mor::scene_create();
+	mor::Scene const scene = mor::scene_create();
 	mor::scene_load_gltf(scene, path.c_str());
 	CHECK(mor::scene_vertex_count(scene) == 3);
 	mor::scene_destroy(scene);
@@ -94,18 +94,18 @@ TEST_CASE("mor: single triangle — 3 vertices") {
 
 TEST_CASE("mor: multiple loads accumulate") {
 	std::string const path = write_triangle_gltf();
-	mor::Scene * scene = mor::scene_create();
+	mor::Scene const scene = mor::scene_create();
 	mor::scene_load_gltf(scene, path.c_str());
 	mor::scene_load_gltf(scene, path.c_str());
 	CHECK(mor::scene_instance_count(scene) == 2);
-	CHECK(mor::scene_meshlet_count(scene)  == 2);
-	CHECK(mor::scene_vertex_count(scene)   == 6);
+	CHECK(mor::scene_meshlet_count(scene) == 2);
+	CHECK(mor::scene_vertex_count(scene) == 6);
 	mor::scene_destroy(scene);
 }
 
 TEST_CASE("mor: gpu upload returns valid id") {
 	std::string const path = write_triangle_gltf();
-	mor::Scene * scene = mor::scene_create();
+	mor::Scene const scene = mor::scene_create();
 	mor::scene_load_gltf(scene, path.c_str());
 	mor::GpuScene const gpu = mor::scene_gpu_upload(scene);
 	CHECK(gpu.id != 0);
@@ -115,7 +115,7 @@ TEST_CASE("mor: gpu upload returns valid id") {
 
 TEST_CASE("mor: gpu meshlet count matches cpu") {
 	std::string const path = write_triangle_gltf();
-	mor::Scene * scene = mor::scene_create();
+	mor::Scene const scene = mor::scene_create();
 	mor::scene_load_gltf(scene, path.c_str());
 	u32 const cpuCount = mor::scene_meshlet_count(scene);
 	mor::GpuScene const gpu = mor::scene_gpu_upload(scene);
@@ -126,29 +126,34 @@ TEST_CASE("mor: gpu meshlet count matches cpu") {
 
 TEST_CASE("mor: all gpu buffer addresses are non-zero") {
 	std::string const path = write_triangle_gltf();
-	mor::Scene * scene = mor::scene_create();
+	mor::Scene const scene = mor::scene_create();
 	mor::scene_load_gltf(scene, path.c_str());
 	mor::GpuScene const gpu = mor::scene_gpu_upload(scene);
 	mor::Buffers const buf = mor::scene_gpu_buffers(gpu);
-	CHECK(buf.meshlets     != 0);
-	CHECK(buf.instances    != 0);
-	CHECK(buf.positions    != 0);
-	CHECK(buf.attributes   != 0);
+	CHECK(buf.meshlets != 0);
+	CHECK(buf.materials != 0);
+	CHECK(buf.textures != 0);
+	CHECK(buf.instances != 0);
+	CHECK(buf.positions != 0);
+	CHECK(buf.attributes != 0);
 	CHECK(buf.meshletVerts != 0);
-	CHECK(buf.meshletTris  != 0);
+	CHECK(buf.meshletTris != 0);
 	mor::scene_gpu_destroy(gpu);
 	mor::scene_destroy(scene);
 }
 
 TEST_CASE("mor: two gpu uploads have distinct buffer addresses") {
 	std::string const path = write_triangle_gltf();
-	mor::Scene * s1 = mor::scene_create();
-	mor::Scene * s2 = mor::scene_create();
+	mor::Scene const s1 = mor::scene_create();
+	mor::Scene const s2 = mor::scene_create();
 	mor::scene_load_gltf(s1, path.c_str());
 	mor::scene_load_gltf(s2, path.c_str());
 	mor::GpuScene const g1 = mor::scene_gpu_upload(s1);
 	mor::GpuScene const g2 = mor::scene_gpu_upload(s2);
-	CHECK(mor::scene_gpu_buffers(g1).meshlets != mor::scene_gpu_buffers(g2).meshlets);
+	CHECK(
+		mor::scene_gpu_buffers(g1).meshlets
+		!= mor::scene_gpu_buffers(g2).meshlets
+	);
 	mor::scene_gpu_destroy(g1);
 	mor::scene_gpu_destroy(g2);
 	mor::scene_destroy(s1);
