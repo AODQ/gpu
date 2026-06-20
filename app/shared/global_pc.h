@@ -3,7 +3,7 @@
 #endif
 
 #ifdef __cplusplus
-#include <srat/core-types.hpp>
+#include <srat/core-math.hpp>
 #else
 #define f32    float
 #define f32v2  vec2
@@ -17,7 +17,13 @@
 
 struct GlobalPC {
 	f32 time;
-	f32 _pad[31];
+	i32 probeX;
+	i32 probeY;
+	u32 probeActive;
+	u32 debugMode;
+	f32v3 cameraPos;
+	f32 _pad[8];
+	f32m44 viewProj;
 };
 
 #ifdef __cplusplus

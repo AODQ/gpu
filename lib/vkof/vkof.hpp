@@ -340,6 +340,10 @@ namespace vkof
 	// Save a transient image to a PNG file. Blocks until the GPU is idle.
 	// Intended for headless rendering — call after render_graph_execute.
 	void screenshot(TransientImage const & image, char const * const path);
+
+	// returns the debug printf message captured this frame, or nullptr if none.
+	// cleared at the start of each render_graph_execute. safe to call multiple times.
+	[[nodiscard]] char const * probe_message();
 }
 
 // -----------------------------------------------------------------------------

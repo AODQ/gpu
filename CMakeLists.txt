@@ -102,6 +102,17 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(stb)
 
+FetchContent_Declare(
+	rapidjson
+	GIT_REPOSITORY https://github.com/Tencent/rapidjson.git
+	GIT_TAG        master
+	GIT_SHALLOW    TRUE
+)
+set(RAPIDJSON_BUILD_DOC      OFF CACHE BOOL "" FORCE)
+set(RAPIDJSON_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(RAPIDJSON_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(rapidjson)
+
 # ------------------------------------------------------------------------------
 # -- Vulkan
 # ------------------------------------------------------------------------------
@@ -260,6 +271,8 @@ add_executable(
 	app/main.cpp
 	app/gfx.cpp
 	app/cull.cpp
+	app/asset_library.cpp
+	app/scene_desc.cpp
 )
 #add_dependencies(cull shaders)
 
@@ -287,6 +300,7 @@ target_include_directories(
 	cull
 	SYSTEM PRIVATE
 	${vma_SOURCE_DIR}/include
+	${rapidjson_SOURCE_DIR}/include
 )
 
 target_precompile_headers(

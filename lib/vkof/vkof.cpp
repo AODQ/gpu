@@ -1,5 +1,6 @@
 #include <vkof/vkof.hpp>
 #include <srat/core-handle.hpp>
+#include <srat/profile.hpp>
 
 #include <imgui.h>
 #include <backends/imgui_impl_glfw.h>
@@ -10,6 +11,11 @@
 
 #include <stb_image_write.h>
 
+int vkof_write_png_uncompressed(
+	char const * path, int w, int h, int comp,
+	void const * data, int stride
+);
+
 #include <chrono>
 #include <unordered_map>
 #include <filesystem>
@@ -19,6 +25,50 @@
 		printf("assertion failed: %s [%d]\n", #x, x); \
 		std::abort(); \
 	} \
+}
+
+// -----------------------------------------------------------------------------
+// -- shader probe
+// -----------------------------------------------------------------------------
+
+static std::string sProbeMessage;
+
+static VKAPI_ATTR VkBool32 VKAPI_CALL debugMessengerCallback(
+	VkDebugUtilsMessageSeverityFlagBitsEXT const severity,
+	VkDebugUtilsMessageTypeFlagsEXT,
+	VkDebugUtilsMessengerCallbackDataEXT const * const data,
+	void *
+) {
+	if (data->pMessageIdName && strstr(data->pMessageIdName, "DEBUG-PRINTF")) {
+		// strip "...DebugPrintf:\n" prefix, keep only the user string
+		char const * found = nullptr;
+		if (data->pMessage) {
+			char const * marker = strstr(data->pMessage, "DebugPrintf:\n");
+			if (marker) {
+				found = marker + 13u;
+			}
+		}
+		if (found) {
+			sProbeMessage = found;
+		}
+		return VK_FALSE;
+	}
+	if (
+		data->pMessage
+		&& strstr(data->pMessage, "DebugPrintf logs to the Information")
+	) {
+		return VK_FALSE;
+	}
+	if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT) {
+		return VK_FALSE;
+	}
+	fprintf(stderr, "[vkof] %s\n", data->pMessage);
+	return VK_FALSE;
+}
+
+char const * vkof::probe_message() {
+	if (sProbeMessage.empty()) { return nullptr; }
+	return sProbeMessage.c_str();
 }
 
 // -----------------------------------------------------------------------------
@@ -136,7 +186,7 @@ namespace
 	}
 
 	// usage depends on whether the format is depth or color
-	VkImageUsageFlags format_usage(VkFormat const format) {
+	VkImageUsageFlags format_usage(VkPhysicalDevice const physicalDevice, VkFormat const format) {
 		VkImageUsageFlags usage = (
 			  VK_IMAGE_USAGE_SAMPLED_BIT
 			| VK_IMAGE_USAGE_TRANSFER_SRC_BIT
@@ -148,10 +198,12 @@ namespace
 		if (isDepth) {
 			usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
 		} else {
-			usage |= (
-				  VK_IMAGE_USAGE_STORAGE_BIT
-				| VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
-			);
+			usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+			VkFormatProperties props {};
+			vkGetPhysicalDeviceFormatProperties(physicalDevice, format, &props);
+			if (props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) {
+				usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+			}
 		}
 		return usage;
 	}
@@ -362,8 +414,92 @@ static std::filesystem::file_time_type file_write_time(std::string const & p) {
 
 static ImplDevice * sDevice;
 
-static PFN_vkGetImageViewHandleNVX pfnGetImageViewHandleNVX;
 static PFN_vkCmdDrawMeshTasksEXT pfnVkCmdDrawMeshTasksEXT;
+
+static VkDescriptorSetLayout sBindlessSetLayout = VK_NULL_HANDLE;
+static VkDescriptorPool sBindlessPool = VK_NULL_HANDLE;
+static VkDescriptorSet sBindlessSet = VK_NULL_HANDLE;
+static u32 sBindlessSamplerNextSlot = 1u;
+static u32 sBindlessStorageNextSlot = 1u;
+static constexpr u32 skBindlessMaxSlots = 65536u;
+
+static VkDescriptorSetLayout create_bindless_set_layout(VkDevice const device)
+{
+	VkDescriptorSetLayoutBinding const bindings[] = {
+		{
+			.binding = 0,
+			.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+			.descriptorCount = skBindlessMaxSlots,
+			.stageFlags = VK_SHADER_STAGE_ALL,
+			.pImmutableSamplers = nullptr,
+		},
+		{
+			.binding = 1,
+			.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+			.descriptorCount = skBindlessMaxSlots,
+			.stageFlags = VK_SHADER_STAGE_ALL,
+			.pImmutableSamplers = nullptr,
+		},
+	};
+	VkDescriptorBindingFlags const bindingFlags[] = {
+		(
+			VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT
+			| VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT
+		),
+		(
+			VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT
+			| VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT
+		),
+	};
+	VkDescriptorSetLayoutBindingFlagsCreateInfo const bindingFlagsInfo = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
+		.pNext = nullptr,
+		.bindingCount = 2u,
+		.pBindingFlags = bindingFlags,
+	};
+	VkDescriptorSetLayoutCreateInfo const ci = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+		.pNext = &bindingFlagsInfo,
+		.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT,
+		.bindingCount = 2u,
+		.pBindings = bindings,
+	};
+	VkDescriptorSetLayout layout;
+	VkAssert(vkCreateDescriptorSetLayout(device, &ci, nullptr, &layout));
+	return layout;
+}
+
+static void create_bindless_pool_and_set(VkDevice const device)
+{
+	VkDescriptorPoolSize const poolSizes[] = {
+		{
+			.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+			.descriptorCount = skBindlessMaxSlots,
+		},
+		{
+			.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+			.descriptorCount = skBindlessMaxSlots,
+		},
+	};
+	VkDescriptorPoolCreateInfo const poolCi = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+		.pNext = nullptr,
+		.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT,
+		.maxSets = 1u,
+		.poolSizeCount = 2u,
+		.pPoolSizes = poolSizes,
+	};
+	VkAssert(vkCreateDescriptorPool(device, &poolCi, nullptr, &sBindlessPool));
+
+	VkDescriptorSetAllocateInfo const allocInfo = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+		.pNext = nullptr,
+		.descriptorPool = sBindlessPool,
+		.descriptorSetCount = 1u,
+		.pSetLayouts = &sBindlessSetLayout,
+	};
+	VkAssert(vkAllocateDescriptorSets(device, &allocInfo, &sBindlessSet));
+}
 
 // -----------------------------------------------------------------------------
 // -- buffer
@@ -716,7 +852,7 @@ vkof::Image vkof::image_create(vkof::ImageCreateInfo const & createInfo)
 		.arrayLayers = 1,
 		.samples = VK_SAMPLE_COUNT_1_BIT,
 		.tiling = VK_IMAGE_TILING_OPTIMAL,
-		.usage = format_usage(vkFormat),
+		.usage = format_usage(sDevice->physicalDevice, vkFormat),
 		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
 		.queueFamilyIndexCount = 0,
 		.pQueueFamilyIndices = nullptr,
@@ -807,6 +943,160 @@ vkof::Image vkof::image_create(vkof::ImageCreateInfo const & createInfo)
 				&implTexture.imageViewPerMip[mip]
 			)
 		);
+	}
+
+	if (createInfo.optInitialData.size() > 0) {
+		VkBufferCreateInfo const stagingCi = {
+			.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+			.pNext = nullptr,
+			.flags = 0,
+			.size = createInfo.optInitialData.size(),
+			.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+			.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+			.queueFamilyIndexCount = 0,
+			.pQueueFamilyIndices = nullptr,
+		};
+		VmaAllocationCreateInfo const stagingAllocCi = {
+			.flags = (
+				  VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT
+				| VMA_ALLOCATION_CREATE_MAPPED_BIT
+				| VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+			),
+			.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+			.requiredFlags = 0,
+			.preferredFlags = 0,
+			.memoryTypeBits = 0,
+			.pool = nullptr,
+			.pUserData = nullptr,
+			.priority = 0.0f,
+		};
+		VkBuffer stagingBuffer;
+		VmaAllocation stagingAlloc;
+		VmaAllocationInfo stagingInfo;
+		VkAssert(
+			vmaCreateBuffer(
+				sDevice->allocator,
+				&stagingCi,
+				&stagingAllocCi,
+				&stagingBuffer,
+				&stagingAlloc,
+				&stagingInfo
+			)
+		);
+		std::memcpy(
+			stagingInfo.pMappedData,
+			createInfo.optInitialData.ptr(),
+			createInfo.optInitialData.size()
+		);
+
+		VkCommandBufferAllocateInfo const cbai = {
+			.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+			.pNext = nullptr,
+			.commandPool = sDevice->commandPoolGraphics,
+			.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+			.commandBufferCount = 1,
+		};
+		VkCommandBuffer cmd;
+		VkAssert(vkAllocateCommandBuffers(sDevice->device, &cbai, &cmd));
+		VkCommandBufferBeginInfo const beginInfo = {
+			.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+			.pNext = nullptr,
+			.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+			.pInheritanceInfo = nullptr,
+		};
+		VkAssert(vkBeginCommandBuffer(cmd, &beginInfo));
+
+		VkImageMemoryBarrier toTransferDst = {
+			.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			.pNext = nullptr,
+			.srcAccessMask = 0,
+			.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+			.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+			.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.image = implTexture.image,
+			.subresourceRange = {
+				.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+				.baseMipLevel = 0,
+				.levelCount = VK_REMAINING_MIP_LEVELS,
+				.baseArrayLayer = 0,
+				.layerCount = 1,
+			},
+		};
+		vkCmdPipelineBarrier(
+			cmd,
+			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+			VK_PIPELINE_STAGE_TRANSFER_BIT,
+			0, 0, nullptr, 0, nullptr,
+			1, &toTransferDst
+		);
+
+		VkBufferImageCopy const copyRegion = {
+			.bufferOffset = 0,
+			.bufferRowLength = 0,
+			.bufferImageHeight = 0,
+			.imageSubresource = {
+				.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+				.mipLevel = 0,
+				.baseArrayLayer = 0,
+				.layerCount = 1,
+			},
+			.imageOffset = { 0, 0, 0 },
+			.imageExtent = { createInfo.width, createInfo.height, 1 },
+		};
+		vkCmdCopyBufferToImage(
+			cmd, stagingBuffer, implTexture.image,
+			VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			1, &copyRegion
+		);
+
+		VkImageMemoryBarrier toShaderRead = {
+			.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			.pNext = nullptr,
+			.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+			.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			.image = implTexture.image,
+			.subresourceRange = {
+				.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+				.baseMipLevel = 0,
+				.levelCount = VK_REMAINING_MIP_LEVELS,
+				.baseArrayLayer = 0,
+				.layerCount = 1,
+			},
+		};
+		vkCmdPipelineBarrier(
+			cmd,
+			VK_PIPELINE_STAGE_TRANSFER_BIT,
+			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			0, 0, nullptr, 0, nullptr,
+			1, &toShaderRead
+		);
+
+		VkAssert(vkEndCommandBuffer(cmd));
+		VkSubmitInfo const submitInfo = {
+			.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+			.pNext = nullptr,
+			.waitSemaphoreCount = 0,
+			.pWaitSemaphores = nullptr,
+			.pWaitDstStageMask = nullptr,
+			.commandBufferCount = 1,
+			.pCommandBuffers = &cmd,
+			.signalSemaphoreCount = 0,
+			.pSignalSemaphores = nullptr,
+		};
+		VkAssert(
+			vkQueueSubmit(sDevice->queueGraphics, 1, &submitInfo, VK_NULL_HANDLE)
+		);
+		VkAssert(vkQueueWaitIdle(sDevice->queueGraphics));
+		vkFreeCommandBuffers(
+			sDevice->device, sDevice->commandPoolGraphics, 1, &cmd
+		);
+		vmaDestroyBuffer(sDevice->allocator, stagingBuffer, stagingAlloc);
 	}
 
 	return sDevice->imagePool.allocate(implTexture);
@@ -913,15 +1203,26 @@ u64 vkof::image_sampler_handle(ImageSamplerHandleInfo const & info)
 		return 0;
 	}
 
-	VkImageViewHandleInfoNVX const handleInfo = {
-		.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_HANDLE_INFO_NVX,
-		.pNext = nullptr,
-		.imageView = implTexture->imageViewFull,
-		.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+	u32 const slot = sBindlessSamplerNextSlot++;
+	VkDescriptorImageInfo const imageInfo = {
 		.sampler = implSampler->sampler,
+		.imageView = implTexture->imageViewFull,
+		.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 	};
-
-	return u64(pfnGetImageViewHandleNVX(sDevice->device, &handleInfo));
+	VkWriteDescriptorSet const write = {
+		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		.pNext = nullptr,
+		.dstSet = sBindlessSet,
+		.dstBinding = 0u,
+		.dstArrayElement = slot,
+		.descriptorCount = 1u,
+		.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+		.pImageInfo = &imageInfo,
+		.pBufferInfo = nullptr,
+		.pTexelBufferView = nullptr,
+	};
+	vkUpdateDescriptorSets(sDevice->device, 1u, &write, 0u, nullptr);
+	return u64(slot);
 }
 
 static VkImageView image_storage_view_for_mip(
@@ -947,15 +1248,26 @@ u64 vkof::image_storage_handle(ImageStorageHandleInfo const & info)
 		: image_storage_view_for_mip(*implTexture, info.mipLevel)
 	);
 
-	VkImageViewHandleInfoNVX const handleInfo = {
-		.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_HANDLE_INFO_NVX,
-		.pNext = nullptr,
-		.imageView = view,
-		.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+	u32 const slot = sBindlessStorageNextSlot++;
+	VkDescriptorImageInfo const imageInfo = {
 		.sampler = VK_NULL_HANDLE,
+		.imageView = view,
+		.imageLayout = VK_IMAGE_LAYOUT_GENERAL,
 	};
-
-	return u64(pfnGetImageViewHandleNVX(sDevice->device, &handleInfo));
+	VkWriteDescriptorSet const write = {
+		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		.pNext = nullptr,
+		.dstSet = sBindlessSet,
+		.dstBinding = 1u,
+		.dstArrayElement = slot,
+		.descriptorCount = 1u,
+		.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+		.pImageInfo = &imageInfo,
+		.pBufferInfo = nullptr,
+		.pTexelBufferView = nullptr,
+	};
+	vkUpdateDescriptorSets(sDevice->device, 1u, &write, 0u, nullptr);
+	return u64(slot);
 }
 
 // -----------------------------------------------------------------------------
@@ -1151,7 +1463,9 @@ void vkof::init()
 			vkb::InstanceBuilder()
 			.set_app_name("demo")
 			.request_validation_layers(true)
-			.use_default_debug_messenger()
+			.set_debug_callback(debugMessengerCallback)
+			.add_debug_messenger_severity(VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT)
+			.add_validation_feature_enable(VK_VALIDATION_FEATURE_ENABLE_DEBUG_PRINTF_EXT)
 			.require_api_version(1, 3, 0)
 			.build()
 		);
@@ -1326,11 +1640,11 @@ void vkof::init()
 		auto const physicalDeviceResults = (
 			vkb::PhysicalDeviceSelector(instance)
 			.set_surface(surface)
+			.add_required_extension(VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME)
 			.add_required_extension(VK_EXT_MESH_SHADER_EXTENSION_NAME)
 			.set_required_features(features)
 			.add_required_extension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)
 			.add_required_extension(VK_KHR_MAINTENANCE_6_EXTENSION_NAME)
-			.add_required_extension(VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME)
 			.add_required_extension_features(meshShaderFeatures)
 			.add_required_extension_features(maintenance4Features)
 			.add_required_extension_features(dynamicRenderingFeatures)
@@ -1552,6 +1866,8 @@ void vkof::init()
 		);
 	}
 
+	sBindlessSetLayout = create_bindless_set_layout(device.device);
+
 	VkPushConstantRange universalPushConstantRange {
 		.stageFlags = VK_SHADER_STAGE_ALL,
 		.offset = 0,
@@ -1561,8 +1877,8 @@ void vkof::init()
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
 		.pNext = nullptr,
 		.flags = 0,
-		.setLayoutCount = 0,
-		.pSetLayouts = nullptr,
+		.setLayoutCount = 1u,
+		.pSetLayouts = &sBindlessSetLayout,
 		.pushConstantRangeCount = 1,
 		.pPushConstantRanges = &universalPushConstantRange,
 	};
@@ -1605,7 +1921,7 @@ void vkof::init()
 			srat::HandlePool<vkof::Buffer, ImplBuffer>::create(1024)
 		),
 		.samplerPool = (
-			srat::HandlePool<vkof::Sampler, ImplSampler>::create(16)
+			srat::HandlePool<vkof::Sampler, ImplSampler>::create(1024)
 		),
 		.transientImagePool = (
 			srat::HandlePool<vkof::TransientImage, ImplTransientImage>
@@ -1634,13 +1950,7 @@ void vkof::init()
 		.profiler = {},
 	};
 
-	pfnGetImageViewHandleNVX = (
-		(PFN_vkGetImageViewHandleNVX)
-		vkGetDeviceProcAddr(
-			sDevice->device,
-			"vkGetImageViewHandleNVX"
-		)
-	);
+	create_bindless_pool_and_set(sDevice->device);
 	pfnVkCmdDrawMeshTasksEXT = (
 		(PFN_vkCmdDrawMeshTasksEXT)
 		vkGetDeviceProcAddr(
@@ -1751,7 +2061,9 @@ void vkof::init_headless(u32 width, u32 height)
 		auto const r = vkb::InstanceBuilder()
 			.set_app_name("vkof-test")
 			.request_validation_layers(true)
-			.use_default_debug_messenger()
+			.set_debug_callback(debugMessengerCallback)
+			.add_debug_messenger_severity(VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT)
+			.add_validation_feature_enable(VK_VALIDATION_FEATURE_ENABLE_DEBUG_PRINTF_EXT)
 			.require_api_version(1, 3, 0)
 			.set_headless(true)
 			.build();
@@ -1913,11 +2225,11 @@ void vkof::init_headless(u32 width, u32 height)
 			vkb::PhysicalDeviceSelector(instance)
 			.defer_surface_initialization()
 			.require_present(false)
+			.add_required_extension(VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME)
 			.add_required_extension(VK_EXT_MESH_SHADER_EXTENSION_NAME)
 			.set_required_features(features)
 			.add_required_extension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)
 			.add_required_extension(VK_KHR_MAINTENANCE_6_EXTENSION_NAME)
-			.add_required_extension(VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME)
 			.add_required_extension_features(meshShaderFeatures)
 			.add_required_extension_features(maintenance4Features)
 			.add_required_extension_features(dynamicRenderingFeatures)
@@ -2139,6 +2451,8 @@ void vkof::init_headless(u32 width, u32 height)
 	}
 
 	// -- universal push-constant layout
+	sBindlessSetLayout = create_bindless_set_layout(device.device);
+
 	VkPushConstantRange universalPushConstantRange {
 		.stageFlags = VK_SHADER_STAGE_ALL,
 		.offset = 0,
@@ -2148,8 +2462,8 @@ void vkof::init_headless(u32 width, u32 height)
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
 		.pNext = nullptr,
 		.flags = 0,
-		.setLayoutCount = 0,
-		.pSetLayouts = nullptr,
+		.setLayoutCount = 1u,
+		.pSetLayouts = &sBindlessSetLayout,
 		.pushConstantRangeCount = 1,
 		.pPushConstantRanges = &universalPushConstantRange,
 	};
@@ -2199,7 +2513,7 @@ void vkof::init_headless(u32 width, u32 height)
 			srat::HandlePool<vkof::Buffer, ImplBuffer>::create(1024)
 		),
 		.samplerPool = (
-			srat::HandlePool<vkof::Sampler, ImplSampler>::create(16)
+			srat::HandlePool<vkof::Sampler, ImplSampler>::create(1024)
 		),
 		.transientImagePool = (
 			srat::HandlePool<vkof::TransientImage, ImplTransientImage>
@@ -2228,13 +2542,7 @@ void vkof::init_headless(u32 width, u32 height)
 		.profiler = {},
 	};
 
-	pfnGetImageViewHandleNVX = (
-		(PFN_vkGetImageViewHandleNVX)
-		vkGetDeviceProcAddr(
-			sDevice->device,
-			"vkGetImageViewHandleNVX"
-		)
-	);
+	create_bindless_pool_and_set(sDevice->device);
 	pfnVkCmdDrawMeshTasksEXT = (
 		(PFN_vkCmdDrawMeshTasksEXT)
 		vkGetDeviceProcAddr(
@@ -2360,6 +2668,13 @@ void vkof::shutdown()
 	}
 
 	vmaDestroyAllocator(sDevice->allocator);
+	vkDestroyDescriptorPool(sDevice->device, sBindlessPool, nullptr);
+	vkDestroyDescriptorSetLayout(sDevice->device, sBindlessSetLayout, nullptr);
+	sBindlessPool = VK_NULL_HANDLE;
+	sBindlessSet = VK_NULL_HANDLE;
+	sBindlessSetLayout = VK_NULL_HANDLE;
+	sBindlessSamplerNextSlot = 1u;
+	sBindlessStorageNextSlot = 1u;
 	vkDestroyPipelineLayout(
 		sDevice->device, sDevice->pipelineLayoutUniversal, nullptr
 	);
@@ -2985,6 +3300,13 @@ void vkof::cmd_draw(CmdDraw const & draw)
 			VK_PIPELINE_BIND_POINT_GRAPHICS,
 			implPipeline->pipeline
 		);
+		vkCmdBindDescriptorSets(
+			implCmd->cmd,
+			VK_PIPELINE_BIND_POINT_GRAPHICS,
+			sDevice->pipelineLayoutUniversal,
+			0u, 1u, &sBindlessSet,
+			0u, nullptr
+		);
 		implCmd->boundPipeline = draw.pipeline;
 		implCmd->bindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
 	}
@@ -3027,6 +3349,13 @@ void vkof::cmd_dispatch(CmdDispatch const & dispatch)
 			implCmd->cmd,
 			VK_PIPELINE_BIND_POINT_COMPUTE,
 			implPipeline->pipeline
+		);
+		vkCmdBindDescriptorSets(
+			implCmd->cmd,
+			VK_PIPELINE_BIND_POINT_COMPUTE,
+			sDevice->pipelineLayoutUniversal,
+			0u, 1u, &sBindlessSet,
+			0u, nullptr
 		);
 		implCmd->boundPipeline = dispatch.pipeline;
 		implCmd->bindPoint = VK_PIPELINE_BIND_POINT_COMPUTE;
@@ -3185,6 +3514,8 @@ static void profiler_init()
 
 void vkof::render_graph_execute(RenderGraphExecuteInfo const & exec)
 {
+	sProbeMessage.clear();
+
 	u32 const frameSlot = sDevice->frameIndex % kFramesInFlight;
 	auto & fd = sDevice->frameData[frameSlot];
 
@@ -3631,28 +3962,34 @@ void vkof::render_graph_execute(RenderGraphExecuteInfo const & exec)
 			);
 			u32 const copyW = sDevice->swapchain.extent.width;
 			u32 const copyH = sDevice->swapchain.extent.height;
-			VkImageCopy const region = {
+			VkImageBlit const region = {
 				.srcSubresource = VkImageSubresourceLayers {
 					.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
 					.mipLevel = 0,
 					.baseArrayLayer = 0,
 					.layerCount = 1,
 				},
-				.srcOffset = { 0, 0, 0 },
+				.srcOffsets = {
+					VkOffset3D { 0, 0, 0 },
+					VkOffset3D { (i32)srcW, (i32)srcH, 1 },
+				},
 				.dstSubresource = VkImageSubresourceLayers {
 					.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
 					.mipLevel = 0,
 					.baseArrayLayer = 0,
 					.layerCount = 1,
 				},
-				.dstOffset = { 0, 0, 0 },
-				.extent = { copyW, copyH, 1 },
+				.dstOffsets = {
+					VkOffset3D { 0, 0, 0 },
+					VkOffset3D { (i32)copyW, (i32)copyH, 1 },
+				},
 			};
-			vkCmdCopyImage(
+			vkCmdBlitImage(
 				cmd,
 				srcVkImage, VK_IMAGE_LAYOUT_GENERAL,
 				dstVkImage, VK_IMAGE_LAYOUT_GENERAL,
-				1, &region
+				1, &region,
+				VK_FILTER_NEAREST
 			);
 		}
 	}
@@ -3884,7 +4221,9 @@ void vkof::screenshot(
 	vkof::TransientImage const & image,
 	char const * const path
 ) {
+	srat::profile_tick pt;
 	vkof::device_wait_idle();
+	pt.tick("device_wait_idle");
 
 	vkof::Image const img = vkof::transient_image_get_image(image);
 	VkImage vkImg;
@@ -3924,6 +4263,7 @@ void vkof::screenshot(
 			sDevice->allocator, &bci, &aci, &stagingBuf, &stagingAlloc, &allocInfo
 		));
 	}
+	pt.tick("staging alloc");
 
 	VkCommandPool const pool = sDevice->commandPoolGraphics;
 	VkCommandBuffer cmd;
@@ -4066,15 +4406,18 @@ void vkof::screenshot(
 		};
 		VkAssert(vkQueueSubmit2(sDevice->queueGraphics, 1u, &submitInfo, fence));
 	}
+	pt.tick("cmd submit");
 
 	VkAssert(vkWaitForFences(sDevice->device, 1u, &fence, VK_TRUE, UINT64_MAX));
+	pt.tick("fence wait (gpu copy)");
 
 	vkDestroyFence(sDevice->device, fence, nullptr);
 	vkFreeCommandBuffers(sDevice->device, pool, 1u, &cmd);
 
-	stbi_write_png(
+	vkof_write_png_uncompressed(
 		path, (int)w, (int)h, 4, allocInfo.pMappedData, (int)(w * 4u)
 	);
+	pt.tick("stbi_write_png");
 
 	vmaDestroyBuffer(sDevice->allocator, stagingBuf, stagingAlloc);
 }

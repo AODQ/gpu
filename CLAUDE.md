@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+BEFORE PROCEEDING WITH ANY CHANGES, on any prompt then provide a proposal
+or a to-do list and ask for feedback. Do not begin writing code until the
+proposal is approved by user.
+
 ## Build commands
 
 cd into the build directory `build`/ to build. make sure everything installs

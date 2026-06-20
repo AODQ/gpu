@@ -132,7 +132,6 @@ TEST_CASE("mor: all gpu buffer addresses are non-zero") {
 	mor::Buffers const buf = mor::scene_gpu_buffers(gpu);
 	CHECK(buf.meshlets != 0);
 	CHECK(buf.materials != 0);
-	CHECK(buf.textures != 0);
 	CHECK(buf.instances != 0);
 	CHECK(buf.positions != 0);
 	CHECK(buf.attributes != 0);

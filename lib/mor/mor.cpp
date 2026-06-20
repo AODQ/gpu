@@ -12,6 +12,7 @@
 
 #include <imgui.h>
 
+#include <filesystem>
 #include <unordered_map>
 #include <vector>
 
@@ -21,6 +22,37 @@
 
 namespace {
 
+struct SamplerKey
+{
+	vkof::SamplerFilter magFilter;
+	vkof::SamplerFilter minFilter;
+	vkof::SamplerAddressMode addressU;
+	vkof::SamplerAddressMode addressV;
+	bool operator==(SamplerKey const & o) const {
+		return (
+			magFilter == o.magFilter
+			&& minFilter == o.minFilter
+			&& addressU == o.addressU
+			&& addressV == o.addressV
+		);
+	}
+};
+
+struct SamplerKeyHash
+{
+	size_t operator()(SamplerKey const & k) const {
+		size_t h = 0;
+		auto mix = [&](size_t v) { h ^= v + 0x9e3779b9 + (h << 6) + (h >> 2); };
+		mix((size_t)k.magFilter);
+		mix((size_t)k.minFilter);
+		mix((size_t)k.addressU);
+		mix((size_t)k.addressV);
+		return h;
+	}
+};
+
+static std::unordered_map<SamplerKey, vkof::Sampler, SamplerKeyHash> sSamplerCache;
+
 struct ImplScene {
 	std::vector<f32v3> positions;
 	std::vector<VertexAttr> attributes;
@@ -29,9 +61,9 @@ struct ImplScene {
 	std::vector<Meshlet> meshlets;
 	std::vector<Instance> instances;
 
-	std::unordered_map<cgltf_texture const *, u64> textureHandles;
+	std::string gltfDir;
+	std::unordered_map<cgltf_texture const *, u32> textureHandles;
 	std::vector<vkof::Image> images;
-	std::vector<vkof::Sampler> samplers;
 
 	std::unordered_map<cgltf_material const *, u32> materialIndices;
 
@@ -59,28 +91,33 @@ static constexpr u32 skMaxMeshletTris = 124;
 // -- private helpers
 // ----------------------------------------------------------------------------
 
-static u64 load_texture(
+static u32 load_texture(
 	ImplScene & s,
 	cgltf_texture const * tex,
 	bool const srgb
 ) {
-	if (!tex || !tex->image || !tex->image->buffer_view) return 0;
+	if (!tex || !tex->image) { return 0; }
 
 	auto const it = s.textureHandles.find(tex);
-	if (it != s.textureHandles.end()) return it->second;
+	if (it != s.textureHandles.end()) { return it->second; }
 
 	cgltf_image const * img = tex->image;
-	u8 const * encoded = (
-		(u8 const *)img->buffer_view->buffer->data
-		+ img->buffer_view->offset
-	);
-	int const encodedLen = (int)img->buffer_view->size;
-
 	int w, h, channels;
-	stbi_uc * const pixels = stbi_load_from_memory(
-		encoded, encodedLen, &w, &h, &channels, 4
-	);
-	if (!pixels) return 0;
+	stbi_uc * pixels = nullptr;
+
+	if (img->buffer_view) {
+		u8 const * encoded = (
+			(u8 const *)img->buffer_view->buffer->data
+			+ img->buffer_view->offset
+		);
+		int const encodedLen = (int)img->buffer_view->size;
+		pixels = stbi_load_from_memory(encoded, encodedLen, &w, &h, &channels, 4);
+	} else if (img->uri && strncmp(img->uri, "data:", 5) != 0) {
+		std::string const fullPath = (std::filesystem::path(s.gltfDir) / img->uri).string();
+		pixels = stbi_load(fullPath.c_str(), &w, &h, &channels, 4);
+	}
+
+	if (!pixels) { return 0; }
 
 	vkof::Image const image = vkof::image_create({
 		.width = (u32)w,
@@ -110,7 +147,7 @@ static u64 load_texture(
 	};
 
 	cgltf_sampler const * cgSamp = tex->sampler;
-	vkof::Sampler const sampler = vkof::sampler_create({
+	SamplerKey const key {
 		.magFilter = (
 			cgSamp
 			? toFilter(cgSamp->mag_filter)
@@ -121,26 +158,36 @@ static u64 load_texture(
 			? toFilter(cgSamp->min_filter)
 			: vkof::SamplerFilter::linear
 		),
-		.addressModeU = (
+		.addressU = (
 			cgSamp
 			? toWrap(cgSamp->wrap_s)
 			: vkof::SamplerAddressMode::repeat
 		),
-		.addressModeV = (
+		.addressV = (
 			cgSamp
 			? toWrap(cgSamp->wrap_t)
 			: vkof::SamplerAddressMode::repeat
 		),
-		.addressModeW = vkof::SamplerAddressMode::repeat,
-	});
+	};
+	auto cacheIt = sSamplerCache.find(key);
+	if (cacheIt == sSamplerCache.end()) {
+		vkof::Sampler const s = vkof::sampler_create({
+			.magFilter = key.magFilter,
+			.minFilter = key.minFilter,
+			.addressModeU = key.addressU,
+			.addressModeV = key.addressV,
+			.addressModeW = vkof::SamplerAddressMode::repeat,
+		});
+		cacheIt = sSamplerCache.emplace(key, s).first;
+	}
+	vkof::Sampler const sampler = cacheIt->second;
 
-	u64 const handle = vkof::image_sampler_handle({
+	u32 const handle = (u32)vkof::image_sampler_handle({
 		.image = image,
 		.sampler = sampler,
 	});
 
 	s.images.push_back(image);
-	s.samplers.push_back(sampler);
 	s.textureHandles.emplace(tex, handle);
 	return handle;
 }
@@ -155,6 +202,7 @@ static void load_primitive(
 	cgltf_accessor * posAcc = nullptr;
 	cgltf_accessor * normAcc = nullptr;
 	cgltf_accessor * uvAcc = nullptr;
+	cgltf_accessor * tanAcc = nullptr;
 	for (cgltf_size ai = 0; ai < prim.attributes_count; ++ai) {
 		cgltf_attribute const & attr = prim.attributes[ai];
 		switch (attr.type) {
@@ -163,6 +211,7 @@ static void load_primitive(
 			case cgltf_attribute_type_texcoord:
 				if (attr.index == 0) uvAcc = attr.data;
 				break;
+			case cgltf_attribute_type_tangent: tanAcc = attr.data; break;
 			default: break;
 		}
 	}
@@ -181,20 +230,33 @@ static void load_primitive(
 		}
 	}
 
-	// -- normals + uvs
+	// -- normals, uvs, tangents
 	{
 		std::vector<f32> normals(vertexCount * 3, 0.0f);
 		std::vector<f32> uvs(vertexCount * 2, 0.0f);
+		std::vector<f32> tangents(vertexCount * 4, 0.0f);
 		if (normAcc) {
 			cgltf_accessor_unpack_floats(normAcc, normals.data(), normals.size());
 		}
 		if (uvAcc) {
 			cgltf_accessor_unpack_floats(uvAcc, uvs.data(), uvs.size());
 		}
+		if (tanAcc) {
+			cgltf_accessor_unpack_floats(tanAcc, tangents.data(), tangents.size());
+		} else {
+			for (u32 i = 0; i < vertexCount; ++i) {
+				tangents[i*4+0] = 1.0f;
+				tangents[i*4+3] = 1.0f;
+			}
+		}
 		for (u32 i = 0; i < vertexCount; ++i) {
 			s->attributes.push_back({
 				.normal = { normals[i*3+0], normals[i*3+1], normals[i*3+2] },
 				.uv = { uvs[i*2+0], uvs[i*2+1] },
+				.tangent = {
+					tangents[i*4+0], tangents[i*4+1],
+					tangents[i*4+2], tangents[i*4+3],
+				},
 			});
 		}
 	}
@@ -338,7 +400,20 @@ static vkof::Buffer upload_buffer(void const * data, u64 byteCount) {
 // ----------------------------------------------------------------------------
 
 mor::Scene mor::scene_create() {
-	return mor::Scene { .id = reinterpret_cast<u64>(new ImplScene()) };
+	ImplScene * const s = new ImplScene();
+	// index 0 is always the default material; meshlets with no material use it
+	s->materials.push_back({
+		.baseColor = { 1.0f, 1.0f, 1.0f, 1.0f },
+		.metallic = 0.0f,
+		.roughness = 1.0f,
+		.emissive = { 0.0f, 0.0f, 0.0f },
+		.textureBaseColor = 0,
+		.textureNormal = 0,
+		.textureMetallicRoughness = 0,
+		.textureEmissive = 0,
+		.flags = 0,
+	});
+	return mor::Scene { .id = reinterpret_cast<u64>(s) };
 }
 
 void mor::scene_destroy(mor::Scene const & scene) {
@@ -346,10 +421,14 @@ void mor::scene_destroy(mor::Scene const & scene) {
 	for (vkof::Image const & img : s->images) {
 		vkof::image_destroy(img);
 	}
-	for (vkof::Sampler const & samp : s->samplers) {
-		vkof::sampler_destroy(samp);
-	}
 	delete s;
+}
+
+void mor::sampler_cache_destroy() {
+	for (auto const & [key, sampler] : sSamplerCache) {
+		vkof::sampler_destroy(sampler);
+	}
+	sSamplerCache.clear();
 }
 
 u32 mor::scene_instance_count(mor::Scene const & scene) {
@@ -420,7 +499,7 @@ void mor::scene_imgui_debug(mor::Scene const & scene) {
 	if (ImGui::TreeNode(label)) {
 		u32 i = 0u;
 		for (auto const & [tex, handle] : s->textureHandles) {
-			ImGui::Text("[%u] handle: 0x%llx", i, (unsigned long long)handle);
+			ImGui::Text("[%u] handle: %u", i, handle);
 			++i;
 		}
 		ImGui::TreePop();
@@ -429,6 +508,8 @@ void mor::scene_imgui_debug(mor::Scene const & scene) {
 
 void mor::scene_load_gltf(mor::Scene const & scene, char const * const path) {
 	ImplScene * const s = reinterpret_cast<ImplScene *>(scene.id);
+
+	s->gltfDir = std::filesystem::path(path).parent_path().string();
 
 	cgltf_options const options {};
 	cgltf_data * data = nullptr;
@@ -475,21 +556,6 @@ mor::GpuScene mor::scene_gpu_upload(mor::Scene const & scene) {
 		gpu->materials = upload_buffer(
 			s->materials.data(), s->materials.size() * sizeof(Material)
 		);
-	}
-	{
-		std::vector<u64> handles;
-		handles.reserve(s->images.size());
-		for (size_t i = 0; i < s->images.size(); ++i) {
-			handles.emplace_back(vkof::image_sampler_handle({
-				.image = s->images[i],
-				.sampler = s->samplers[i],
-			}));
-		}
-		if (!handles.empty()) {
-			gpu->textures = upload_buffer(
-				handles.data(), handles.size() * sizeof(u64)
-			);
-		}
 	}
 	gpu->meshletCount = (u32)s->meshlets.size();
 

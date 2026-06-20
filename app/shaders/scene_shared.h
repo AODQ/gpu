@@ -19,7 +19,7 @@ struct SceneDrawPC {
 	u64 attributes;
 	u64 meshletVerts;
 	u64 meshletTris;
-	f32m44 viewProj;
+	f32m44 modelMatrix;
 };
 
 #ifdef __cplusplus

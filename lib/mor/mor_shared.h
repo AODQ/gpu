@@ -18,6 +18,7 @@
 struct VertexAttr {
 	f32v3 normal;
 	f32v2 uv;
+	f32v4 tangent;
 };
 
 struct Meshlet {
@@ -34,10 +35,10 @@ struct Material {
 	f32 metallic;
 	f32 roughness;
 	f32v3 emissive;
-	u64 textureBaseColor;
-	u64 textureNormal;
-	u64 textureMetallicRoughness;
-	u64 textureEmissive;
+	u32 textureBaseColor;
+	u32 textureNormal;
+	u32 textureMetallicRoughness;
+	u32 textureEmissive;
 	u32 flags;
 };
 

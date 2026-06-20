@@ -35,4 +35,6 @@ void scene_gpu_destroy(GpuScene const & scene);
 Buffers scene_gpu_buffers(GpuScene const & scene);
 u32 scene_gpu_meshlet_count(GpuScene const & scene);
 
+void sampler_cache_destroy();
+
 } // namespace mor
