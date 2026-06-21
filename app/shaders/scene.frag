@@ -36,8 +36,8 @@ vec3 index_color(uint idx) {
 }
 
 // void main() {
-// 	MaterialBuf materialBuf = MaterialBuf(pc.draw.materials);
-// 	const Material mat = materialBuf.data[inMaterialIndex];
+// 	GpuMorMaterialBuffer materialBuf = pc.draw.materials;
+// 	const GpuMorMaterial mat = materialBuf.data[inMaterialIndex];
 // 	const f32v3 N = normalize(inNormal);
 // 	const f32v3 T = normalize(inTangent.xyz);
 // 	const f32v3 B = cross(N, T) * inTangent.w;

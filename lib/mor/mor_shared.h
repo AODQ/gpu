@@ -20,13 +20,13 @@
 #endif
 #endif
 
-struct VertexAttr {
+struct GpuMorVertexAttr {
 	f32v3 normal;
 	f32v2 uv;
 	f32v4 tangent;
 };
 
-struct Meshlet {
+struct GpuMorMeshlet {
 	u32 vertexOffset;
 	u32 vertexCount;
 	u32 triangleOffset;
@@ -35,7 +35,7 @@ struct Meshlet {
 	u32 materialIndex;
 };
 
-struct Material {
+struct GpuMorMaterial {
 	f32v4 baseColor;
 	f32 metallic;
 	f32 roughness;
@@ -47,18 +47,26 @@ struct Material {
 	u32 flags;
 };
 
-struct Instance {
+struct GpuMorInstance {
 	f32m44 transform;
 	u32 meshletOffset;
 	u32 meshletCount;
 };
 
-#ifndef __cplusplus
-layout(buffer_reference, scalar) buffer MeshletBuf     { Meshlet    data[]; };
-layout(buffer_reference, scalar) buffer InstanceBuf    { Instance   data[]; };
-layout(buffer_reference, scalar) buffer PositionBuf    { f32v3      data[]; };
-layout(buffer_reference, scalar) buffer AttrBuf        { VertexAttr data[]; };
-layout(buffer_reference, scalar) buffer MeshletVertBuf { u32        data[]; };
-layout(buffer_reference, scalar) buffer MeshletTriBuf  { uint8_t    data[]; };
-layout(buffer_reference, scalar) buffer MaterialBuf    { Material   data[]; };
+#ifdef __cplusplus
+using GpuMorMeshletBuffer = u64;
+using GpuMorInstanceBuffer = u64;
+using GpuMorPositionBuffer = u64;
+using GpuMorVertexAttrBuffer = u64;
+using GpuMorMeshletVertBuffer = u64;
+using GpuMorMeshletTriBuffer = u64;
+using GpuMorMaterialBuffer = u64;
+#else
+layout(buffer_reference, scalar) buffer GpuMorMeshletBuffer { GpuMorMeshlet data[]; };
+layout(buffer_reference, scalar) buffer GpuMorInstanceBuffer { GpuMorInstance data[]; };
+layout(buffer_reference, scalar) buffer GpuMorPositionBuffer { f32v3 data[]; };
+layout(buffer_reference, scalar) buffer GpuMorVertexAttrBuffer { GpuMorVertexAttr data[]; };
+layout(buffer_reference, scalar) buffer GpuMorMeshletVertBuffer { u32 data[]; };
+layout(buffer_reference, scalar) buffer GpuMorMeshletTriBuffer { uint8_t data[]; };
+layout(buffer_reference, scalar) buffer GpuMorMaterialBuffer { GpuMorMaterial data[]; };
 #endif

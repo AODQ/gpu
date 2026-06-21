@@ -12,7 +12,7 @@ struct TriangleDrawPC {
 
 #ifndef __cplusplus
 layout(push_constant, scalar) uniform PC {
-	GlobalPC       global;
+	GpuGlobalPC global;
 	TriangleDrawPC draw;
 } pc;
 #endif

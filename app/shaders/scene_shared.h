@@ -10,32 +10,32 @@
 #include "mor/mor_shared.h"
 #endif
 
-struct SceneDrawPC {
+struct GpuSceneDrawPC {
 	u32 modelId;
-	u64 meshlets;
-	u64 positions;
-	u64 instances;
-	u64 meshletVerts;
-	u64 meshletTris;
+	BDA(GpuMorMeshletBuffer) meshlets;
+	BDA(GpuMorPositionBuffer) positions;
+	BDA(GpuMorInstanceBuffer) instances;
+	BDA(GpuMorMeshletVertBuffer) meshletVerts;
+	BDA(GpuMorMeshletTriBuffer) meshletTris;
 	f32m44 modelMatrix;
 };
 
-struct DeferredDrawInfo {
-	u64 meshlets;
-	u64 positions;
-	u64 attributes;
-	u64 materials;
-	u64 instances;
-	u64 meshletVerts;
-	u64 meshletTris;
+struct GpuSceneDeferredDrawInfo {
+	BDA(GpuMorMeshletBuffer) meshlets;
+	BDA(GpuMorPositionBuffer) positions;
+	BDA(GpuMorVertexAttrBuffer) attributes;
+	BDA(GpuMorMaterialBuffer) materials;
+	BDA(GpuMorInstanceBuffer) instances;
+	BDA(GpuMorMeshletVertBuffer) meshletVerts;
+	BDA(GpuMorMeshletTriBuffer) meshletTris;
 	f32m44 modelMatrix;
 };
 
 #ifdef __cplusplus
-static_assert(sizeof(SceneDrawPC) <= 128, "SceneDrawPC must be <= 128 bytes");
+static_assert(sizeof(GpuSceneDrawPC) <= 128, "GpuSceneDrawPC must be <= 128 bytes");
 #else
 layout(push_constant, scalar) uniform PC {
-	GlobalPC global;
-	SceneDrawPC draw;
+	GpuGlobalPC global;
+	GpuSceneDrawPC draw;
 } pc;
 #endif

@@ -179,15 +179,15 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 
 	static constexpr u32 kMaxModels = 256u;
 	vkof::Buffer const modelsIndirectBuffer = vkof::buffer_create({
-		.byteCount = sizeof(ModelIndirectDesc) * kMaxModels,
+		.byteCount = sizeof(GpuResolveModelIndirect) * kMaxModels,
 		.memory = vkof::BufferMemory::DeviceOnly,
 	});
 
 	auto const fnUploadModelsIndirectBuffer = [&]() {
-		std::vector<ModelIndirectDesc> descs(modelList.size());
+		std::vector<GpuResolveModelIndirect> descs(modelList.size());
 		for (size_t i = 0u; i < modelList.size(); ++i) {
 			mor::Buffers const bufs = mor::scene_gpu_buffers(modelList[i].gpuScene);
-			descs[i] = ModelIndirectDesc {
+			descs[i] = GpuResolveModelIndirect {
 				.meshlets = bufs.meshlets,
 				.materials = bufs.materials,
 			};
@@ -198,7 +198,7 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			.byteOffset = 0u,
 			.data = srat::slice<u8 const>(
 				reinterpret_cast<u8 const *>(descs.data()),
-				descs.size() * sizeof(ModelIndirectDesc)
+				descs.size() * sizeof(GpuResolveModelIndirect)
 			),
 		});
 	};
@@ -285,7 +285,7 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			!ImGui::GetIO().WantCaptureMouse
 			&& glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS
 		);
-		GlobalPC const globalPC {
+		GpuGlobalPC const globalPC {
 			.time = (f32)glfwGetTime(),
 			.probeX = (i32)curMouseX,
 			.probeY = (i32)curMouseY,
@@ -348,7 +348,7 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			vkof::RenderNode const drawNode = vkof::render_node_create({
 				.queue = vkof::CommandQueue::graphics,
 			});
-			static constexpr f32 kClearColor[] = { 0.05f, 0.05f, 0.1f, 1.0f };
+			static constexpr f32 kVisibilityClearColor[] = { 0.0f, 0.0f, 0.0f, 0.0f };
 			static constexpr f32 kDepthClear = 1.0f;
 			vkof::render_node_attachment_color({
 				.node = drawNode,
@@ -356,7 +356,7 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 				.loadOp = vkof::RenderNodeLoadOp::clear,
 				.mipLevel = 0,
 				.colorIndex = 0,
-				.clearColor = srat::slice<f32 const>(kClearColor, 4),
+				.clearColor = srat::slice<f32 const>(kVisibilityClearColor, 4),
 			});
 			vkof::render_node_attachment_depth({
 				.node = drawNode,
@@ -378,7 +378,7 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 						u32 const count = (
 							mor::scene_gpu_meshlet_count(model.gpuScene)
 						);
-						SceneDrawPC const drawPC {
+						GpuSceneDrawPC const drawPC {
 							.modelId = model.modelId,
 							.meshlets = bufs.meshlets,
 							.positions = bufs.positions,
@@ -430,7 +430,7 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			vkof::render_node_callback({
 				.node = resolveNode,
 				.callback = [&](vkof::CommandBuffer const & cmd) {
-					ResolvePC const resolvePC {
+					GpuResolvePC const resolvePC {
 						.visibilityImageHandle = visibilityHandle,
 						.outputImageHandle = colorHandle,
 						.models = vkof::buffer_virtual_address(modelsIndirectBuffer),

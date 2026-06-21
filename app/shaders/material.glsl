@@ -20,7 +20,7 @@ struct BsdfMaterial {
 };
 
 BsdfMaterial bsdf_material_from_gltf(
-	Material mat,
+	GpuMorMaterial mat,
 	f32v2 uv
 ) {
 	f32v4 baseColor = mat.baseColor;

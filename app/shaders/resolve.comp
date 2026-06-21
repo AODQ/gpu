@@ -46,11 +46,9 @@ void main() {
 	const uint meshletId = ((packed >> 7u) & 0x1FFFFu) - 1u;
 	const uint modelId = (packed >> 24u) & 0xFFu;
 
-	ModelIndirectDescBuf modelDescs = ModelIndirectDescBuf(pc.resolve.models);
-	const ModelIndirectDesc modelDesc = modelDescs.data[modelId];
-
-	MeshletBuf meshletBuf = MeshletBuf(modelDesc.meshlets);
-	const Meshlet meshlet = meshletBuf.data[meshletId];
+	GpuResolveModelIndirectBuffer modelsBuf = GpuResolveModelIndirectBuffer(pc.resolve.models);
+	const GpuResolveModelIndirect modelDesc = modelsBuf.data[modelId];
+	const GpuMorMeshlet meshlet = GpuMorMeshletBuffer(modelDesc.meshlets).data[meshletId];
 
 	vec3 color = index_color(meshletId);
 	switch (pc.global.debugMode) {
@@ -59,12 +57,12 @@ void main() {
 			break;
 		}
 		case MOR_DEBUG_VIEW_MODEL_ID: {
-			color = index_color(modelId);
+			color = index_color(packed);
 			break;
 		}
 		case MOR_DEBUG_VIEW_TRIANGLE_ID: {
-			// color = index_color(triangleId);
-			color = index_color(meshlet.vertexOffset);
+			color = index_color(triangleId);
+			// color = index_color(meshlet.vertexOffset);
 			break;
 		}
 	}

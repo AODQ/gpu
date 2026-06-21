@@ -15,7 +15,9 @@
 #define i32    int
 #endif
 
-struct GlobalPC {
+#define BDA(Type) u64
+
+struct GpuGlobalPC {
 	f32 time;
 	i32 probeX;
 	i32 probeY;
@@ -27,5 +29,5 @@ struct GlobalPC {
 };
 
 #ifdef __cplusplus
-static_assert(sizeof(GlobalPC) == 128, "GlobalPC must be 128 bytes");
+static_assert(sizeof(GpuGlobalPC) == 128, "GpuGlobalPC must be 128 bytes");
 #endif

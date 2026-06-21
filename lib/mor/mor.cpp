@@ -55,11 +55,11 @@ static std::unordered_map<SamplerKey, vkof::Sampler, SamplerKeyHash> sSamplerCac
 
 struct ImplScene {
 	std::vector<f32v3> positions;
-	std::vector<VertexAttr> attributes;
+	std::vector<GpuMorVertexAttr> attributes;
 	std::vector<u32> meshletVerts;
 	std::vector<u8> meshletTris;
-	std::vector<Meshlet> meshlets;
-	std::vector<Instance> instances;
+	std::vector<GpuMorMeshlet> meshlets;
+	std::vector<GpuMorInstance> instances;
 
 	std::string gltfDir;
 	std::unordered_map<cgltf_texture const *, u32> textureHandles;
@@ -67,7 +67,7 @@ struct ImplScene {
 
 	std::unordered_map<cgltf_material const *, u32> materialIndices;
 
-	std::vector<Material> materials;
+	std::vector<GpuMorMaterial> materials;
 };
 
 struct ImplGpuScene {
@@ -457,7 +457,7 @@ void mor::scene_imgui_debug(mor::Scene const & scene) {
 	snprintf(label, sizeof(label), "instances (%u)", instanceCount);
 	if (ImGui::TreeNode(label)) {
 		for (u32 i = 0; i < instanceCount; ++i) {
-			Instance const & inst = s->instances[i];
+			GpuMorInstance const & inst = s->instances[i];
 			ImGui::Text(
 				"[%u] meshlets: %u  offset: %u",
 				i, inst.meshletCount, inst.meshletOffset
@@ -469,7 +469,7 @@ void mor::scene_imgui_debug(mor::Scene const & scene) {
 	snprintf(label, sizeof(label), "meshlets (%u)", meshletCount);
 	if (ImGui::TreeNode(label)) {
 		for (u32 i = 0; i < meshletCount; ++i) {
-			Meshlet const & m = s->meshlets[i];
+			GpuMorMeshlet const & m = s->meshlets[i];
 			ImGui::Text(
 				"[%u] verts: %u  tris: %u  inst: %u  mat: %u",
 				i, m.vertexCount, m.triangleCount, m.instanceIndex, m.materialIndex
@@ -483,7 +483,7 @@ void mor::scene_imgui_debug(mor::Scene const & scene) {
 	snprintf(label, sizeof(label), "materials (%u)", materialCount);
 	if (ImGui::TreeNode(label)) {
 		for (u32 i = 0; i < materialCount; ++i) {
-			Material const & mat = s->materials[i];
+			GpuMorMaterial const & mat = s->materials[i];
 			ImGui::Text(
 				"[%u] base: (%.2f %.2f %.2f %.2f)  metal: %.2f  rough: %.2f",
 				i,
@@ -538,7 +538,7 @@ mor::GpuScene mor::scene_gpu_upload(mor::Scene const & scene) {
 		s->positions.data(), s->positions.size() * sizeof(f32v3)
 	);
 	gpu->attributes = upload_buffer(
-		s->attributes.data(), s->attributes.size() * sizeof(VertexAttr)
+		s->attributes.data(), s->attributes.size() * sizeof(GpuMorVertexAttr)
 	);
 	gpu->meshletVerts = upload_buffer(
 		s->meshletVerts.data(), s->meshletVerts.size() * sizeof(u32)
@@ -547,14 +547,14 @@ mor::GpuScene mor::scene_gpu_upload(mor::Scene const & scene) {
 		s->meshletTris.data(), s->meshletTris.size() * sizeof(u8)
 	);
 	gpu->meshlets = upload_buffer(
-		s->meshlets.data(), s->meshlets.size() * sizeof(Meshlet)
+		s->meshlets.data(), s->meshlets.size() * sizeof(GpuMorMeshlet)
 	);
 	gpu->instances = upload_buffer(
-		s->instances.data(), s->instances.size() * sizeof(Instance)
+		s->instances.data(), s->instances.size() * sizeof(GpuMorInstance)
 	);
 	if (!s->materials.empty()) {
 		gpu->materials = upload_buffer(
-			s->materials.data(), s->materials.size() * sizeof(Material)
+			s->materials.data(), s->materials.size() * sizeof(GpuMorMaterial)
 		);
 	}
 	gpu->meshletCount = (u32)s->meshlets.size();
