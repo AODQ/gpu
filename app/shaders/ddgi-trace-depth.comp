@@ -1,0 +1,121 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_shader_image_load_formatted : require
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_debug_printf : require
+
+// visibility trace
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 2) uniform image2D vkofImages[];
+layout(set = 0, binding = 3) uniform accelerationStructureEXT vkofTlas;
+
+#include "shared/ddgi-shared.h"
+
+shared struct {
+	vec3 dir;
+	float dist;
+} sharedRays[16*16];
+
+void traceRay(const vec3 rayDir) {
+	sharedRays[gl_LocalInvocationIndex].dir = rayDir;
+	sharedRays[gl_LocalInvocationIndex].dist = 0.0;
+
+	rayQueryEXT rq;
+	rayQueryInitializeEXT(
+		rq,
+		/*topLevel=*/ vkofTlas,
+		/*rayFlags=*/ (
+			gl_RayFlagsOpaqueEXT
+			| gl_RayFlagsTerminateOnFirstHitEXT
+		),
+		/*cullMask=*/ 0xFF,
+		/*origin=*/ rayOrigin(),
+		/*tmin=*/ 0.001f,
+		/*direction=*/ rayDir,
+		/*tmax=*/ 1000.0f
+	);
+	// just one bounce for now
+	rayQueryProceedEXT(rq);
+	const bool hit = (
+		   rayQueryGetIntersectionTypeEXT(rq, true)
+		!= gl_RayQueryCommittedIntersectionNoneEXT
+	);
+	if (hit) {
+		sharedRays[gl_LocalInvocationIndex].dist = (
+			rayQueryGetIntersectionTEXT(rq, true)
+		);
+	}
+}
+
+void main() {
+	// -- trace rays
+	traceRay(rayDirection());
+
+	debugPrintfEXT(
+		"traceRay: %d, %d, %d, %f\n",
+		gl_WorkGroupID.x,
+		gl_WorkGroupID.y,
+		gl_LocalInvocationIndex,
+		sharedRays[gl_LocalInvocationIndex].dist
+	);
+
+	// -- synchronize shared mem
+	barrier();
+
+	// -- get the local offset into probe and the global offset into the grid
+	const uint probeOffI = gl_LocalInvocationID.x;
+	const uint probeOffJ = gl_LocalInvocationID.y;
+
+	// -- get texel direction from octahedron encoding
+	const vec2 texelCoord = (
+		(
+			(vec2(probeOffI, probeOffJ) + vec2(0.5f))
+			/ vec2(16.0f, 16.0f) * vec2(2.0f)
+		)
+		- vec2(1.0f)
+	);
+	const vec3 texelDir = octahedronDecode(texelCoord);
+
+	// -- combine results from all rays
+	float weightedDist = 0.0f;
+	float weightedDistSqr = 0.0f;
+	float weightSum = 0.0f;
+	for (uint k = 0; k < 16*16; ++k) {
+		const float weight = (
+			pow(max(0.0f, dot(texelDir, sharedRays[k].dir)), 4.0f)
+		);
+		weightSum += weight;
+		weightedDist += sharedRays[k].dist * weight;
+		weightedDistSqr += sharedRays[k].dist * sharedRays[k].dist * weight;
+	}
+	const float invW = 1.0 / max(weightSum, 0.0001);
+	weightedDist *= invW;
+	weightedDistSqr *= invW;
+
+	// -- combine with previous distance history
+	const uint probeGridOffX = gl_WorkGroupID.x * (16u) + 1u;
+	const uint probeGridOffY = gl_WorkGroupID.y * (16u) + 1u;
+	const ivec2 probeGridCoord = (
+		ivec2(probeGridOffX + probeOffI, probeGridOffY + probeOffJ)
+	);
+	const vec2 previousDistance = (
+		imageLoad(
+			vkofImages[nonuniformEXT(pc.ddgi.depthStorageHandle)],
+			probeGridCoord
+		).rg
+	);
+	const vec2 combinedDistance = (
+		mix(previousDistance, vec2(weightedDist, weightedDistSqr), 0.05f)
+	);
+	imageStore(
+		vkofImages[nonuniformEXT(pc.ddgi.depthStorageHandle)],
+		probeGridCoord,
+		vec4(combinedDistance, 0.0f, 1.0f)
+	);
+}

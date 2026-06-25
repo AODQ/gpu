@@ -46,7 +46,7 @@ bool inShadow = (
 
 ## Step 8 — DDGI probe grid
 
-### Data structures (shared header `app/shared/ddgi_shared.h`)
+### Data structures (shared header `app/shared/ddgi-shared.h`)
 
 ```c
 struct GpuDdgiGrid {

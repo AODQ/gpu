@@ -2,17 +2,25 @@
 #pragma once
 #endif
 
+#ifndef GLOBAL_PC_H
+#define GLOBAL_PC_H
+
 #ifdef __cplusplus
 #include <srat/core-math.hpp>
 #else
-#define f32    float
-#define f32v2  vec2
-#define f32v3  vec3
-#define f32v4  vec4
+#define f32 float
+#define f32v2 vec2
+#define f32v3 vec3
+#define u32 uint
+#define u64 uint64_t
+#define i32 int
+#define u32v2 uvec2
+#define u32v3 uvec3
+#define f32v4 vec4
 #define f32m44 mat4
-#define u32    uint
-#define u64    uint64_t
-#define i32    int
+#define u32 uint
+#define u64 uint64_t
+#define i32 int
 #endif
 
 #define VA(Type) u64
@@ -48,3 +56,5 @@ layout(buffer_reference, scalar) buffer GpuDebugPCBuffer {
 	GpuDebugPC data;
 };
 #endif
+
+#endif // GLOBAL_PC_H

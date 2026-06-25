@@ -7,6 +7,7 @@
 #include <srat/core-types.hpp>
 
 #include <functional>
+#include <imgui.h>
 
 struct GLFWwindow;
 
@@ -226,6 +227,8 @@ namespace vkof
 		Sampler sampler;
 	};
 	u32 image_sampler_handle(ImageSamplerHandleInfo const & info);
+	[[nodiscard]] ImTextureID image_imgui_id(ImageSamplerHandleInfo const & info);
+	void image_imgui_id_destroy(ImTextureID id);
 
 	// for use with image2d
 	struct ImageStorageHandleInfo {

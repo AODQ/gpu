@@ -21,8 +21,6 @@ struct SceneDescDdgiVolume
 	f32v3 probeSpacing;
 	u32v3 probeCounts;
 	u32 raysPerProbe;
-	u32 irradianceResolution;
-	u32 depthResolution;
 
 	inline f32v3 max() const {
 		return {

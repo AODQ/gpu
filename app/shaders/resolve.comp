@@ -13,6 +13,8 @@ layout(set = 0, binding = 2) uniform image2D vkofImages[];
 layout(set = 0, binding = 3) uniform accelerationStructureEXT vkofTlas;
 
 #include "mor/mor_shared.h"
+#define DDGI_NO_PC
+#include "shared/ddgi-shared.h"
 #include "resolve_pc.h"
 #include "material.glsl"
 #include "probe.glsl"
@@ -67,8 +69,65 @@ f32v2 fnNdcToClip(f32v4 ndc, const ivec2 screensize) {
 	return screen * f32v2(screensize);
 }
 
+vec3 sampleProbeIrradiance(
+	const vec3 worldPos,
+	const vec3 worldNormal
+) {
+	if (pc.global.ddgiGrid == 0u) { return vec3(0.0, 1.0f, 0.0f); }
+
+	// get px/py from probe information
+	const GpuDdgiGrid grid = GpuDdgiGridBuffer(pc.global.ddgiGrid).data;
+
+	const vec3 gridOriginMax = (
+		grid.origin + vec3(grid.probeCounts)*grid.probeSpacing
+	);
+
+	if (
+		   worldPos.x < grid.origin.x
+		|| worldPos.y < grid.origin.y
+		|| worldPos.z < grid.origin.z
+	) {
+		return vec3(0.0);
+	}
+
+	if (
+		   worldPos.x > gridOriginMax.x
+		|| worldPos.y > gridOriginMax.y
+		|| worldPos.z > gridOriginMax.z
+	) {
+		return vec3(0.0);
+	}
+
+	// scale the world position into the probe grid space
+	const vec3 gridPos = (
+		(worldPos - grid.origin) / vec3(grid.probeSpacing)
+	);
+	const vec2 octahedronUv = octahedronEncode(normalize(worldNormal));
+	const ivec3 probeIdx = clamp(
+		ivec3(gridPos),
+		ivec3(0),
+		ivec3(grid.probeCounts) - ivec3(1)
+	);
+	const ivec2 atlasOrigin = ivec2(
+		probeIdx.x * 8,
+		(probeIdx.y + probeIdx.z * int(grid.probeCounts.y)) * 8
+	);
+	const vec2 atlasSize = vec2(
+		float(grid.probeCounts.x) * 8.0,
+		float(grid.probeCounts.y * grid.probeCounts.z) * 8.0
+	);
+	const vec2 localUv = clamp((octahedronUv * 0.5 + 0.5) * 8.0, 0.5, 7.5);
+	const vec2 atlasUv = (vec2(atlasOrigin) + localUv) / atlasSize;
+	const vec3 irradiance = (
+		texture(vkofTextures[nonuniformEXT(grid.irradianceSamplerHandle)], atlasUv).rgb
+	);
+	return irradiance;
+}
+
 void main() {
 	const ivec2 coord  = ivec2(gl_GlobalInvocationID.xy);
+	const ivec2 screensize = ivec2(1280, 720);
+
 	const uint packed = (
 		imageLoad(vkofImagesU[pc.resolve.visibilityImageHandle], coord).r
 	);
@@ -150,8 +209,6 @@ void main() {
 	const f32v4 ndc1 = pc.global.viewProj * modelTransform * f32v4(pos1, 1.0);
 	const f32v4 ndc2 = pc.global.viewProj * modelTransform * f32v4(pos2, 1.0);
 
-	// TODO get screensize
-	const ivec2 screensize = ivec2(1280, 720);
 	const f32v2 clip0 = fnNdcToClip(ndc0, screensize);
 	const f32v2 clip1 = fnNdcToClip(ndc1, screensize);
 	const f32v2 clip2 = fnNdcToClip(ndc2, screensize);
@@ -251,52 +308,56 @@ void main() {
 		dot(rawGeomNormal, -wi) >= 0.0 ? rawGeomNormal : -rawGeomNormal
 	);
 	f32v3 irradiance = f32v3(0.0);
-	if (pc.global.lightCount > 0u) {
-		GpuLightBuffer lightBuf = GpuLightBuffer(pc.global.lightsVa);
-		for (uint i = 0u; i < pc.global.lightCount; ++i) {
-			const GpuLight light = lightBuf.data[i];
-			const f32v3 toLight = light.position - worldPos;
-			const f32 dist = length(toLight);
-			const f32v3 wo = toLight / dist;
-			const f32 dotNL = max(dot(worldNormal, wo), 0.0);
-			if (dotNL <= 0.0) { continue; }
-			if (pc.global.shadowsEnabled != 0u) {
-				rayQueryEXT rq;
-				rayQueryInitializeEXT(
-					/*rayQuery=*/rq,
-					/*topLevel=*/vkofTlas,
-					/*rayFlags=*/ (
-						gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT
-					),
-					/*cullMask=*/0xFFu,
-					/*origin=*/worldPos + geomNormal * 0.0005f,
-					/*tMin=*/0.001f,
-					/*direction=*/wo,
-					/*tMax=*/dist + 0.0025f
-				);
-				rayQueryProceedEXT(rq);
-				const bool hasHit = (
-					rayQueryGetIntersectionTypeEXT(/*rayQuery=*/rq, /*committed=*/true)
-					!= gl_RayQueryCommittedIntersectionNoneEXT
-				);
-				const bool inShadow = (
-					hasHit
-					&& rayQueryGetIntersectionTEXT(/*rayQuery=*/rq, /*committed=*/true) < dist
-				);
-				if (inShadow) { continue; }
-			}
-			const f32 distNorm = dist / light.radius;
-			const f32 falloff = (
-				clamp(1.0 - distNorm * distNorm * distNorm * distNorm, 0.0, 1.0)
-			);
-			const f32 attenuation = (falloff * falloff) / (dist * dist + 1.0);
-			irradiance += (
-				fnBsdfF(worldNormal, wi, wo, bsdfMaterial)
-				* light.color * dotNL * attenuation
-			);
-		}
-	}
-	const f32v3 ambient = bsdfMaterial.albedo * 0.02f;
+	// if (pc.global.lightCount > 0u) {
+	// 	GpuLightBuffer lightBuf = GpuLightBuffer(pc.global.lightsVa);
+	// 	for (uint i = 0u; i < pc.global.lightCount; ++i) {
+	// 		const GpuLight light = lightBuf.data[i];
+	// 		const f32v3 toLight = light.position - worldPos;
+	// 		const f32 dist = length(toLight);
+	// 		const f32v3 wo = toLight / dist;
+	// 		const f32 dotNL = max(dot(worldNormal, wo), 0.0);
+	// 		if (dotNL <= 0.0) { continue; }
+	// 		if (pc.global.shadowsEnabled != 0u) {
+	// 			rayQueryEXT rq;
+	// 			rayQueryInitializeEXT(
+	// 				/*rayQuery=*/rq,
+	// 				/*topLevel=*/vkofTlas,
+	// 				/*rayFlags=*/ (
+	// 					gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT
+	// 				),
+	// 				/*cullMask=*/0xFFu,
+	// 				/*origin=*/worldPos + geomNormal * 0.0005f,
+	// 				/*tMin=*/0.001f,
+	// 				/*direction=*/wo,
+	// 				/*tMax=*/dist + 0.0025f
+	// 			);
+	// 			rayQueryProceedEXT(rq);
+	// 			const bool hasHit = (
+	// 				rayQueryGetIntersectionTypeEXT(/*rayQuery=*/rq, /*committed=*/true)
+	// 				!= gl_RayQueryCommittedIntersectionNoneEXT
+	// 			);
+	// 			const bool inShadow = (
+	// 				hasHit
+	// 				&& rayQueryGetIntersectionTEXT(/*rayQuery=*/rq, /*committed=*/true) < dist
+	// 			);
+	// 			if (inShadow) { continue; }
+	// 		}
+	// 		const f32 distNorm = dist / light.radius;
+	// 		const f32 falloff = (
+	// 			clamp(1.0 - distNorm * distNorm * distNorm * distNorm, 0.0, 1.0)
+	// 		);
+	// 		const f32 attenuation = (falloff * falloff) / (dist * dist + 1.0);
+	// 		irradiance += (
+	// 			fnBsdfF(worldNormal, wi, wo, bsdfMaterial)
+	// 			* light.color * dotNL * attenuation
+	// 		);
+	// 	}
+	// }
+	const f32v3 ambient = (
+		pc.global.ddgiGrid != 0u
+		? bsdfMaterial.albedo * sampleProbeIrradiance(worldPos, worldNormal)
+		: bsdfMaterial.albedo * vec3(1.0f, 0.0f, 0.0f)
+	);
 	const f32v3 hdr = irradiance + ambient + bsdfMaterial.emissive;
 	f32v4 outColor = f32v4(fnAces(hdr * pc.global.exposure), 1.0f);
 
@@ -351,13 +412,13 @@ void main() {
 	// -- pixel probe
 	if (shader_probe_is_active_pixel(ivec2(gl_GlobalInvocationID.xy))) {
 		outColor.rgb = f32v3(1.0, 0.0, 1.0);
-		debugPrintfEXT(
-			"__MODEL__: %u\nbarycentric: %f %f %f (sum %f)\nmodelId: %u, meshletId: %u, triangleId: %u\n",
-			modelId,
-			barycentric.x, barycentric.y, barycentric.z,
-			barycentric.x + barycentric.y + barycentric.z,
-			modelId, meshletId, triangleId
-		);
+		// debugPrintfEXT(
+		// 	"__MODEL__: %u\nbarycentric: %f %f %f (sum %f)\nmodelId: %u, meshletId: %u, triangleId: %u\n",
+		// 	modelId,
+		// 	barycentric.x, barycentric.y, barycentric.z,
+		// 	barycentric.x + barycentric.y + barycentric.z,
+		// 	modelId, meshletId, triangleId
+		// );
 	}
 
 	// -- blend results

@@ -1,5 +1,6 @@
 #include "shaders/scene_shared.h"
 #include "shaders/resolve_pc.h"
+#include "shared/ddgi-shared.h"
 #include "asset_library.hpp"
 #include "scene_desc.hpp"
 
@@ -31,7 +32,7 @@ static bool sFpMode = false;
 static float sFlyCamSpeed = 0.05f;
 static u32 sSelectedObject = 0xFFFFFFFFu;
 static std::vector<u32> sDrawToInstIdx;
-static ImGuizmo::OPERATION sGizmoOp = ImGuizmo::TRANSLATE;
+static ImGuizmo::OPERATION sGizmoOp = ImGuizmo::TRANSLATE; // only TRANSLATE and ROTATE are used
 
 using Clock = std::chrono::steady_clock;
 using Ms = std::chrono::duration<double, std::milli>;
@@ -54,8 +55,6 @@ struct DdgiVolume
 	f32v3 probeSpacing;
 	u32v3 probeCounts;
 	u32 raysPerProbe;
-	u32 irradianceResolution;
-	u32 depthResolution;
 
 	[[nodiscard]] f32v3 max() const {
 		return {
@@ -68,6 +67,13 @@ struct DdgiVolume
 
 	vkof::Image imageIrradiance;
 	vkof::Image imageDepth;
+	vkof::Sampler sampler;
+	u32 irradianceStorageHandle;
+	u32 depthStorageHandle;
+	u32 irradianceSamplerHandle;
+	u32 depthSamplerHandle;
+	ImTextureID irradianceImguiId;
+	ImTextureID depthImguiId;
 };
 
 DdgiVolume ddgi_volume_create(
@@ -78,14 +84,25 @@ DdgiVolume ddgi_volume_create(
 		.probeSpacing = desc.probeSpacing,
 		.probeCounts = desc.probeCounts,
 		.raysPerProbe = desc.raysPerProbe,
-		.irradianceResolution = desc.irradianceResolution,
-		.depthResolution = desc.depthResolution,
 		.imageIrradiance = {},
 		.imageDepth = {},
+		.sampler = {},
+		.irradianceStorageHandle = 0u,
+		.depthStorageHandle = 0u,
+		.irradianceSamplerHandle = 0u,
+		.depthSamplerHandle = 0u,
+		.irradianceImguiId = nullptr,
+		.depthImguiId = nullptr,
 	};
 
-	u32 const irradW = vol.probeCounts.x * (vol.irradianceResolution + 2u);
-	u32 const irradH = vol.probeCounts.y * vol.probeCounts.z * (vol.irradianceResolution + 2u);
+	// octahedron encoding requires 2 extra pixels in each dimension for the
+	//   "wrap" region
+	// irradiance resolution is 6x6 octahedron, depth is 14x14
+	static constexpr size_t skIrradianceRes = 6u + 2u;
+	static constexpr size_t skDepthRes = 14u + 2u;
+
+	u32 const irradW = vol.probeCounts.x * skIrradianceRes;
+	u32 const irradH = vol.probeCounts.y * vol.probeCounts.z * skIrradianceRes;
 	vol.imageIrradiance = vkof::image_create({
 		.width = irradW,
 		.height = irradH,
@@ -94,14 +111,39 @@ DdgiVolume ddgi_volume_create(
 		.optInitialData = {},
 	});
 
-	u32 const depthW = vol.probeCounts.x * (vol.depthResolution + 2u);
-	u32 const depthH = vol.probeCounts.y * vol.probeCounts.z * (vol.depthResolution + 2u);
+	u32 const depthW = vol.probeCounts.x * skDepthRes;
+	u32 const depthH = vol.probeCounts.y * vol.probeCounts.z * skDepthRes;
 	vol.imageDepth = vkof::image_create({
 		.width = depthW,
 		.height = depthH,
 		.format = vkof::ImageFormat::r16g16b16a16_sfloat,
 		.mipLevels = 1u,
 		.optInitialData = {},
+	});
+
+	vol.sampler = vkof::sampler_create({
+		.magFilter = vkof::SamplerFilter::linear,
+		.minFilter = vkof::SamplerFilter::linear,
+		.addressModeU = vkof::SamplerAddressMode::clamp_to_edge,
+		.addressModeV = vkof::SamplerAddressMode::clamp_to_edge,
+		.addressModeW = vkof::SamplerAddressMode::clamp_to_edge,
+		.mipmapMode = vkof::SamplerMipmapMode::nearest,
+	});
+	vol.irradianceStorageHandle = vkof::image_storage_handle({
+		.image = vol.imageIrradiance,
+		.mipLevel = 0u,
+	});
+	vol.depthStorageHandle = vkof::image_storage_handle({
+		.image = vol.imageDepth,
+		.mipLevel = 0u,
+	});
+	vol.irradianceSamplerHandle = vkof::image_sampler_handle({
+		.image = vol.imageIrradiance,
+		.sampler = vol.sampler,
+	});
+	vol.depthSamplerHandle = vkof::image_sampler_handle({
+		.image = vol.imageDepth,
+		.sampler = vol.sampler,
 	});
 
 	return vol;
@@ -185,6 +227,11 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 		? scene_desc_load(sceneFilePath)
 		: SceneDesc{};
 
+	std::vector<DdgiVolume> ddgiVolumes;
+	for (SceneDescDdgiVolume const & v : sceneDesc.ddgiVolumes) {
+		ddgiVolumes.push_back(ddgi_volume_create(v));
+	}
+
 	std::string const meshPath = (shaderDir / "scene.mesh").string();
 	std::string const fragPath = (shaderDir / "scene.frag").string();
 	std::string const libDirStr = libDir.string();
@@ -229,6 +276,22 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			.includePaths = srat::slice { kIncludePaths, 1u },
 		})
 	);
+	vkof::Pipeline const ddgiTraceIrradiancePipeline = (
+		vkof::pipeline_compute_create({
+			.pathCompute = (
+				(shaderDir / "ddgi-trace-irradiance.comp").string().c_str()
+			),
+			.includePaths = srat::slice { kIncludePaths, 1u },
+		})
+	);
+	vkof::Pipeline const ddgiTraceDepthPipeline = (
+		vkof::pipeline_compute_create({
+			.pathCompute = (
+				(shaderDir / "ddgi-trace-depth.comp").string().c_str()
+			),
+			.includePaths = srat::slice { kIncludePaths, 1u },
+		})
+	);
 	vkof::Pipeline const resolvePipeline = (
 		vkof::pipeline_compute_create({
 			.pathCompute = (shaderDir / "resolve.comp").string().c_str(),
@@ -238,7 +301,7 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 	vkof::Pipeline const debugProbePipeline = (
 		vkof::debug_sphere_pipeline_create({
 			.pathFrag = (
-				(shaderDir / "ddgi_probe_vis.frag").string().c_str()
+				(shaderDir / "ddgi-debug-probe.frag").string().c_str()
 			)
 		})
 	);
@@ -282,6 +345,10 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 	});
 	vkof::Buffer const debugPcBuffer = vkof::buffer_create({
 		.byteCount = sizeof(GpuDebugPC),
+		.memory = vkof::BufferMemory::HostWritable,
+	});
+	vkof::Buffer const ddgiGridBuffer = vkof::buffer_create({
+		.byteCount = sizeof(GpuDdgiGrid),
 		.memory = vkof::BufferMemory::HostWritable,
 	});
 	vkof::AccelerationStructureTlas const tlas = (
@@ -412,14 +479,14 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			sPrevTab = currTab;
 		}
 		if (!ImGui::GetIO().WantCaptureKeyboard) {
-			static bool sPrevT = false, sPrevR = false, sPrevS = false;
+			static bool sPrevT = false, sPrevR = false, sPrevGrave = false;
 			bool const currT = glfwGetKey(window, GLFW_KEY_T) == GLFW_PRESS;
 			bool const currR = glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS;
-			bool const currS = glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS;
+			bool const currGrave = glfwGetKey(window, GLFW_KEY_GRAVE_ACCENT) == GLFW_PRESS;
 			if (currT && !sPrevT) { sGizmoOp = ImGuizmo::TRANSLATE; }
 			if (currR && !sPrevR) { sGizmoOp = ImGuizmo::ROTATE; }
-			if (currS && !sPrevS) { sGizmoOp = ImGuizmo::SCALE; }
-			sPrevT = currT; sPrevR = currR; sPrevS = currS;
+			if (currGrave && !sPrevGrave) { sSelectedObject = 0xFFFFFFFFu; }
+			sPrevT = currT; sPrevR = currR; sPrevGrave = currGrave;
 		}
 
 		double curMouseX, curMouseY;
@@ -453,7 +520,10 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 		bool const fpLookActive = (
 			sFpMode
 			&& !ImGui::GetIO().WantCaptureMouse
-			&& glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS
+			&& (
+				glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS
+				|| glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS
+			)
 		);
 		if (!fpLookActive && prevFpLookActive) {
 			glfwGetCursorPos(window, &prevMouseX, &prevMouseY);
@@ -506,7 +576,8 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			&& glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS
 		);
 		bool const leftClickSelect = (
-			!ImGui::GetIO().WantCaptureMouse
+			!sFpMode
+			&& !ImGui::GetIO().WantCaptureMouse
 			&& ImGui::IsMouseReleased(ImGuiMouseButton_Left)
 			&& !ImGui::IsMouseDragging(ImGuiMouseButton_Left)
 		);
@@ -526,6 +597,27 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 				reinterpret_cast<u8 const *>(&debugPC), sizeof(debugPC)
 			),
 		});
+		if (!ddgiVolumes.empty()) {
+			DdgiVolume const & dv = ddgiVolumes[0u];
+			SceneDescDdgiVolume const & ds = sceneDesc.ddgiVolumes[0u];
+			GpuDdgiGrid const grid = {
+				.origin = ds.origin,
+				.probeCounts = ds.probeCounts,
+				.probeSpacing = ds.probeSpacing,
+				.raysPerProbe = ds.raysPerProbe,
+				.irradianceStorageHandle = dv.irradianceStorageHandle,
+				.depthStorageHandle = dv.depthStorageHandle,
+				.irradianceSamplerHandle = dv.irradianceSamplerHandle,
+				.depthSamplerHandle = dv.depthSamplerHandle,
+			};
+			vkof::buffer_upload({
+				.buffer = ddgiGridBuffer,
+				.byteOffset = 0u,
+				.data = srat::slice<u8 const>(
+					reinterpret_cast<u8 const *>(&grid), sizeof(grid)
+				),
+			});
+		}
 		GpuGlobalPC const globalPC {
 			.time = (f32)glfwGetTime(),
 			.cameraPos = sFpMode ? fpCam.position : srat::camera_orbit_eye(cam),
@@ -539,7 +631,11 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 				: (srat::camera_orbit_proj(cam) * srat::camera_orbit_view(cam))
 			),
 			.debug = vkof::buffer_virtual_address(debugPcBuffer),
-			.ddgiGrid = 0u,
+			.ddgiGrid = (
+				ddgiVolumes.empty()
+				? 0u
+				: vkof::buffer_virtual_address(ddgiGridBuffer)
+			),
 			.shadowsEnabled = (tlas.id != 0u && !modelList.empty()) ? 1u : 0u,
 			._reserved = {},
 		};
@@ -549,6 +645,8 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 		{
 			ImGuiIO const & io = ImGui::GetIO();
 			ImGuizmo::BeginFrame();
+			// draw into the background so the gizmo isn't clipped to the scene panel
+			ImGuizmo::SetDrawlist(ImGui::GetBackgroundDrawList());
 			ImGuizmo::SetRect(0.0f, 0.0f, io.DisplaySize.x, io.DisplaySize.y);
 		}
 
@@ -630,6 +728,10 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			}
 			ImGui::DragFloat3("position", &selInst.position.x, 0.01f);
 			ImGui::DragFloat3("rotation", &selInst.rotation.x, 0.5f);
+			ImGui::SameLine();
+			if (ImGui::Button("reset")) {
+				selInst.rotation = {};
+			}
 			ImGui::DragFloat("scale", &selInst.scale, 0.01f, 0.001f, 1000.0f);
 			{
 				f32m44 const viewMat = (
@@ -652,11 +754,22 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 					ImGuizmo::WORLD,
 					model.m.ptr()
 				)) {
-					float t[3], r[3], s[3];
-					ImGuizmo::DecomposeMatrixToComponents(model.m.ptr(), t, r, s);
-					selInst.position = { t[0], t[1], t[2] };
-					selInst.rotation = { r[0], r[1], r[2] };
-					selInst.scale = s[0];
+					f32 const * m = model.m.ptr();
+					// translation is always at column 3 in column-major
+					selInst.position = { m[12], m[13], m[14] };
+					if (sGizmoOp == ImGuizmo::ROTATE) {
+						// decompose for R = Ry(a) * Rx(b) * Rz(c) from column-major m16
+						// column-major: m[col*4 + row]
+						// R[1][2] = m[2*4+1] = m[9]  = -sin(b)
+						// R[0][2] = m[2*4+0] = m[8]  = sin(a)*cos(b)
+						// R[2][2] = m[2*4+2] = m[10] = cos(a)*cos(b)
+						// R[1][0] = m[0*4+1] = m[1]  = cos(b)*sin(c)
+						// R[1][1] = m[1*4+1] = m[5]  = cos(b)*cos(c)
+						f32 const invS = 1.0f / sqrtf(m[0]*m[0] + m[1]*m[1] + m[2]*m[2]);
+						selInst.rotation.x = (180.0f/3.14159265f) * asinf(-m[9] * invS);
+						selInst.rotation.y = (180.0f/3.14159265f) * atan2f(m[8] * invS, m[10] * invS);
+						selInst.rotation.z = (180.0f/3.14159265f) * atan2f(m[1] * invS, m[5] * invS);
+					}
 				}
 			}
 			ImGui::Separator();
@@ -795,16 +908,16 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 
 		ImGui::Begin("ddgi volumes");
 		if (ImGui::Button("add volume")) {
-			sceneDesc.ddgiVolumes.emplace_back(SceneDescDdgiVolume {
+			SceneDescDdgiVolume const newVol = {
 				.origin = (
 					sFpMode ? fpCam.position : srat::camera_orbit_eye(cam)
 				),
 				.probeSpacing = { 1.0f, 1.0f, 1.0f },
 				.probeCounts = { 8u, 4u, 8u },
 				.raysPerProbe = 128u,
-				.irradianceResolution = 6u,
-				.depthResolution = 14u,
-			});
+			};
+			sceneDesc.ddgiVolumes.push_back(newVol);
+			ddgiVolumes.push_back(ddgi_volume_create(newVol));
 		}
 		i32 removeVolIdx = -1;
 		for (u32 i = 0u; i < (u32)sceneDesc.ddgiVolumes.size(); ++i) {
@@ -855,11 +968,43 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			ImGui::PopID();
 		}
 		if (removeVolIdx >= 0) {
+			DdgiVolume & dying = ddgiVolumes[(u32)removeVolIdx];
+			vkof::image_imgui_id_destroy(dying.irradianceImguiId);
+			vkof::image_imgui_id_destroy(dying.depthImguiId);
+			vkof::image_destroy(dying.imageIrradiance);
+			vkof::image_destroy(dying.imageDepth);
+			vkof::sampler_destroy(dying.sampler);
+			ddgiVolumes.erase(ddgiVolumes.begin() + removeVolIdx);
 			sceneDesc.ddgiVolumes.erase(
 				sceneDesc.ddgiVolumes.begin() + removeVolIdx
 			);
 		}
 		ImGui::End();
+
+		if (!ddgiVolumes.empty()) {
+			ImGui::Begin("ddgi atlases");
+			DdgiVolume & dv = ddgiVolumes[0u];
+			if (!dv.irradianceImguiId) {
+				dv.irradianceImguiId = (
+					vkof::image_imgui_id({
+						.image = dv.imageIrradiance,
+						.sampler = dv.sampler,
+					})
+				);
+				dv.depthImguiId = (
+					vkof::image_imgui_id({
+						.image = dv.imageDepth,
+						.sampler = dv.sampler,
+					})
+				);
+			}
+			f32 const w = ImGui::GetContentRegionAvail().x;
+			ImGui::Text("irradiance");
+			ImGui::Image(dv.irradianceImguiId, ImVec2(w, w * 0.5f));
+			ImGui::Text("depth");
+			ImGui::Image(dv.depthImguiId, ImVec2(w, w * 0.5f));
+			ImGui::End();
+		}
 
 		if (!sceneDesc.lights.empty()) {
 			vkof::buffer_upload({
@@ -1072,10 +1217,80 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			});
 			vkof::acceleration_structure_set_tlas(tlas);
 
+			// prepare resolve node for DDGI reads
+			vkof::RenderNode const resolveNode = (
+				vkof::render_node_create({
+					.queue = vkof::CommandQueue::graphics,
+				})
+			);
+
+			// -- ddgi trace node
+			std::vector<vkof::RenderNode> ddgiTraceNodes;
+			for (auto const & ddgi : ddgiVolumes) {
+				vkof::RenderNode const ddgiNode = (
+					vkof::render_node_create({.queue = vkof::CommandQueue::graphics, })
+				);
+				vkof::render_node_add_persistent_image({
+					.node = ddgiNode,
+					.image = ddgi.imageIrradiance,
+					.access = vkof::RenderNodeAccess::write,
+				});
+				vkof::render_node_add_persistent_image({
+					.node = ddgiNode,
+					.image = ddgi.imageDepth,
+					.access = vkof::RenderNodeAccess::write,
+				});
+				vkof::render_node_add_persistent_image({
+					.node = resolveNode,
+					.image = ddgi.imageIrradiance,
+					.access = vkof::RenderNodeAccess::read,
+				});
+				vkof::render_node_add_persistent_image({
+					.node = resolveNode,
+					.image = ddgi.imageDepth,
+					.access = vkof::RenderNodeAccess::read,
+				});
+
+				vkof::render_node_callback({
+					.node = ddgiNode,
+					.callback = [&](vkof::CommandBuffer const & cmd) {
+						GpuDdgiGrid const tracePC = {
+							.origin = ddgi.origin,
+							.probeCounts = ddgi.probeCounts,
+							.probeSpacing = ddgi.probeSpacing,
+							.raysPerProbe = ddgi.raysPerProbe,
+							.irradianceStorageHandle = ddgi.irradianceStorageHandle,
+							.depthStorageHandle = ddgi.depthStorageHandle,
+							.irradianceSamplerHandle = ddgi.irradianceSamplerHandle,
+							.depthSamplerHandle = ddgi.depthSamplerHandle,
+						};
+						vkof::cmd_dispatch(vkof::CmdDispatch {
+							.cmd = cmd,
+							.pipeline = ddgiTraceIrradiancePipeline,
+							.pushconstant = srat::slice<u8 const>(
+								reinterpret_cast<u8 const *>(&tracePC), sizeof(tracePC)
+							),
+							.groupCountX = ddgi.probeCounts.x,
+							.groupCountY = ddgi.probeCounts.y * ddgi.probeCounts.z,
+							.groupCountZ = 1u,
+						});
+						vkof::cmd_dispatch(vkof::CmdDispatch {
+							.cmd = cmd,
+							.pipeline = ddgiTraceDepthPipeline,
+							.pushconstant = srat::slice<u8 const>(
+								reinterpret_cast<u8 const *>(&tracePC), sizeof(tracePC)
+							),
+							.groupCountX = ddgi.probeCounts.x,
+							.groupCountY = ddgi.probeCounts.y * ddgi.probeCounts.z,
+							.groupCountZ = 1u,
+						});
+					}
+				});
+
+				ddgiTraceNodes.emplace_back(ddgiNode);
+			}
+
 			// -- resolve node
-			vkof::RenderNode const resolveNode = vkof::render_node_create({
-				.queue = vkof::CommandQueue::graphics,
-			});
 			vkof::render_node_add_image({
 				.node = resolveNode,
 				.image = visibilityTarget,
@@ -1108,9 +1323,21 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			});
 
 			// -- execute render graph
-			vkof::RenderNode const nodes[] = { drawNode, tlasNode, resolveNode, };
+			std::vector<vkof::RenderNode> allNodes;
+			allNodes.emplace_back(drawNode);
+			allNodes.emplace_back(tlasNode);
+			allNodes.insert(
+				allNodes.end(),
+				ddgiTraceNodes.begin(),
+				ddgiTraceNodes.end()
+			);
+			allNodes.emplace_back(resolveNode);
 			vkof::render_graph_execute({
-				.nodes = srat::slice<vkof::RenderNode const>(nodes, 3u),
+				.nodes = (
+					srat::slice<vkof::RenderNode const>(
+						allNodes.data(), allNodes.size()
+					)
+				),
 				.rootPushconstant = srat::slice<u8 const>(
 					reinterpret_cast<u8 const *>(&globalPC), sizeof(globalPC)
 				),

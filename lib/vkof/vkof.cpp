@@ -1729,6 +1729,24 @@ u32 vkof::image_sampler_handle(ImageSamplerHandleInfo const & info)
 	return slot;
 }
 
+ImTextureID vkof::image_imgui_id(ImageSamplerHandleInfo const & info)
+{
+	auto const implTexture = sDevice->imagePool.get(info.image);
+	auto const implSampler = sDevice->samplerPool.get(info.sampler);
+	if (!implTexture || !implSampler) { return nullptr; }
+	return ImGui_ImplVulkan_AddTexture(
+		implSampler->sampler,
+		implTexture->imageViewFull,
+		VK_IMAGE_LAYOUT_GENERAL
+	);
+}
+
+void vkof::image_imgui_id_destroy(ImTextureID const id)
+{
+	if (!id) { return; }
+	ImGui_ImplVulkan_RemoveTexture(static_cast<VkDescriptorSet>(id));
+}
+
 static VkImageView image_storage_view_for_mip(
 	ImplTexture const & implTexture, u32 mipLevel
 )
@@ -2891,13 +2909,13 @@ static void init_impl(
 
 		VkDescriptorPoolSize const imguiPoolSize = {
 			.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-			.descriptorCount = 1,
+			.descriptorCount = 16,
 		};
 		VkDescriptorPoolCreateInfo const imguiPoolCi = {
 			.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
 			.pNext = nullptr,
 			.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-			.maxSets = 1,
+			.maxSets = 16,
 			.poolSizeCount = 1,
 			.pPoolSizes = &imguiPoolSize,
 		};
@@ -3993,6 +4011,7 @@ void vkof::cmd_dispatch(CmdDispatch const & dispatch)
 		sDevice->pipelineComputePool.get(dispatch.pipeline)
 	);
 	if (!implCmd || !implPipeline) {
+		printf("[vkof] cmd_dispatch: invalid command buffer or pipeline\n");
 		return;
 	}
 
@@ -4230,6 +4249,30 @@ void vkof::render_graph_execute(RenderGraphExecuteInfo const & exec)
 		.pInheritanceInfo = nullptr,
 	};
 	VkAssert(vkBeginCommandBuffer(cmd, &beginInfo));
+
+	// -- make previous frame's persistent-resource writes visible to this frame
+	{
+		VkMemoryBarrier2 const crossFrameBarrier = {
+			.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+			.pNext = nullptr,
+			.srcStageMask  = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+			.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+			.dstStageMask  = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+			.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+		};
+		VkDependencyInfo const crossFrameDep = {
+			.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+			.pNext = nullptr,
+			.dependencyFlags = 0,
+			.memoryBarrierCount = 1,
+			.pMemoryBarriers = &crossFrameBarrier,
+			.bufferMemoryBarrierCount = 0,
+			.pBufferMemoryBarriers = nullptr,
+			.imageMemoryBarrierCount = 0,
+			.pImageMemoryBarriers = nullptr,
+		};
+		vkCmdPipelineBarrier2(cmd, &crossFrameDep);
+	}
 
 	// -- reset timestamp queries for this frame slot
 	if (prof.gpuSupported) {

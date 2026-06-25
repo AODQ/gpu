@@ -80,8 +80,6 @@ SceneDesc scene_desc_load(std::filesystem::path const & path)
 				.probeSpacing = { 1.0f, 1.0f, 1.0f },
 				.probeCounts = { 8u, 4u, 8u },
 				.raysPerProbe = 128u,
-				.irradianceResolution = 6u,
-				.depthResolution = 14u,
 			};
 			auto readF32v3 = [&](char const * key, f32v3 & out) {
 				if (!v.HasMember(key) || !v[key].IsArray()) { return; }
