@@ -269,15 +269,19 @@ void main() {
 						gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT
 					),
 					/*cullMask=*/0xFFu,
-					/*origin=*/worldPos + geomNormal * 0.002f,
+					/*origin=*/worldPos + geomNormal * 0.0005f,
 					/*tMin=*/0.001f,
 					/*direction=*/wo,
-					/*tMax=*/dist - 0.01f
+					/*tMax=*/dist + 0.0025f
 				);
 				rayQueryProceedEXT(rq);
-				const bool inShadow = (
+				const bool hasHit = (
 					rayQueryGetIntersectionTypeEXT(/*rayQuery=*/rq, /*committed=*/true)
 					!= gl_RayQueryCommittedIntersectionNoneEXT
+				);
+				const bool inShadow = (
+					hasHit
+					&& rayQueryGetIntersectionTEXT(/*rayQuery=*/rq, /*committed=*/true) < dist
 				);
 				if (inShadow) { continue; }
 			}

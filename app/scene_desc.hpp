@@ -15,11 +15,14 @@ struct SceneInstance
 	f32 scale;
 };
 
-struct DdgiVolume
+struct SceneDescDdgiVolume
 {
 	f32v3 origin;
 	f32v3 probeSpacing;
 	u32v3 probeCounts;
+	u32 raysPerProbe;
+	u32 irradianceResolution;
+	u32 depthResolution;
 
 	inline f32v3 max() const {
 		return {
@@ -35,7 +38,7 @@ struct SceneDesc
 {
 	std::vector<SceneInstance> instances;
 	std::vector<GpuLight> lights;
-	std::vector<DdgiVolume> ddgiVolumes;
+	std::vector<SceneDescDdgiVolume> ddgiVolumes;
 };
 
 [[nodiscard]] SceneDesc scene_desc_load(std::filesystem::path const & path);
@@ -48,14 +51,8 @@ void scene_desc_add_instance(
 	f32v3 const position = {}
 );
 
-struct SceneDescImguiResult
-{
-	i32 focusIdx;
-	i32 selectedIdx;
-};
-
-[[nodiscard]] SceneDescImguiResult scene_desc_imgui(
+// returns index of selected instance, -1 if none selected
+[[nodiscard]] i32 scene_desc_imgui(
 	SceneDesc & desc,
-	std::filesystem::path & savePath,
-	i32 selectedInstIdx
+	std::filesystem::path & savePath
 );

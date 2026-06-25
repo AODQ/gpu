@@ -380,6 +380,7 @@ static void load_node(ImplScene * s, cgltf_node const * node) {
 	if (node->mesh) {
 		u32 const instanceIndex = (u32)s->instances.size();
 		u32 const meshletOffset = (u32)s->meshlets.size();
+		u32 const vertexBase = (u32)s->positions.size();
 
 		for (cgltf_size pi = 0; pi < node->mesh->primitives_count; ++pi) {
 			load_primitive(s, node->mesh->primitives[pi], instanceIndex);
@@ -388,8 +389,38 @@ static void load_node(ImplScene * s, cgltf_node const * node) {
 		f32m44 transform {};
 		cgltf_node_transform_world(node, transform.m.ptr());
 
+		// bake node world transform into positions and attributes so the BLAS
+		// lives in GLTF-world space; instance.transform is then identity and
+		// the TLAS only needs the scene-level make_model_matrix.
+		u32 const vertexEnd = (u32)s->positions.size();
+		for (u32 i = vertexBase; i < vertexEnd; ++i) {
+			f32v3 const p = s->positions[i];
+			f32v4 const tp = transform * f32v4 { p.x, p.y, p.z, 1.0f };
+			s->positions[i] = { tp.x, tp.y, tp.z };
+
+			// normals and tangent.xyz transform by the 3x3 rotation sub-matrix
+			// (assumes no non-uniform scale in node transforms)
+			f32 const * m = transform.m.ptr();
+			auto const rot3 = [&](f32v3 const v) -> f32v3 {
+				return {
+					m[0]*v.x + m[4]*v.y + m[8]*v.z,
+					m[1]*v.x + m[5]*v.y + m[9]*v.z,
+					m[2]*v.x + m[6]*v.y + m[10]*v.z,
+				};
+			};
+			auto const norm = [](f32v3 const v) -> f32v3 {
+				f32 const inv = 1.0f / sqrtf(v.x*v.x + v.y*v.y + v.z*v.z);
+				return { v.x*inv, v.y*inv, v.z*inv };
+			};
+
+			GpuMorVertexAttribute & attr = s->attributes[i];
+			attr.normal = norm(rot3(attr.normal));
+			f32v3 const rt = norm(rot3({ attr.tangent.x, attr.tangent.y, attr.tangent.z }));
+			attr.tangent = { rt.x, rt.y, rt.z, attr.tangent.w };
+		}
+
 		s->instances.push_back({
-			.transform = transform,
+			.transform = f32m44_identity(),
 			.meshletOffset = meshletOffset,
 			.meshletCount = (u32)s->meshlets.size() - meshletOffset,
 		});

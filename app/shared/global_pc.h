@@ -36,8 +36,9 @@ struct GpuGlobalPC {
 	u32 selectedObject;
 	f32m44 viewProj;
 	VA(GpuDebugPC) debug;
+	VA(GpuDdgiGrid) ddgiGrid;
 	u32 shadowsEnabled;
-	u32 _reserved[3];
+	u32 _reserved[1];
 };
 
 #ifdef __cplusplus

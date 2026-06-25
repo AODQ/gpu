@@ -8,6 +8,7 @@
 #include <srat/camera.hpp>
 
 #include <imgui.h>
+#include <ImGuizmo.h>
 #include <backends/imgui_impl_glfw.h>
 #include <GLFW/glfw3.h>
 #include <filesystem>
@@ -30,6 +31,7 @@ static bool sFpMode = false;
 static float sFlyCamSpeed = 0.05f;
 static u32 sSelectedObject = 0xFFFFFFFFu;
 static std::vector<u32> sDrawToInstIdx;
+static ImGuizmo::OPERATION sGizmoOp = ImGuizmo::TRANSLATE;
 
 using Clock = std::chrono::steady_clock;
 using Ms = std::chrono::duration<double, std::milli>;
@@ -40,6 +42,75 @@ static void tick(char const * label, Clock::time_point & t) {
 }
 
 static constexpr f32 kDegToRad = 0.017453292519943295f;
+
+
+// -----------------------------------------------------------------------------
+// -- ddgi
+// -----------------------------------------------------------------------------
+
+struct DdgiVolume
+{
+	f32v3 origin;
+	f32v3 probeSpacing;
+	u32v3 probeCounts;
+	u32 raysPerProbe;
+	u32 irradianceResolution;
+	u32 depthResolution;
+
+	[[nodiscard]] f32v3 max() const {
+		return {
+			origin.x + probeSpacing.x * (f32)probeCounts.x,
+			origin.y + probeSpacing.y * (f32)probeCounts.y,
+			origin.z + probeSpacing.z * (f32)probeCounts.z,
+		};
+	}
+	[[nodiscard]] f32v3 min() const { return origin; }
+
+	vkof::Image imageIrradiance;
+	vkof::Image imageDepth;
+};
+
+DdgiVolume ddgi_volume_create(
+	SceneDescDdgiVolume const & desc
+) {
+	DdgiVolume vol = {
+		.origin = desc.origin,
+		.probeSpacing = desc.probeSpacing,
+		.probeCounts = desc.probeCounts,
+		.raysPerProbe = desc.raysPerProbe,
+		.irradianceResolution = desc.irradianceResolution,
+		.depthResolution = desc.depthResolution,
+		.imageIrradiance = {},
+		.imageDepth = {},
+	};
+
+	u32 const irradW = vol.probeCounts.x * (vol.irradianceResolution + 2u);
+	u32 const irradH = vol.probeCounts.y * vol.probeCounts.z * (vol.irradianceResolution + 2u);
+	vol.imageIrradiance = vkof::image_create({
+		.width = irradW,
+		.height = irradH,
+		.format = vkof::ImageFormat::r16g16b16a16_sfloat,
+		.mipLevels = 1u,
+		.optInitialData = {},
+	});
+
+	u32 const depthW = vol.probeCounts.x * (vol.depthResolution + 2u);
+	u32 const depthH = vol.probeCounts.y * vol.probeCounts.z * (vol.depthResolution + 2u);
+	vol.imageDepth = vkof::image_create({
+		.width = depthW,
+		.height = depthH,
+		.format = vkof::ImageFormat::r16g16b16a16_sfloat,
+		.mipLevels = 1u,
+		.optInitialData = {},
+	});
+
+	return vol;
+}
+
+
+// -----------------------------------------------------------------------------
+// -- model
+// -----------------------------------------------------------------------------
 
 struct LoadedModel
 {
@@ -340,6 +411,16 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			}
 			sPrevTab = currTab;
 		}
+		if (!ImGui::GetIO().WantCaptureKeyboard) {
+			static bool sPrevT = false, sPrevR = false, sPrevS = false;
+			bool const currT = glfwGetKey(window, GLFW_KEY_T) == GLFW_PRESS;
+			bool const currR = glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS;
+			bool const currS = glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS;
+			if (currT && !sPrevT) { sGizmoOp = ImGuizmo::TRANSLATE; }
+			if (currR && !sPrevR) { sGizmoOp = ImGuizmo::ROTATE; }
+			if (currS && !sPrevS) { sGizmoOp = ImGuizmo::SCALE; }
+			sPrevT = currT; sPrevR = currR; sPrevS = currS;
+		}
 
 		double curMouseX, curMouseY;
 		glfwGetCursorPos(window, &curMouseX, &curMouseY);
@@ -424,11 +505,16 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			!ImGui::GetIO().WantCaptureMouse
 			&& glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS
 		);
+		bool const leftClickSelect = (
+			!ImGui::GetIO().WantCaptureMouse
+			&& ImGui::IsMouseReleased(ImGuiMouseButton_Left)
+			&& !ImGui::IsMouseDragging(ImGuiMouseButton_Left)
+		);
 		GpuDebugPC const debugPC {
 			.debugMode = (i32)sDebugMode,
 			.probeX = (i32)curMouseX,
 			.probeY = (i32)curMouseY,
-			.probeActive = rightClick ? 1u : 0u,
+			.probeActive = (rightClick || leftClickSelect) ? 1u : 0u,
 			.mipLodBias = sMipLodBias,
 			.mipOverrideActive = sMipOverrideActive ? 1u : 0u,
 			.mipLodOverride = sMipLodOverride,
@@ -453,11 +539,18 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 				: (srat::camera_orbit_proj(cam) * srat::camera_orbit_view(cam))
 			),
 			.debug = vkof::buffer_virtual_address(debugPcBuffer),
+			.ddgiGrid = 0u,
 			.shadowsEnabled = (tlas.id != 0u && !modelList.empty()) ? 1u : 0u,
 			._reserved = {},
 		};
 
 		vkof::imgui_begin();
+
+		{
+			ImGuiIO const & io = ImGui::GetIO();
+			ImGuizmo::BeginFrame();
+			ImGuizmo::SetRect(0.0f, 0.0f, io.DisplaySize.x, io.DisplaySize.y);
+		}
 
 		if (char const * uri = asset_library_imgui(assetLib)) {
 			std::string const relPath = std::filesystem::relative(
@@ -479,17 +572,13 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			) {
 				selectedInstIdx = (i32)sDrawToInstIdx[sSelectedObject];
 			}
-			SceneDescImguiResult const listResult = (
-				scene_desc_imgui(sceneDesc, sceneFilePath, selectedInstIdx)
+			i32 const sceneDescSelected = (
+				scene_desc_imgui(sceneDesc, sceneFilePath)
 			);
-			if (listResult.focusIdx >= 0) {
-				cam.target = sceneDesc.instances[listResult.focusIdx].position;
-			}
-			if (listResult.selectedIdx >= 0) {
-				u32 const newInstIdx = (u32)listResult.selectedIdx;
+			if (sceneDescSelected != -1) {
 				sSelectedObject = 0xFFFFFFFFu;
 				for (u32 di = 0u; di < (u32)sDrawToInstIdx.size(); ++di) {
-					if (sDrawToInstIdx[di] == newInstIdx) {
+					if (sDrawToInstIdx[di] == (u32)sceneDescSelected) {
 						sSelectedObject = di;
 						break;
 					}
@@ -510,13 +599,66 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 				std::filesystem::path(selInst.filename).stem().string()
 			);
 			ImGui::Text("selected: %s", selLabel.c_str());
-			ImGui::SameLine();
 			if (ImGui::Button("deselect")) {
 				sSelectedObject = 0xFFFFFFFFu;
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("remove")) {
+				sceneDesc.instances.erase(
+					sceneDesc.instances.begin() + (ptrdiff_t)instIdx
+				);
+				sSelectedObject = 0xFFFFFFFFu;
+			}
+			ImGui::SameLine();
+			{
+				static bool sPrevF = false;
+				bool const currF = (
+					!ImGui::GetIO().WantCaptureKeyboard
+					&& glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS
+				);
+				bool const focusPressed = ImGui::Button("focus") || (currF && !sPrevF);
+				sPrevF = currF;
+				if (focusPressed) {
+					cam.target = selInst.position;
+					if (sFpMode) {
+						fpCam.position = (
+							selInst.position
+							- srat::camera_fp_forward(fpCam) * cam.distance
+						);
+					}
+				}
 			}
 			ImGui::DragFloat3("position", &selInst.position.x, 0.01f);
 			ImGui::DragFloat3("rotation", &selInst.rotation.x, 0.5f);
 			ImGui::DragFloat("scale", &selInst.scale, 0.01f, 0.001f, 1000.0f);
+			{
+				f32m44 const viewMat = (
+					sFpMode
+					? srat::camera_fp_view(fpCam)
+					: srat::camera_orbit_view(cam)
+				);
+				f32m44 projMat = (
+					sFpMode
+					? srat::camera_fp_proj(fpCam)
+					: srat::camera_orbit_proj(cam)
+				);
+				// undo Vulkan Y-flip so ImGuizmo (OpenGL convention) renders correctly
+				projMat.m[5] = -projMat.m[5];
+				f32m44 model = make_model_matrix(selInst);
+				if (ImGuizmo::Manipulate(
+					viewMat.m.ptr(),
+					projMat.m.ptr(),
+					sGizmoOp,
+					ImGuizmo::WORLD,
+					model.m.ptr()
+				)) {
+					float t[3], r[3], s[3];
+					ImGuizmo::DecomposeMatrixToComponents(model.m.ptr(), t, r, s);
+					selInst.position = { t[0], t[1], t[2] };
+					selInst.rotation = { r[0], r[1], r[2] };
+					selInst.scale = s[0];
+				}
+			}
 			ImGui::Separator();
 		}
 
@@ -653,17 +795,20 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 
 		ImGui::Begin("ddgi volumes");
 		if (ImGui::Button("add volume")) {
-			sceneDesc.ddgiVolumes.emplace_back(DdgiVolume {
+			sceneDesc.ddgiVolumes.emplace_back(SceneDescDdgiVolume {
 				.origin = (
 					sFpMode ? fpCam.position : srat::camera_orbit_eye(cam)
 				),
 				.probeSpacing = { 1.0f, 1.0f, 1.0f },
 				.probeCounts = { 8u, 4u, 8u },
+				.raysPerProbe = 128u,
+				.irradianceResolution = 6u,
+				.depthResolution = 14u,
 			});
 		}
 		i32 removeVolIdx = -1;
 		for (u32 i = 0u; i < (u32)sceneDesc.ddgiVolumes.size(); ++i) {
-			DdgiVolume & vol = sceneDesc.ddgiVolumes[i];
+			SceneDescDdgiVolume & vol = sceneDesc.ddgiVolumes[i];
 			ImGui::PushID((int)i);
 			char volLabel[32];
 			snprintf(volLabel, sizeof(volLabel), "volume %u", i);
@@ -775,10 +920,15 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 				/*radius=*/light.radius,
 				/*color=*/light.color
 			);
+			vkof::debug_draw_sphere(
+				/*center=*/light.position,
+				/*radius=*/0.1f,
+				/*color=*/{ 1.0f, 1.0f, 0.2f }
+			);
 		}
 		static std::vector<vkof::DebugSphere> probes;
 		probes.clear();
-		for (DdgiVolume const & vol : sceneDesc.ddgiVolumes) {
+		for (SceneDescDdgiVolume const & vol : sceneDesc.ddgiVolumes) {
 			vkof::debug_draw_box(
 				/*min=*/vol.min(),
 				/*max=*/vol.max(),

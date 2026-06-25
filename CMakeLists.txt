@@ -79,6 +79,17 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(imgui)
 
 FetchContent_Declare(
+	imguizmo
+	GIT_REPOSITORY https://github.com/CedricGuillemet/ImGuizmo.git
+	GIT_TAG master
+	GIT_SHALLOW TRUE
+)
+FetchContent_GetProperties(imguizmo)
+if(NOT imguizmo_POPULATED)
+	FetchContent_Populate(imguizmo)
+endif()
+
+FetchContent_Declare(
 	cgltf
 	GIT_REPOSITORY https://github.com/jkuhlmann/cgltf.git
 	GIT_TAG        v1.14
@@ -290,6 +301,12 @@ add_executable(
 	app/cull.cpp
 	app/asset_library.cpp
 	app/scene_desc.cpp
+	${imguizmo_SOURCE_DIR}/src/ImGuizmo.cpp
+)
+
+set_source_files_properties(
+	${imguizmo_SOURCE_DIR}/src/ImGuizmo.cpp
+	PROPERTIES SKIP_PRECOMPILE_HEADERS ON
 )
 #add_dependencies(cull shaders)
 
@@ -319,6 +336,7 @@ target_include_directories(
 	SYSTEM PRIVATE
 	${vma_SOURCE_DIR}/include
 	${rapidjson_SOURCE_DIR}/include
+	${imguizmo_SOURCE_DIR}/src
 )
 
 target_precompile_headers(

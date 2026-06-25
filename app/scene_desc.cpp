@@ -75,10 +75,13 @@ SceneDesc scene_desc_load(std::filesystem::path const & path)
 	if (doc.HasMember("ddgi_volumes") && doc["ddgi_volumes"].IsArray()) {
 		for (auto const & v : doc["ddgi_volumes"].GetArray()) {
 			if (!v.IsObject()) { continue; }
-			DdgiVolume vol = {
+			SceneDescDdgiVolume vol = {
 				.origin = {},
 				.probeSpacing = { 1.0f, 1.0f, 1.0f },
 				.probeCounts = { 8u, 4u, 8u },
+				.raysPerProbe = 128u,
+				.irradianceResolution = 6u,
+				.depthResolution = 14u,
 			};
 			auto readF32v3 = [&](char const * key, f32v3 & out) {
 				if (!v.HasMember(key) || !v[key].IsArray()) { return; }
@@ -163,7 +166,7 @@ void scene_desc_save(SceneDesc const & desc, std::filesystem::path const & path)
 
 	writer.Key("ddgi_volumes");
 	writer.StartArray();
-	for (DdgiVolume const & vol : desc.ddgiVolumes) {
+	for (SceneDescDdgiVolume const & vol : desc.ddgiVolumes) {
 		writer.StartObject();
 		auto writeF32v3 = [&](char const * key, f32v3 const & v) {
 			writer.Key(key);
@@ -205,12 +208,11 @@ void scene_desc_add_instance(
 	});
 }
 
-SceneDescImguiResult scene_desc_imgui(
+i32 scene_desc_imgui(
 	SceneDesc & desc,
-	std::filesystem::path & savePath,
-	i32 const selectedInstIdx
+	std::filesystem::path & savePath
 ) {
-	ImGui::Begin("Scene");
+	ImGui::Begin("scene object list");
 
 	if (savePath.empty()) {
 		static char sSaveAsInput[512] = {};
@@ -233,34 +235,18 @@ SceneDescImguiResult scene_desc_imgui(
 
 	ImGui::Separator();
 
-	i32 removeIdx = -1;
-	i32 focusIdx = -1;
 	i32 selectedIdx = -1;
 	for (i32 i = 0; i < (i32)desc.instances.size(); ++i) {
 		ImGui::PushID(i);
 		std::string const label = (
 			std::filesystem::path(desc.instances[i].filename).stem().string()
 		);
-		bool const isSelected = (i == selectedInstIdx);
-		if (isSelected) {
-			ImGui::PushStyleColor(ImGuiCol_Header, ImGui::GetStyleColorVec4(ImGuiCol_HeaderActive));
-		}
-		bool const open = ImGui::CollapsingHeader(label.c_str());
-		if (isSelected) {
-			ImGui::PopStyleColor();
-		}
-		if (open) {
+		if (ImGui::Button(label.c_str())) {
 			selectedIdx = i;
-			if (ImGui::SmallButton("focus")) { focusIdx = i; }
-			ImGui::SameLine();
-			if (ImGui::SmallButton("remove")) { removeIdx = i; }
 		}
 		ImGui::PopID();
 	}
-	if (removeIdx >= 0) {
-		desc.instances.erase(desc.instances.begin() + removeIdx);
-	}
 
 	ImGui::End();
-	return { .focusIdx = focusIdx, .selectedIdx = selectedIdx };
+	return selectedIdx;
 }
