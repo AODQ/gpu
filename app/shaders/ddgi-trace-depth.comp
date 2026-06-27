@@ -12,7 +12,7 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(set = 0, binding = 2) uniform image2D vkofImages[];
+layout(set = 0, binding = 5) uniform image3D vkofImages3D[];
 layout(set = 0, binding = 3) uniform accelerationStructureEXT vkofTlas;
 
 #include "shared/ddgi-shared.h"
@@ -24,7 +24,7 @@ shared struct {
 
 void traceRay(const vec3 rayDir) {
 	sharedRays[gl_LocalInvocationIndex].dir = rayDir;
-	sharedRays[gl_LocalInvocationIndex].dist = 0.0;
+	sharedRays[gl_LocalInvocationIndex].dist = 1000.0f;
 
 	rayQueryEXT rq;
 	rayQueryInitializeEXT(
@@ -56,14 +56,6 @@ void traceRay(const vec3 rayDir) {
 void main() {
 	// -- trace rays
 	traceRay(rayDirection());
-
-	debugPrintfEXT(
-		"traceRay: %d, %d, %d, %f\n",
-		gl_WorkGroupID.x,
-		gl_WorkGroupID.y,
-		gl_LocalInvocationIndex,
-		sharedRays[gl_LocalInvocationIndex].dist
-	);
 
 	// -- synchronize shared mem
 	barrier();
@@ -99,22 +91,30 @@ void main() {
 	weightedDistSqr *= invW;
 
 	// -- combine with previous distance history
-	const uint probeGridOffX = gl_WorkGroupID.x * (16u) + 1u;
-	const uint probeGridOffY = gl_WorkGroupID.y * (16u) + 1u;
-	const ivec2 probeGridCoord = (
-		ivec2(probeGridOffX + probeOffI, probeGridOffY + probeOffJ)
+	const uint px = gl_WorkGroupID.x;
+	const uint py = gl_WorkGroupID.y % pc.ddgi.probeCounts.y;
+	const uint pz = gl_WorkGroupID.y / pc.ddgi.probeCounts.y;
+
+	// -- toroidal atlas slot and history validity for this probe
+	const uvec3 atlasSlot = ddgiAtlasSlot(uvec3(px, py, pz));
+	const float blendWeight = ddgiIsNewProbe(atlasSlot) ? 1.0f : 0.15f;
+
+	const ivec3 probeGridCoord = ivec3(
+		int(atlasSlot.x) * 16 + int(probeOffI),
+		int(atlasSlot.y) * 16 + int(probeOffJ),
+		int(atlasSlot.z)
 	);
 	const vec2 previousDistance = (
 		imageLoad(
-			vkofImages[nonuniformEXT(pc.ddgi.depthStorageHandle)],
+			vkofImages3D[nonuniformEXT(pc.ddgi.depthStorageHandle)],
 			probeGridCoord
 		).rg
 	);
 	const vec2 combinedDistance = (
-		mix(previousDistance, vec2(weightedDist, weightedDistSqr), 0.05f)
+		mix(previousDistance, vec2(weightedDist, weightedDistSqr), blendWeight)
 	);
 	imageStore(
-		vkofImages[nonuniformEXT(pc.ddgi.depthStorageHandle)],
+		vkofImages3D[nonuniformEXT(pc.ddgi.depthStorageHandle)],
 		probeGridCoord,
 		vec4(combinedDistance, 0.0f, 1.0f)
 	);

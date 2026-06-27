@@ -91,6 +91,8 @@ Tests use **doctest v2.4.11** and the `vkof::init_headless()` path — no window
 | Struct fields / locals | `camelCase` | `byteCount`, `elementCount`, `debugName` |
 | Static constexpr | `sk` prefix + `PascalCase` | `skTileSize`, `skSliceDynamicExtent`, `skEpsilon` |
 | Enum values | `snake_case` or `camelCase` | `write_on_test_off`, `readWrite`, `DeviceOnly` |
+| File names | `kebab-case` with dashes, never underscores | `util-ggx-sample.glsl`, `core-types.hpp`, `main.cpp` |
+| Shader util headers | `util-` prefix + `kebab-case` | `util-ggx-sample.glsl`, `util-taa-filter.glsl` |
 
 ### Formatting
 

@@ -19,6 +19,7 @@ struct Buffers {
 	u64 meshletVerts;
 	u64 meshletTris;
 	u64 flatIndices;
+	u64 flatMeshlets;
 	u32 vertexCount;
 	u32 triangleCount;
 };
@@ -30,6 +31,7 @@ void scene_load_gltf(Scene const & scene, char const * const path);
 u32 scene_instance_count(Scene const & scene);
 u32 scene_meshlet_count(Scene const & scene);
 u32 scene_vertex_count(Scene const & scene);
+void scene_bounds(Scene const & scene, f32v3 & outMin, f32v3 & outMax);
 
 void scene_imgui_debug(Scene const & scene);
 

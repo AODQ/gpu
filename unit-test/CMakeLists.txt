@@ -68,3 +68,5 @@ install(
 	TARGETS vkof-test
 	RUNTIME DESTINATION bin
 )
+
+set_target_properties(vkof-test PROPERTIES INSTALL_RPATH "$ORIGIN")

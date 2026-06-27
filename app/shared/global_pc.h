@@ -33,20 +33,23 @@ struct GpuDebugPC {
 	f32 mipLodBias;
 	u32 mipOverrideActive;
 	f32 mipLodOverride;
+	f32v3 sunDir;
+	f32 skyTurbidity;
+	f32 sunIntensity;
 };
 
 struct GpuGlobalPC {
 	f32 time;
 	f32v3 cameraPos;
 	u32 lightCount;
+	u32 shadowsEnabled;
 	u64 lightsVa;
 	f32 exposure;
 	u32 selectedObject;
 	f32m44 viewProj;
 	VA(GpuDebugPC) debug;
 	VA(GpuDdgiGrid) ddgiGrid;
-	u32 shadowsEnabled;
-	u32 _reserved[1];
+	VA(GpuResolveModelIndirectBuffer) models;
 };
 
 #ifdef __cplusplus

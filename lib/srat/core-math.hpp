@@ -24,6 +24,7 @@ template <typename T>
 
 inline i32 i32_min(i32 const a, i32 const b) { return (a < b) ? a : b; }
 inline i32 i32_max(i32 const a, i32 const b) { return (a > b) ? a : b; }
+inline i32 i32_abs(i32 const a) { return (a < 0) ? -a : a; }
 inline i32 i32_clamp(i32 const v, i32 const min, i32 const max) {
 	return i32_min(i32_max(v, min), max);
 }
@@ -1033,6 +1034,8 @@ inline f32v4x8 f32m44x8_mul_vec(f32m44x8 const & m, f32v4x8 const & v) {
 
 inline f32 f32_min(f32 const a, f32 const b) { return (a < b) ? a : b; }
 inline f32 f32_max(f32 const a, f32 const b) { return (a > b) ? a : b; }
+inline f32 f32_abs(f32 const a) { return (a < 0.0f) ? -a : a; }
+inline f32 f32_round(f32 const a) { return (a >= 0.0f) ? f32(i32(a + 0.5f)) : f32(i32(a - 0.5f)); }
 inline f32 f32_clamp(f32 const v, f32 const min, f32 const max) {
 	return f32_min(f32_max(v, min), max);
 }

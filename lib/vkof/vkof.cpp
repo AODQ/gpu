@@ -267,6 +267,7 @@ namespace
 		std::vector<VkImageView> imageViewPerMip;
 		u32 width;
 		u32 height;
+		u32 depth;
 		VkFormat vkFormat;
 	};
 
@@ -515,6 +516,8 @@ static VkDescriptorSet sBindlessSet = VK_NULL_HANDLE;
 static u32 sBindlessSamplerNextSlot = 1u;
 static u32 sBindlessStorageUintNextSlot = 1u;
 static u32 sBindlessStorageFloatNextSlot = 1u;
+static u32 sBindlessSampler3dNextSlot = 1u;
+static u32 sBindlessStorage3dNextSlot = 1u;
 static constexpr u32 skBindlessMaxSlots = 65536u;
 // maps (TransientImage.id << 8 | mipLevel) -> allocated bindless slot
 static std::unordered_map<u64, u32> sTransientStorageSlotCache;
@@ -547,7 +550,8 @@ struct DebugSphereBatch {
 	vkof::Pipeline pipeline;
 };
 
-static constexpr u32 skDebugMaxSpheres = 4096u;
+static constexpr u32 skDebugSphereInitialCapacity = 4096u;
+static u32 sDebugSphereCapacity = skDebugSphereInitialCapacity;
 static std::vector<vkof::DebugSphere> sDebugSphereData;
 static std::vector<DebugSphereBatch> sDebugSphereBatches;
 static vkof::Buffer sDebugSphereBuffer { 0 };
@@ -630,8 +634,13 @@ static bool format_is_uint(VkFormat const fmt) {
 
 static VkDescriptorSetLayout create_bindless_set_layout(VkDevice const device)
 {
+	VkDescriptorBindingFlags const skBoundAndUpdateable = (
+		VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT
+		| VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT
+	);
 	VkDescriptorSetLayoutBinding const bindings[] = {
 		{
+			// binding 0: sampler2D
 			.binding = 0,
 			.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
 			.descriptorCount = skBindlessMaxSlots,
@@ -639,6 +648,7 @@ static VkDescriptorSetLayout create_bindless_set_layout(VkDevice const device)
 			.pImmutableSamplers = nullptr,
 		},
 		{
+			// binding 1: uimage2D (uint storage)
 			.binding = 1,
 			.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
 			.descriptorCount = skBindlessMaxSlots,
@@ -646,6 +656,7 @@ static VkDescriptorSetLayout create_bindless_set_layout(VkDevice const device)
 			.pImmutableSamplers = nullptr,
 		},
 		{
+			// binding 2: image2D (float storage)
 			.binding = 2,
 			.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
 			.descriptorCount = skBindlessMaxSlots,
@@ -660,38 +671,44 @@ static VkDescriptorSetLayout create_bindless_set_layout(VkDevice const device)
 			.stageFlags = VK_SHADER_STAGE_ALL,
 			.pImmutableSamplers = nullptr,
 		},
+		{
+			// binding 4: sampler3D
+			.binding = 4,
+			.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+			.descriptorCount = skBindlessMaxSlots,
+			.stageFlags = VK_SHADER_STAGE_ALL,
+			.pImmutableSamplers = nullptr,
+		},
+		{
+			// binding 5: image3D (float storage)
+			.binding = 5,
+			.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+			.descriptorCount = skBindlessMaxSlots,
+			.stageFlags = VK_SHADER_STAGE_ALL,
+			.pImmutableSamplers = nullptr,
+		},
 	};
 	VkDescriptorBindingFlags const bindingFlags[] = {
-		(
-			VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT
-			| VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT
-		),
-		(
-			VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT
-			| VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT
-		),
-		(
-			VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT
-			| VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT
-		),
-		(
-			VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT
-			| VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT
-		),
+		skBoundAndUpdateable,
+		skBoundAndUpdateable,
+		skBoundAndUpdateable,
+		skBoundAndUpdateable,
+		skBoundAndUpdateable,
+		skBoundAndUpdateable,
 	};
 	VkDescriptorSetLayoutBindingFlagsCreateInfo const bindingFlagsInfo = {
 		.sType = (
 			VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO
 		),
 		.pNext = nullptr,
-		.bindingCount = 4u,
+		.bindingCount = 6u,
 		.pBindingFlags = bindingFlags,
 	};
 	VkDescriptorSetLayoutCreateInfo const ci = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
 		.pNext = &bindingFlagsInfo,
 		.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT,
-		.bindingCount = 4u,
+		.bindingCount = 6u,
 		.pBindings = bindings,
 	};
 	VkDescriptorSetLayout layout;
@@ -703,13 +720,14 @@ static void create_bindless_pool_and_set(VkDevice const device)
 {
 	VkDescriptorPoolSize const poolSizes[] = {
 		{
+			// bindings 0 (sampler2D) + 4 (sampler3D)
 			.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-			.descriptorCount = skBindlessMaxSlots,
+			.descriptorCount = skBindlessMaxSlots * 2u,
 		},
 		{
-			// binding 1 (uint storage) + binding 2 (float storage)
+			// bindings 1 (uint image2D) + 2 (float image2D) + 5 (float image3D)
 			.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-			.descriptorCount = skBindlessMaxSlots * 2u,
+			.descriptorCount = skBindlessMaxSlots * 3u,
 		},
 		{
 			// binding 3: single TLAS slot
@@ -1084,16 +1102,17 @@ vkof::Image vkof::image_create(
 {
 	ImplTexture implTexture;
 	VkFormat const vkFormat = to_vk_format(createInfo.format);
+	bool const is3d = createInfo.depth > 1u;
 	VkImageCreateInfo const imageCreateInfo = {
 		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
 		.pNext = nullptr,
 		.flags = 0,
-		.imageType = VK_IMAGE_TYPE_2D,
+		.imageType = is3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D,
 		.format = vkFormat,
 		.extent = VkExtent3D {
 			.width = createInfo.width,
 			.height = createInfo.height,
-			.depth = 1,
+			.depth = is3d ? createInfo.depth : 1u,
 		},
 		.mipLevels = createInfo.mipLevels,
 		.arrayLayers = 1,
@@ -1127,14 +1146,18 @@ vkof::Image vkof::image_create(
 	);
 	implTexture.width = createInfo.width;
 	implTexture.height = createInfo.height;
+	implTexture.depth = is3d ? createInfo.depth : 1u;
 
-	// view: aspect must match the format
+	VkImageViewType const viewType = (
+		is3d ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D
+	);
+
 	VkImageViewCreateInfo const imageViewFullCi = {
 		.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
 		.pNext = nullptr,
 		.flags = 0,
 		.image = implTexture.image,
-		.viewType = VK_IMAGE_VIEW_TYPE_2D,
+		.viewType = viewType,
 		.format = vkFormat,
 		.components = VkComponentMapping {
 			.r = VK_COMPONENT_SWIZZLE_IDENTITY,
@@ -1166,7 +1189,7 @@ vkof::Image vkof::image_create(
 			.pNext = nullptr,
 			.flags = 0,
 			.image = implTexture.image,
-			.viewType = VK_IMAGE_VIEW_TYPE_2D,
+			.viewType = viewType,
 			.format = vkFormat,
 			.components = VkComponentMapping {
 				.r = VK_COMPONENT_SWIZZLE_IDENTITY,
@@ -1290,7 +1313,11 @@ vkof::Image vkof::image_create(
 				.layerCount = 1,
 			},
 			.imageOffset = { 0, 0, 0 },
-			.imageExtent = { createInfo.width, createInfo.height, 1 },
+			.imageExtent = {
+				createInfo.width,
+				createInfo.height,
+				is3d ? createInfo.depth : 1u,
+			},
 		};
 		vkCmdCopyBufferToImage(
 			cmd, stagingBuffer, implTexture.image,
@@ -1447,6 +1474,12 @@ u32 vkof::image_height(Image const & image)
 {
 	auto const implTexture = sDevice->imagePool.get(image);
 	return implTexture ? implTexture->height : 0;
+}
+
+u32 vkof::image_depth(Image const & image)
+{
+	auto const implTexture = sDevice->imagePool.get(image);
+	return implTexture ? implTexture->depth : 0;
 }
 
 void vkof::image_generate_mipmaps(Image const & image)
@@ -1786,6 +1819,67 @@ u32 vkof::image_storage_handle(ImageStorageHandleInfo const & info)
 		.pNext = nullptr,
 		.dstSet = sBindlessSet,
 		.dstBinding = binding,
+		.dstArrayElement = slot,
+		.descriptorCount = 1u,
+		.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+		.pImageInfo = &imageInfo,
+		.pBufferInfo = nullptr,
+		.pTexelBufferView = nullptr,
+	};
+	vkUpdateDescriptorSets(sDevice->device, 1u, &write, 0u, nullptr);
+	return slot;
+}
+
+u32 vkof::image_sampler3d_handle(ImageSamplerHandleInfo const & info)
+{
+	auto const implTexture = sDevice->imagePool.get(info.image);
+	auto const implSampler = sDevice->samplerPool.get(info.sampler);
+	if (!implTexture || !implSampler) { return 0u; }
+
+	u32 const slot = sBindlessSampler3dNextSlot++;
+	VkDescriptorImageInfo const imageInfo = {
+		.sampler = implSampler->sampler,
+		.imageView = implTexture->imageViewFull,
+		.imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+	};
+	VkWriteDescriptorSet const write = {
+		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		.pNext = nullptr,
+		.dstSet = sBindlessSet,
+		.dstBinding = 4u,
+		.dstArrayElement = slot,
+		.descriptorCount = 1u,
+		.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+		.pImageInfo = &imageInfo,
+		.pBufferInfo = nullptr,
+		.pTexelBufferView = nullptr,
+	};
+	vkUpdateDescriptorSets(sDevice->device, 1u, &write, 0u, nullptr);
+	return slot;
+}
+
+u32 vkof::image_storage3d_handle(ImageStorageHandleInfo const & info)
+{
+	auto const implTexture = sDevice->imagePool.get(info.image);
+	if (!implTexture) { return 0u; }
+
+	VkImageView const view = (
+		info.mipLevel == 0u
+		? implTexture->imageViewFull
+		: image_storage_view_for_mip(*implTexture, info.mipLevel)
+	);
+
+	u32 const slot = sBindlessStorage3dNextSlot++;
+	VkDescriptorImageInfo const imageInfo = {
+		.sampler = VK_NULL_HANDLE,
+		.imageView = view,
+		.imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+	};
+	VkWriteDescriptorSet const write = {
+		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		.pNext = nullptr,
+		.dstSet = sBindlessSet,
+		.dstBinding = 5u,
 		.dstArrayElement = slot,
 		.descriptorCount = 1u,
 		.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
@@ -2975,8 +3069,9 @@ static void init_impl(
 			.byteCount = sizeof(DebugVertex) * skDebugMaxLines * 2u,
 			.memory = vkof::BufferMemory::HostWritable,
 		});
+		sDebugSphereCapacity = skDebugSphereInitialCapacity;
 		sDebugSphereBuffer = vkof::buffer_create({
-			.byteCount = sizeof(vkof::DebugSphere) * skDebugMaxSpheres,
+			.byteCount = sizeof(vkof::DebugSphere) * sDebugSphereCapacity,
 			.memory = vkof::BufferMemory::HostWritable,
 		});
 	}
@@ -3582,7 +3677,7 @@ void vkof::debug_draw_spheres(
 ) {
 	u32 const startIdx = (u32)sDebugSphereData.size();
 	u32 const count = (u32)spheres.size();
-	if (count == 0u || startIdx + count > skDebugMaxSpheres) { return; }
+	if (count == 0u) { return; }
 	for (u32 i = 0u; i < count; ++i) {
 		sDebugSphereData.push_back(spheres.ptr()[i]);
 	}
@@ -4830,6 +4925,15 @@ void vkof::render_graph_execute(RenderGraphExecuteInfo const & exec)
 	) {
 		vkCmdPipelineBarrier2(cmd, &nodeBoundaryDep);
 
+		u32 const sphereCount = (u32)sDebugSphereData.size();
+		if (sphereCount > sDebugSphereCapacity) {
+			vkof::buffer_destroy(sDebugSphereBuffer);
+			sDebugSphereCapacity = sphereCount * 2u;
+			sDebugSphereBuffer = vkof::buffer_create({
+				.byteCount = sizeof(vkof::DebugSphere) * sDebugSphereCapacity,
+				.memory = vkof::BufferMemory::HostWritable,
+			});
+		}
 		srat::slice<u8> sphereHostMem = (
 			vkof::buffer_host_address(sDebugSphereBuffer)
 		);

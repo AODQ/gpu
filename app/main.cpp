@@ -1,8 +1,9 @@
 #include "shaders/scene_shared.h"
 #include "shaders/resolve_pc.h"
 #include "shared/ddgi-shared.h"
+#include "shared/light_shared.h"
 #include "asset_library.hpp"
-#include "scene_desc.hpp"
+#include <scene/scene.hpp>
 
 #include <vkof/vkof.hpp>
 #include <mor/mor.hpp>
@@ -13,12 +14,14 @@
 #include <backends/imgui_impl_glfw.h>
 #include <GLFW/glfw3.h>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <thread>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <unordered_map>
+#include <variant>
 
 static float sScrollDelta = 0.0f;
 static int sDebugMode = 0;
@@ -28,11 +31,15 @@ static float sMipLodBias = 0.0f;
 static float sAnisotropy = 16.0f;
 static float sAnisotropyPending = 16.0f;
 static float sExposure = 1.0f;
+static float sSkyTurbidity = 1.7f;
+static float sSkyTimeScale = 0.05f;
+static float sSunIntensity = 1.0f;
 static bool sFpMode = false;
 static float sFlyCamSpeed = 0.05f;
-static u32 sSelectedObject = 0xFFFFFFFFu;
-static std::vector<u32> sDrawToInstIdx;
-static ImGuizmo::OPERATION sGizmoOp = ImGuizmo::TRANSLATE; // only TRANSLATE and ROTATE are used
+static std::optional<u32> sSelected;
+static std::vector<u32> sDrawToEntityIdx;
+static ImGuizmo::OPERATION sGizmoOp = ImGuizmo::TRANSLATE;
+static bool sShowDdgiProbes = false;
 
 using Clock = std::chrono::steady_clock;
 using Ms = std::chrono::duration<double, std::milli>;
@@ -42,32 +49,15 @@ static void tick(char const * label, Clock::time_point & t) {
 	t = Clock::now();
 }
 
-static constexpr f32 kDegToRad = 0.017453292519943295f;
-
-
 // -----------------------------------------------------------------------------
 // -- ddgi
 // -----------------------------------------------------------------------------
 
 struct DdgiVolume
 {
-	f32v3 origin;
-	f32v3 probeSpacing;
-	u32v3 probeCounts;
-	u32 raysPerProbe;
-
-	[[nodiscard]] f32v3 max() const {
-		return {
-			origin.x + probeSpacing.x * (f32)probeCounts.x,
-			origin.y + probeSpacing.y * (f32)probeCounts.y,
-			origin.z + probeSpacing.z * (f32)probeCounts.z,
-		};
-	}
-	[[nodiscard]] f32v3 min() const { return origin; }
-
 	vkof::Image imageIrradiance;
 	vkof::Image imageDepth;
-	vkof::Sampler sampler;
+	vkof::Sampler commonSampler;
 	u32 irradianceStorageHandle;
 	u32 depthStorageHandle;
 	u32 irradianceSamplerHandle;
@@ -76,17 +66,12 @@ struct DdgiVolume
 	ImTextureID depthImguiId;
 };
 
-DdgiVolume ddgi_volume_create(
-	SceneDescDdgiVolume const & desc
-) {
+DdgiVolume ddgi_volume_create(u32v3 const probeCounts)
+{
 	DdgiVolume vol = {
-		.origin = desc.origin,
-		.probeSpacing = desc.probeSpacing,
-		.probeCounts = desc.probeCounts,
-		.raysPerProbe = desc.raysPerProbe,
 		.imageIrradiance = {},
 		.imageDepth = {},
-		.sampler = {},
+		.commonSampler = {},
 		.irradianceStorageHandle = 0u,
 		.depthStorageHandle = 0u,
 		.irradianceSamplerHandle = 0u,
@@ -95,33 +80,30 @@ DdgiVolume ddgi_volume_create(
 		.depthImguiId = nullptr,
 	};
 
-	// octahedron encoding requires 2 extra pixels in each dimension for the
-	//   "wrap" region
-	// irradiance resolution is 6x6 octahedron, depth is 14x14
-	static constexpr size_t skIrradianceRes = 6u + 2u;
-	static constexpr size_t skDepthRes = 14u + 2u;
+	// irradiance uses 6x6 octahedron with 1-pixel border on each side = 8x8
+	// depth uses 14x14 octahedron with 1-pixel border on each side = 16x16
+	static constexpr u32 skIrradianceRes = 6u + 2u;
+	static constexpr u32 skDepthRes = 14u + 2u;
 
-	u32 const irradW = vol.probeCounts.x * skIrradianceRes;
-	u32 const irradH = vol.probeCounts.y * vol.probeCounts.z * skIrradianceRes;
 	vol.imageIrradiance = vkof::image_create({
-		.width = irradW,
-		.height = irradH,
+		.width = probeCounts.x * skIrradianceRes,
+		.height = probeCounts.y * skIrradianceRes,
+		.depth = probeCounts.z,
 		.format = vkof::ImageFormat::r16g16b16a16_sfloat,
 		.mipLevels = 1u,
 		.optInitialData = {},
 	});
 
-	u32 const depthW = vol.probeCounts.x * skDepthRes;
-	u32 const depthH = vol.probeCounts.y * vol.probeCounts.z * skDepthRes;
 	vol.imageDepth = vkof::image_create({
-		.width = depthW,
-		.height = depthH,
+		.width = probeCounts.x * skDepthRes,
+		.height = probeCounts.y * skDepthRes,
+		.depth = probeCounts.z,
 		.format = vkof::ImageFormat::r16g16b16a16_sfloat,
 		.mipLevels = 1u,
 		.optInitialData = {},
 	});
 
-	vol.sampler = vkof::sampler_create({
+	vol.commonSampler = vkof::sampler_create({
 		.magFilter = vkof::SamplerFilter::linear,
 		.minFilter = vkof::SamplerFilter::linear,
 		.addressModeU = vkof::SamplerAddressMode::clamp_to_edge,
@@ -129,25 +111,171 @@ DdgiVolume ddgi_volume_create(
 		.addressModeW = vkof::SamplerAddressMode::clamp_to_edge,
 		.mipmapMode = vkof::SamplerMipmapMode::nearest,
 	});
-	vol.irradianceStorageHandle = vkof::image_storage_handle({
+	vol.irradianceStorageHandle = vkof::image_storage3d_handle({
 		.image = vol.imageIrradiance,
 		.mipLevel = 0u,
 	});
-	vol.depthStorageHandle = vkof::image_storage_handle({
+	vol.depthStorageHandle = vkof::image_storage3d_handle({
 		.image = vol.imageDepth,
 		.mipLevel = 0u,
 	});
-	vol.irradianceSamplerHandle = vkof::image_sampler_handle({
+	vol.irradianceSamplerHandle = vkof::image_sampler3d_handle({
 		.image = vol.imageIrradiance,
-		.sampler = vol.sampler,
+		.sampler = vol.commonSampler,
 	});
-	vol.depthSamplerHandle = vkof::image_sampler_handle({
+	vol.depthSamplerHandle = vkof::image_sampler3d_handle({
 		.image = vol.imageDepth,
-		.sampler = vol.sampler,
+		.sampler = vol.commonSampler,
 	});
 
 	return vol;
 }
+
+void ddgi_volume_destroy(DdgiVolume & dv)
+{
+	if (dv.irradianceImguiId) { vkof::image_imgui_id_destroy(dv.irradianceImguiId); }
+	if (dv.depthImguiId) { vkof::image_imgui_id_destroy(dv.depthImguiId); }
+	vkof::image_destroy(dv.imageIrradiance);
+	vkof::image_destroy(dv.imageDepth);
+	vkof::sampler_destroy(dv.commonSampler);
+	dv = {};
+}
+
+// -----------------------------------------------------------------------------
+// -- specular temporal history
+// -----------------------------------------------------------------------------
+
+struct SpecularHistory
+{
+	vkof::Image normalImage {};
+	vkof::Image specularImage[2] {};
+	vkof::Image momentImage[2] {};
+	vkof::Sampler commonSampler {};
+	u32 normalSamplerHandle { 0u };
+	u32 normalStorageHandle { 0u };
+	u32 specularSamplerHandle[2] { 0u, 0u };
+	u32 specularStorageHandle[2] { 0u, 0u };
+	u32 momentSamplerHandle[2] { 0u, 0u };
+	u32 momentStorageHandle[2] { 0u, 0u };
+	ImTextureID normalImguiId { nullptr };
+	ImTextureID specularImguiId[2] { nullptr, nullptr };
+	ImTextureID momentImguiId[2] { nullptr, nullptr };
+};
+
+SpecularHistory specular_history_create(u32 const width, u32 const height)
+{
+	SpecularHistory sh = {};
+
+	sh.normalImage = vkof::image_create({
+		.width = width,
+		.height = height,
+		.depth = 1u,
+		.format = vkof::ImageFormat::r16g16b16a16_sfloat,
+		.mipLevels = 1u,
+		.optInitialData = {},
+	});
+	for (u32 i = 0u; i < 2u; ++i) {
+		sh.specularImage[i] = vkof::image_create({
+			.width = width,
+			.height = height,
+			.depth = 1u,
+			.format = vkof::ImageFormat::r16g16b16a16_sfloat,
+			.mipLevels = 1u,
+			.optInitialData = {},
+		});
+		sh.momentImage[i] = vkof::image_create({
+			.width = width,
+			.height = height,
+			.depth = 1u,
+			.format = vkof::ImageFormat::r16g16b16a16_sfloat,
+			.mipLevels = 1u,
+			.optInitialData = {},
+		});
+	}
+
+	sh.commonSampler = vkof::sampler_create({
+		.magFilter = vkof::SamplerFilter::linear,
+		.minFilter = vkof::SamplerFilter::linear,
+		.addressModeU = vkof::SamplerAddressMode::clamp_to_edge,
+		.addressModeV = vkof::SamplerAddressMode::clamp_to_edge,
+		.addressModeW = vkof::SamplerAddressMode::clamp_to_edge,
+		.mipmapMode = vkof::SamplerMipmapMode::nearest,
+	});
+
+	sh.normalSamplerHandle = vkof::image_sampler_handle({
+		.image = sh.normalImage,
+		.sampler = sh.commonSampler,
+	});
+	sh.normalStorageHandle = vkof::image_storage_handle({
+		.image = sh.normalImage,
+		.mipLevel = 0u,
+	});
+	for (u32 i = 0u; i < 2u; ++i) {
+		sh.specularSamplerHandle[i] = vkof::image_sampler_handle({
+			.image = sh.specularImage[i],
+			.sampler = sh.commonSampler,
+		});
+		sh.specularStorageHandle[i] = vkof::image_storage_handle({
+			.image = sh.specularImage[i],
+			.mipLevel = 0u,
+		});
+		sh.momentSamplerHandle[i] = vkof::image_sampler_handle({
+			.image = sh.momentImage[i],
+			.sampler = sh.commonSampler,
+		});
+		sh.momentStorageHandle[i] = vkof::image_storage_handle({
+			.image = sh.momentImage[i],
+			.mipLevel = 0u,
+		});
+	}
+
+	return sh;
+}
+
+void specular_history_destroy(SpecularHistory & sh)
+{
+	if (sh.normalImguiId) {
+		vkof::image_imgui_id_destroy(sh.normalImguiId);
+	}
+	for (u32 i = 0u; i < 2u; ++i) {
+		if (sh.specularImguiId[i]) {
+			vkof::image_imgui_id_destroy(sh.specularImguiId[i]);
+		}
+		if (sh.momentImguiId[i]) {
+			vkof::image_imgui_id_destroy(sh.momentImguiId[i]);
+		}
+	}
+	vkof::image_destroy(sh.normalImage);
+	for (u32 i = 0u; i < 2u; ++i) {
+		vkof::image_destroy(sh.specularImage[i]);
+		vkof::image_destroy(sh.momentImage[i]);
+	}
+	vkof::sampler_destroy(sh.commonSampler);
+	sh = {};
+}
+
+struct DdgiCascade
+{
+	DdgiVolume volume {};
+	f32v3 snappedOrigin {};
+	u32v3 scrollOffset {};
+	u32v3 frameInvalidStart {};
+	u32v3 frameInvalidCount {};
+};
+
+struct DdgiSystem
+{
+	DdgiCascade cascades[skMaxDdgiCascades] {};
+	u32 cascadeCount { 3u };
+	u32v3 probeCounts { 16u, 16u, 16u };
+	f32 probeSpacing { 2.0f };
+	f32 cascadeScale { 8.0f };
+	bool dirty { true };
+	bool frozen { false };
+};
+static DdgiSystem sDdgi {};
+static SpecularHistory sSpecularHistory {};
+static u32 sFrameIndex = 0u;
 
 
 // -----------------------------------------------------------------------------
@@ -160,18 +288,9 @@ struct LoadedModel
 	mor::GpuScene gpuScene;
 	u32 modelId;
 	vkof::AccelerationStructureBlas blas;
+	f32v3 boundsMin;
+	f32v3 boundsMax;
 };
-
-static f32m44 make_model_matrix(SceneInstance const & inst)
-{
-	return (
-		f32m44_translate(inst.position.x, inst.position.y, inst.position.z)
-		* f32m44_rotate_y(inst.rotation.y * kDegToRad)
-		* f32m44_rotate_x(inst.rotation.x * kDegToRad)
-		* f32m44_rotate_z(inst.rotation.z * kDegToRad)
-		* f32m44_scale(inst.scale, inst.scale, inst.scale)
-	);
-}
 
 int32_t main(int32_t const argc, char const * const * const argv) {
 	char const * gltfPath = nullptr;
@@ -220,17 +339,24 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 
 	AssetLibrary const assetLib = asset_library_create(assetsDir);
 
-	std::filesystem::path sceneFilePath = (
-		scenePath ? std::filesystem::path(scenePath) : std::filesystem::path{}
-	);
-	SceneDesc sceneDesc = scenePath
-		? scene_desc_load(sceneFilePath)
-		: SceneDesc{};
-
-	std::vector<DdgiVolume> ddgiVolumes;
-	for (SceneDescDdgiVolume const & v : sceneDesc.ddgiVolumes) {
-		ddgiVolumes.push_back(ddgi_volume_create(v));
-	}
+	bool const singleModelMode = (gltfPath != nullptr && scenePath == nullptr);
+	std::filesystem::path sceneFilePath = [&]() -> std::filesystem::path {
+		if (scenePath) { return std::filesystem::path(scenePath); }
+		if (singleModelMode) {
+			std::filesystem::path const gltfFsPath = (
+				std::filesystem::canonical(gltfPath)
+			);
+			return (
+				gltfFsPath.parent_path()
+				/ (gltfFsPath.stem().string() + ".json")
+			);
+		}
+		return {};
+	}();
+	scene::Desc sceneDesc = !sceneFilePath.empty()
+		? scene::desc_load(sceneFilePath)
+		: scene::Desc{};
+	bool const freshSingleModel = singleModelMode && sceneDesc.entities.empty();
 
 	std::string const meshPath = (shaderDir / "scene.mesh").string();
 	std::string const fragPath = (shaderDir / "scene.frag").string();
@@ -302,7 +428,8 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 		vkof::debug_sphere_pipeline_create({
 			.pathFrag = (
 				(shaderDir / "ddgi-debug-probe.frag").string().c_str()
-			)
+			),
+			.includePaths = srat::slice { kIncludePaths, 1u },
 		})
 	);
 	{ tick("pipeline (shader compile)", t); }
@@ -327,11 +454,15 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 		.far = cam.far,
 	};
 
-	bool const singleModelMode = (gltfPath != nullptr && scenePath == nullptr);
-	if (singleModelMode) {
-		scene_desc_add_instance(
+	if (freshSingleModel) {
+		scene::desc_add_entity(
 			sceneDesc,
-			std::filesystem::canonical(gltfPath).string()
+			scene::EntityInstance {
+				.filename = std::filesystem::canonical(gltfPath).string(),
+				.rotation = {},
+				.scale = 1.0f,
+			},
+			{}
 		);
 	}
 
@@ -348,12 +479,18 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 		.memory = vkof::BufferMemory::HostWritable,
 	});
 	vkof::Buffer const ddgiGridBuffer = vkof::buffer_create({
-		.byteCount = sizeof(GpuDdgiGrid),
+		.byteCount = sizeof(GpuDdgiCascades),
 		.memory = vkof::BufferMemory::HostWritable,
 	});
 	vkof::AccelerationStructureTlas const tlas = (
 		vkof::tlas_create({ .maxInstances = kMaxModels })
 	);
+
+	for (u32 ci = 0u; ci < sDdgi.cascadeCount; ++ci) {
+		sDdgi.cascades[ci].volume = ddgi_volume_create(sDdgi.probeCounts);
+	}
+	sDdgi.dirty = false;
+	sSpecularHistory = specular_history_create(kScreenW, kScreenH);
 
 	static constexpr u32 kMaxLights = 64u;
 	vkof::Buffer const lightsBuffer = vkof::buffer_create({
@@ -372,6 +509,8 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 		mor::Scene const scene = mor::scene_create();
 		auto const tLoad = Clock::now();
 		mor::scene_load_gltf(scene, p.c_str());
+		f32v3 boundsMin, boundsMax;
+		mor::scene_bounds(scene, boundsMin, boundsMax);
 		auto const tUpload = Clock::now();
 		mor::GpuScene const sceneGpu = mor::scene_gpu_upload(scene);
 		auto const tBlas = Clock::now();
@@ -399,12 +538,18 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			.gpuScene = sceneGpu,
 			.modelId = modelId,
 			.blas = blas,
+			.boundsMin = boundsMin,
+			.boundsMax = boundsMax,
 		});
 	};
 
-	for (SceneInstance const & inst : sceneDesc.instances) {
-		fnVerifyModelLoaded(inst.filename);
+	for (scene::Entity const & entity : sceneDesc.entities) {
+		if (auto * ei = std::get_if<scene::EntityInstance>(&entity.data)) {
+			fnVerifyModelLoaded(ei->filename);
+		}
 	}
+
+
 
 	GLFWwindow * const window = vkof::window();
 
@@ -427,6 +572,7 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			0.05f
 		);
 		sPrevFrameTime = Clock::now();
+		++sFrameIndex;
 
 		if (!glfwGetWindowAttrib(window, GLFW_FOCUSED)) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -485,7 +631,7 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			bool const currGrave = glfwGetKey(window, GLFW_KEY_GRAVE_ACCENT) == GLFW_PRESS;
 			if (currT && !sPrevT) { sGizmoOp = ImGuizmo::TRANSLATE; }
 			if (currR && !sPrevR) { sGizmoOp = ImGuizmo::ROTATE; }
-			if (currGrave && !sPrevGrave) { sSelectedObject = 0xFFFFFFFFu; }
+			if (currGrave && !sPrevGrave) { sSelected = std::nullopt; }
 			sPrevT = currT; sPrevR = currR; sPrevGrave = currGrave;
 		}
 
@@ -500,13 +646,14 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 		{
 			f32v3 bboxMin = { 1e30f, 1e30f, 1e30f };
 			f32v3 bboxMax = { -1e30f, -1e30f, -1e30f };
-			for (SceneInstance const & inst : sceneDesc.instances) {
-				bboxMin.x = std::min(bboxMin.x, inst.position.x);
-				bboxMin.y = std::min(bboxMin.y, inst.position.y);
-				bboxMin.z = std::min(bboxMin.z, inst.position.z);
-				bboxMax.x = std::max(bboxMax.x, inst.position.x);
-				bboxMax.y = std::max(bboxMax.y, inst.position.y);
-				bboxMax.z = std::max(bboxMax.z, inst.position.z);
+			for (scene::Entity const & entity : sceneDesc.entities) {
+				if (!std::holds_alternative<scene::EntityInstance>(entity.data)) { continue; }
+				bboxMin.x = std::min(bboxMin.x, entity.position.x);
+				bboxMin.y = std::min(bboxMin.y, entity.position.y);
+				bboxMin.z = std::min(bboxMin.z, entity.position.z);
+				bboxMax.x = std::max(bboxMax.x, entity.position.x);
+				bboxMax.y = std::max(bboxMax.y, entity.position.y);
+				bboxMax.z = std::max(bboxMax.z, entity.position.z);
 			}
 			sceneBboxExtent = std::max(
 				{
@@ -567,8 +714,10 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 		cam.aspect = (f32)winW / (f32)winH;
 		fpCam.aspect = cam.aspect;
 
-		for (SceneInstance const & inst : sceneDesc.instances) {
-			fnVerifyModelLoaded(inst.filename);
+		for (scene::Entity const & entity : sceneDesc.entities) {
+			if (auto * ei = std::get_if<scene::EntityInstance>(&entity.data)) {
+				fnVerifyModelLoaded(ei->filename);
+			}
 		}
 
 		bool const rightClick = (
@@ -581,6 +730,12 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			&& ImGui::IsMouseReleased(ImGuiMouseButton_Left)
 			&& !ImGui::IsMouseDragging(ImGuiMouseButton_Left)
 		);
+		f32 const sunAngle = (f32)glfwGetTime() * sSkyTimeScale;
+		f32v3 const sunDir = f32v3_normalize({
+			cosf(sunAngle),
+			sinf(sunAngle) * 0.8f + 0.2f,
+			0.3f,
+		});
 		GpuDebugPC const debugPC {
 			.debugMode = (i32)sDebugMode,
 			.probeX = (i32)curMouseX,
@@ -589,6 +744,9 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			.mipLodBias = sMipLodBias,
 			.mipOverrideActive = sMipOverrideActive ? 1u : 0u,
 			.mipLodOverride = sMipLodOverride,
+			.sunDir = sunDir,
+			.skyTurbidity = sSkyTurbidity,
+			.sunIntensity = sSunIntensity,
 		};
 		vkof::buffer_upload({
 			.buffer = debugPcBuffer,
@@ -597,47 +755,197 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 				reinterpret_cast<u8 const *>(&debugPC), sizeof(debugPC)
 			),
 		});
-		if (!ddgiVolumes.empty()) {
-			DdgiVolume const & dv = ddgiVolumes[0u];
-			SceneDescDdgiVolume const & ds = sceneDesc.ddgiVolumes[0u];
-			GpuDdgiGrid const grid = {
-				.origin = ds.origin,
-				.probeCounts = ds.probeCounts,
-				.probeSpacing = ds.probeSpacing,
-				.raysPerProbe = ds.raysPerProbe,
-				.irradianceStorageHandle = dv.irradianceStorageHandle,
-				.depthStorageHandle = dv.depthStorageHandle,
-				.irradianceSamplerHandle = dv.irradianceSamplerHandle,
-				.depthSamplerHandle = dv.depthSamplerHandle,
+
+		// -- build gpu lights from entities
+		std::vector<GpuLight> gpuLights;
+		for (scene::Entity const & entity : sceneDesc.entities) {
+			if (auto * el = std::get_if<scene::EntityLight>(&entity.data)) {
+				gpuLights.push_back(GpuLight {
+					.position = entity.position,
+					.radius = el->radius,
+					.color = el->color,
+				});
+			}
+		}
+		if (!gpuLights.empty()) {
+			vkof::buffer_upload({
+				.buffer = lightsBuffer,
+				.byteOffset = 0u,
+				.data = srat::slice<u8 const>(
+					reinterpret_cast<u8 const *>(gpuLights.data()),
+					gpuLights.size() * sizeof(GpuLight)
+				),
+			});
+		}
+
+		// -- reinit ddgi if probe counts changed
+		bool const ddgiReinit = sDdgi.dirty;
+		if (sDdgi.dirty) {
+			vkof::device_wait_idle();
+			for (u32 ci = 0u; ci < sDdgi.cascadeCount; ++ci) {
+				ddgi_volume_destroy(sDdgi.cascades[ci].volume);
+				sDdgi.cascades[ci].volume = ddgi_volume_create(sDdgi.probeCounts);
+				sDdgi.cascades[ci].scrollOffset = {};
+			}
+			sDdgi.dirty = false;
+		}
+
+		// -- snap ddgi origins and update toroidal scroll offsets per cascade
+		{
+			f32v3 const cameraPos = (
+				sFpMode ? fpCam.position : srat::camera_orbit_eye(cam)
+			);
+
+			auto const updateAxis = [](
+				u32 & scroll,
+				u32 & invStart,
+				u32 & invCount,
+				i32 const delta,
+				u32 const count
+			) {
+				invStart = 0u;
+				invCount = 0u;
+				if (delta == 0) { return; }
+				u32 const absDelta = (u32)i32_min(i32_abs(delta), (i32)count);
+				u32 const prevScroll = scroll;
+				scroll = (u32)(
+					(((i32)scroll + delta) % (i32)count + (i32)count) % (i32)count
+				);
+				invStart = (delta > 0) ? prevScroll : scroll;
+				invCount = absDelta;
 			};
+
+			f32 snapSpacingScale = 1.0f;
+			for (u32 ci = 0u; ci < sDdgi.cascadeCount; ++ci) {
+				DdgiCascade & cascade = sDdgi.cascades[ci];
+				f32 const s = sDdgi.probeSpacing * snapSpacingScale;
+				f32v3 const half = {
+					f32(sDdgi.probeCounts.x) * s * 0.5f,
+					f32(sDdgi.probeCounts.y) * s * 0.5f,
+					f32(sDdgi.probeCounts.z) * s * 0.5f,
+				};
+				f32v3 const newSnapped = {
+					std::floor((cameraPos.x - half.x) / s) * s,
+					std::floor((cameraPos.y - half.y) / s) * s,
+					std::floor((cameraPos.z - half.z) / s) * s,
+				};
+
+				// -- compute invalid probe slice from per-axis delta
+				if (ddgiReinit) {
+					cascade.frameInvalidStart = { 0u, 0u, 0u };
+					cascade.frameInvalidCount = sDdgi.probeCounts;
+					cascade.snappedOrigin = newSnapped;
+				} else if (sDdgi.frozen) {
+					cascade.frameInvalidStart = {};
+					cascade.frameInvalidCount = {};
+				} else {
+					i32 const dx = (
+						(i32)f32_round(
+							(newSnapped.x - cascade.snappedOrigin.x) / s
+						)
+					);
+					i32 const dy = (
+						(i32)f32_round(
+							(newSnapped.y - cascade.snappedOrigin.y) / s
+						)
+					);
+					i32 const dz = (
+						(i32)f32_round(
+							(newSnapped.z - cascade.snappedOrigin.z) / s
+						)
+					);
+					updateAxis(
+						cascade.scrollOffset.x,
+						cascade.frameInvalidStart.x,
+						cascade.frameInvalidCount.x,
+						dx, sDdgi.probeCounts.x
+					);
+					updateAxis(
+						cascade.scrollOffset.y,
+						cascade.frameInvalidStart.y,
+						cascade.frameInvalidCount.y,
+						dy, sDdgi.probeCounts.y
+					);
+					updateAxis(
+						cascade.scrollOffset.z,
+						cascade.frameInvalidStart.z,
+						cascade.frameInvalidCount.z,
+						dz, sDdgi.probeCounts.z
+					);
+					cascade.snappedOrigin = newSnapped;
+				}
+				snapSpacingScale *= sDdgi.cascadeScale;
+			}
+		}
+
+		// -- build ddgi cascade data and upload
+		GpuDdgiCascades gpuCascades { .grids = {}, .count = sDdgi.cascadeCount };
+		{
+			f32 uploadSpacingScale = 1.0f;
+			for (u32 ci = 0u; ci < sDdgi.cascadeCount; ++ci) {
+				DdgiCascade const & cascade = sDdgi.cascades[ci];
+				DdgiVolume const & dv = cascade.volume;
+				f32 const s = sDdgi.probeSpacing * uploadSpacingScale;
+				f32v3 const sp { s, s, s };
+				gpuCascades.grids[ci] = {
+					.origin = cascade.snappedOrigin,
+					.probeCounts = sDdgi.probeCounts,
+					.probeSpacing = sp,
+					.irradianceStorageHandle = dv.irradianceStorageHandle,
+					.depthStorageHandle = dv.depthStorageHandle,
+					.irradianceSamplerHandle = dv.irradianceSamplerHandle,
+					.depthSamplerHandle = dv.depthSamplerHandle,
+					.scrollOffset = cascade.scrollOffset,
+					.invalidStart = cascade.frameInvalidStart,
+					.invalidCount = cascade.frameInvalidCount,
+				};
+				uploadSpacingScale *= sDdgi.cascadeScale;
+			}
 			vkof::buffer_upload({
 				.buffer = ddgiGridBuffer,
 				.byteOffset = 0u,
 				.data = srat::slice<u8 const>(
-					reinterpret_cast<u8 const *>(&grid), sizeof(grid)
+					reinterpret_cast<u8 const *>(&gpuCascades),
+					sizeof(gpuCascades)
 				),
 			});
 		}
+
+		// -- compute selected draw index for gpu highlighting (uses previous frame's sDrawToEntityIdx)
+		u32 selectedDrawIdx = 0xFFFFFFFFu;
+		if (sSelected.has_value()) {
+			u32 const selEntityIdx = *sSelected;
+			if (
+				selEntityIdx < (u32)sceneDesc.entities.size()
+				&& std::holds_alternative<scene::EntityInstance>(
+					sceneDesc.entities[selEntityIdx].data
+				)
+			) {
+				for (u32 di = 0u; di < (u32)sDrawToEntityIdx.size(); ++di) {
+					if (sDrawToEntityIdx[di] == selEntityIdx) {
+						selectedDrawIdx = di;
+						break;
+					}
+				}
+			}
+		}
+
 		GpuGlobalPC const globalPC {
 			.time = (f32)glfwGetTime(),
 			.cameraPos = sFpMode ? fpCam.position : srat::camera_orbit_eye(cam),
-			.lightCount = (u32)sceneDesc.lights.size(),
+			.lightCount = (u32)gpuLights.size(),
+			.shadowsEnabled = (tlas.id != 0u && !modelList.empty()) ? 1u : 0u,
 			.lightsVa = vkof::buffer_virtual_address(lightsBuffer),
 			.exposure = sExposure,
-			.selectedObject = sSelectedObject,
+			.selectedObject = selectedDrawIdx,
 			.viewProj = (
 				sFpMode
 				? (srat::camera_fp_proj(fpCam) * srat::camera_fp_view(fpCam))
 				: (srat::camera_orbit_proj(cam) * srat::camera_orbit_view(cam))
 			),
 			.debug = vkof::buffer_virtual_address(debugPcBuffer),
-			.ddgiGrid = (
-				ddgiVolumes.empty()
-				? 0u
-				: vkof::buffer_virtual_address(ddgiGridBuffer)
-			),
-			.shadowsEnabled = (tlas.id != 0u && !modelList.empty()) ? 1u : 0u,
-			._reserved = {},
+			.ddgiGrid = vkof::buffer_virtual_address(ddgiGridBuffer),
+			.models = vkof::buffer_virtual_address(modelsIndirectBuffer),
 		};
 
 		vkof::imgui_begin();
@@ -645,7 +953,6 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 		{
 			ImGuiIO const & io = ImGui::GetIO();
 			ImGuizmo::BeginFrame();
-			// draw into the background so the gizmo isn't clipped to the scene panel
 			ImGuizmo::SetDrawlist(ImGui::GetBackgroundDrawList());
 			ImGuizmo::SetRect(0.0f, 0.0f, io.DisplaySize.x, io.DisplaySize.y);
 		}
@@ -654,60 +961,67 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			std::string const relPath = std::filesystem::relative(
 				std::filesystem::path(uri), repoDir
 			).string();
-			scene_desc_add_instance(
+			scene::desc_add_entity(
 				sceneDesc,
-				relPath,
+				scene::EntityInstance {
+					.filename = relPath,
+					.rotation = {},
+					.scale = 1.0f,
+				},
 				sFpMode ? fpCam.position : srat::camera_orbit_eye(cam)
 			);
 			fnVerifyModelLoaded(relPath);
 		}
 
-		if (!singleModelMode) {
-			i32 selectedInstIdx = -1;
-			if (
-				sSelectedObject != 0xFFFFFFFFu
-				&& sSelectedObject < (u32)sDrawToInstIdx.size()
-			) {
-				selectedInstIdx = (i32)sDrawToInstIdx[sSelectedObject];
-			}
-			i32 const sceneDescSelected = (
-				scene_desc_imgui(sceneDesc, sceneFilePath)
-			);
-			if (sceneDescSelected != -1) {
-				sSelectedObject = 0xFFFFFFFFu;
-				for (u32 di = 0u; di < (u32)sDrawToInstIdx.size(); ++di) {
-					if (sDrawToInstIdx[di] == (u32)sceneDescSelected) {
-						sSelectedObject = di;
-						break;
-					}
+		if (char const * msg = vkof::probe_message()) {
+			u32 pickedModel = 0u;
+			if (sscanf(msg, "__MODEL__: %u", &pickedModel) == 1) {
+				if (rightClick && pickedModel < (u32)sDrawToEntityIdx.size()) {
+					sSelected = sDrawToEntityIdx[pickedModel];
 				}
 			}
+			ImGui::BeginTooltip();
+			ImGui::Text("%s", msg);
+			ImGui::EndTooltip();
 		}
 
+		// -- entity pending for removal (set inside scene window, executed after)
+		std::optional<u32> removeEntityIdx;
+
 		ImGui::Begin("scene");
-		ImGui::Text("fps: %.1f", ImGui::GetIO().Framerate);
+
+		if (sceneFilePath.empty()) {
+			static char sSaveAsInput[512] = {};
+			ImGui::SetNextItemWidth(200.0f);
+			ImGui::InputText("##saveas", sSaveAsInput, sizeof(sSaveAsInput));
+			ImGui::SameLine();
+			if (ImGui::Button("Save As") && sSaveAsInput[0] != '\0') {
+				sceneFilePath = sSaveAsInput;
+				scene::desc_save(sceneDesc, sceneFilePath);
+			}
+		} else {
+			if (ImGui::Button("Save")) {
+				scene::desc_save(sceneDesc, sceneFilePath);
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Load")) {
+				sceneDesc = scene::desc_load(sceneFilePath);
+				sSelected = std::nullopt;
+			}
+		}
 		ImGui::Separator();
+
+		ImGui::Text("fps: %.1f", ImGui::GetIO().Framerate);
+
+		// -- selected entity panel
 		if (
-			sSelectedObject != 0xFFFFFFFFu
-			&& sSelectedObject < (u32)sDrawToInstIdx.size()
+			sSelected.has_value()
+			&& *sSelected < (u32)sceneDesc.entities.size()
 		) {
-			u32 const instIdx = sDrawToInstIdx[sSelectedObject];
-			SceneInstance & selInst = sceneDesc.instances[instIdx];
-			std::string const selLabel = (
-				std::filesystem::path(selInst.filename).stem().string()
-			);
-			ImGui::Text("selected: %s", selLabel.c_str());
-			if (ImGui::Button("deselect")) {
-				sSelectedObject = 0xFFFFFFFFu;
-			}
-			ImGui::SameLine();
-			if (ImGui::Button("remove")) {
-				sceneDesc.instances.erase(
-					sceneDesc.instances.begin() + (ptrdiff_t)instIdx
-				);
-				sSelectedObject = 0xFFFFFFFFu;
-			}
-			ImGui::SameLine();
+			ImGui::Separator();
+			scene::Entity & selEntity = sceneDesc.entities[*sSelected];
+
+			// -- focus / deselect / remove buttons
 			{
 				static bool sPrevF = false;
 				bool const currF = (
@@ -717,22 +1031,66 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 				bool const focusPressed = ImGui::Button("focus") || (currF && !sPrevF);
 				sPrevF = currF;
 				if (focusPressed) {
-					cam.target = selInst.position;
+					cam.target = scene::entity_focus_target(selEntity);
 					if (sFpMode) {
 						fpCam.position = (
-							selInst.position
+							cam.target
 							- srat::camera_fp_forward(fpCam) * cam.distance
 						);
 					}
 				}
 			}
-			ImGui::DragFloat3("position", &selInst.position.x, 0.01f);
-			ImGui::DragFloat3("rotation", &selInst.rotation.x, 0.5f);
 			ImGui::SameLine();
-			if (ImGui::Button("reset")) {
-				selInst.rotation = {};
+			if (ImGui::Button("deselect")) { sSelected = std::nullopt; }
+			ImGui::SameLine();
+			if (ImGui::Button("remove")) {
+				removeEntityIdx = *sSelected;
+				sSelected = std::nullopt;
 			}
-			ImGui::DragFloat("scale", &selInst.scale, 0.01f, 0.001f, 1000.0f);
+
+			// -- position (shared across all entity types)
+			ImGui::DragFloat3("position", &selEntity.position.x, 0.01f);
+
+			// -- type-specific fields
+			std::visit(
+				[&](auto & d) {
+					using T = std::decay_t<decltype(d)>;
+					if constexpr (std::is_same_v<T, scene::EntityInstance>) {
+						ImGui::DragFloat3("rotation", &d.rotation.x, 0.5f);
+						ImGui::SameLine();
+						if (ImGui::Button("reset")) { d.rotation = {}; }
+						ImGui::DragFloat("scale", &d.scale, 0.01f, 0.001f, 1000.0f);
+					} else if constexpr (std::is_same_v<T, scene::EntityLight>) {
+						ImGui::DragFloat("radius", &d.radius, 0.1f, 0.01f, 1000.0f);
+						f32v3 & col = d.color;
+						float maxComp = std::max({col.x, col.y, col.z, 0.0001f});
+						f32v3 norm = {
+							col.x / maxComp,
+							col.y / maxComp,
+							col.z / maxComp,
+						};
+						bool changed = false;
+						if (ImGui::ColorEdit3("hue", &norm.x)) { changed = true; }
+						if (
+							ImGui::DragFloat(
+								"intensity", &maxComp, 0.5f, 0.01f, 2000.0f, "%.1f"
+							)
+						) {
+							changed = true;
+						}
+						if (changed) {
+							col = {
+								norm.x * maxComp,
+								norm.y * maxComp,
+								norm.z * maxComp,
+							};
+						}
+					}
+				},
+				selEntity.data
+			);
+
+			// -- gizmo: translate for all; also rotate for instances (T/R keys)
 			{
 				f32m44 const viewMat = (
 					sFpMode
@@ -746,32 +1104,49 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 				);
 				// undo Vulkan Y-flip so ImGuizmo (OpenGL convention) renders correctly
 				projMat.m[5] = -projMat.m[5];
-				f32m44 model = make_model_matrix(selInst);
+				ImGuizmo::OPERATION const gizmoOp = (
+					std::holds_alternative<scene::EntityInstance>(selEntity.data)
+					? sGizmoOp
+					: ImGuizmo::TRANSLATE
+				);
+				f32m44 matrix;
+				if (auto * ei = std::get_if<scene::EntityInstance>(&selEntity.data)) {
+					matrix = scene::entity_model_matrix(selEntity, *ei);
+				} else {
+					matrix = f32m44_translate(
+						selEntity.position.x,
+						selEntity.position.y,
+						selEntity.position.z
+					);
+				}
 				if (ImGuizmo::Manipulate(
 					viewMat.m.ptr(),
 					projMat.m.ptr(),
-					sGizmoOp,
+					gizmoOp,
 					ImGuizmo::WORLD,
-					model.m.ptr()
+					matrix.m.ptr()
 				)) {
-					f32 const * m = model.m.ptr();
-					// translation is always at column 3 in column-major
-					selInst.position = { m[12], m[13], m[14] };
-					if (sGizmoOp == ImGuizmo::ROTATE) {
-						// decompose for R = Ry(a) * Rx(b) * Rz(c) from column-major m16
-						// column-major: m[col*4 + row]
-						// R[1][2] = m[2*4+1] = m[9]  = -sin(b)
-						// R[0][2] = m[2*4+0] = m[8]  = sin(a)*cos(b)
-						// R[2][2] = m[2*4+2] = m[10] = cos(a)*cos(b)
-						// R[1][0] = m[0*4+1] = m[1]  = cos(b)*sin(c)
-						// R[1][1] = m[1*4+1] = m[5]  = cos(b)*cos(c)
-						f32 const invS = 1.0f / sqrtf(m[0]*m[0] + m[1]*m[1] + m[2]*m[2]);
-						selInst.rotation.x = (180.0f/3.14159265f) * asinf(-m[9] * invS);
-						selInst.rotation.y = (180.0f/3.14159265f) * atan2f(m[8] * invS, m[10] * invS);
-						selInst.rotation.z = (180.0f/3.14159265f) * atan2f(m[1] * invS, m[5] * invS);
+					f32 const * m = matrix.m.ptr();
+					selEntity.position = { m[12], m[13], m[14] };
+					if (auto * ei = std::get_if<scene::EntityInstance>(&selEntity.data)) {
+						if (sGizmoOp == ImGuizmo::ROTATE) {
+							f32 const invS = (
+								1.0f / sqrtf(m[0]*m[0] + m[1]*m[1] + m[2]*m[2])
+							);
+							ei->rotation.x = (
+								(180.0f/3.14159265f) * asinf(-m[9] * invS)
+							);
+							ei->rotation.y = (
+								(180.0f/3.14159265f) * atan2f(m[8] * invS, m[10] * invS)
+							);
+							ei->rotation.z = (
+								(180.0f/3.14159265f) * atan2f(m[1] * invS, m[5] * invS)
+							);
+						}
 					}
 				}
 			}
+
 			ImGui::Separator();
 		}
 
@@ -785,6 +1160,8 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			cam.azimuth = 0.0f;
 			cam.elevation = 0.3f;
 		}
+		ImGui::SameLine();
+		ImGui::Checkbox("ddgi probes", &sShowDdgiProbes);
 		if (ImGui::Checkbox("fly cam [Tab / ESC]", &sFpMode)) {
 			if (sFpMode) {
 				fpCam.position = srat::camera_orbit_eye(cam);
@@ -810,13 +1187,18 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			);
 			ImGui::TextDisabled("right-click + drag to look");
 		}
-		// these match MOR_DEBUG_VIEW* in mor_shared.h
 		static constexpr char const * kDebugModes[] = {
 			"none",
 			"meshlet index",
 			"model index",
 			"triangle index",
 			"mip heatmap",
+			"albedo",
+			"world normal",
+			"roughness",
+			"metallic",
+			"emissive",
+			"uv",
 		};
 		ImGui::Combo(
 			"debug", &sDebugMode, kDebugModes, IM_ARRAYSIZE(kDebugModes)
@@ -829,6 +1211,9 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			ImGui::SliderFloat("mip LOD bias", &sMipLodBias, -4.0f, 4.0f, "%.1f");
 		}
 		ImGui::DragFloat("exposure", &sExposure, 0.01f, 0.0f, 10.0f, "%.2f");
+		ImGui::SliderFloat("turbidity", &sSkyTurbidity, 1.0f, 10.0f, "%.1f");
+		ImGui::DragFloat("sun speed", &sSkyTimeScale, 0.001f, 0.0f, 1.0f, "%.3f");
+		ImGui::DragFloat("sun intensity", &sSunIntensity, 0.01f, 0.0f, 10.0f, "%.2f");
 		ImGui::SliderFloat("anisotropy", &sAnisotropyPending, 1.0f, 16.0f, "%.0f");
 		if (ImGui::IsItemDeactivatedAfterEdit() && sAnisotropyPending != sAnisotropy) {
 			sAnisotropy = sAnisotropyPending;
@@ -841,160 +1226,133 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 				);
 			}
 		}
-		ImGui::End();
 
-		ImGui::Begin("lights");
-		if (ImGui::Button("add light")) {
-			sceneDesc.lights.emplace_back(GpuLight {
-				.position = (
-					sFpMode ? fpCam.position : srat::camera_orbit_eye(cam)
-				),
-				.radius = 10.0f,
-				.color = { 50.0f, 50.0f, 50.0f },
-			});
-		}
-		i32 removeLightIdx = -1;
-		for (u32 i = 0u; i < (u32)sceneDesc.lights.size(); ++i) {
-			GpuLight & light = sceneDesc.lights[i];
-			ImGui::PushID((int)i);
-			char hdrLabel[32];
-			snprintf(hdrLabel, sizeof(hdrLabel), "light %u", i);
+		// -- entity lists
+		if (!singleModelMode) {
+			ImGui::Separator();
+
+			// -- instances
 			ImGui::SetNextItemAllowOverlap();
-			bool const open = ImGui::CollapsingHeader(hdrLabel);
-			float const focusW = (
-				ImGui::CalcTextSize("focus").x
-				+ ImGui::GetStyle().FramePadding.x * 2.0f
-			);
-			float const removeW = (
-				ImGui::CalcTextSize("remove").x
-				+ ImGui::GetStyle().FramePadding.x * 2.0f
-			);
-			float const spacing = ImGui::GetStyle().ItemSpacing.x;
-			ImGui::SameLine(
-				ImGui::GetContentRegionMax().x - focusW - removeW - spacing
-			);
-			if (ImGui::SmallButton("focus")) {
-				cam.target = light.position;
-			}
-			ImGui::SameLine();
-			if (ImGui::SmallButton("remove")) {
-				removeLightIdx = (i32)i;
-			}
-			if (open) {
-				ImGui::DragFloat3("pos", &light.position.x, 0.1f);
-				ImGui::DragFloat("radius", &light.radius, 0.1f, 0.01f, 1000.0f);
-				f32v3 & col = light.color;
-				float maxComp = std::max({col.x, col.y, col.z, 0.0001f});
-				f32v3 norm = { col.x / maxComp, col.y / maxComp, col.z / maxComp };
-				bool changed = false;
-				if (ImGui::ColorEdit3("hue", &norm.x)) { changed = true; }
-				if (
-					ImGui::DragFloat(
-						"intensity", &maxComp, 0.5f, 0.01f, 2000.0f, "%.1f"
-					)
-				) {
-					changed = true;
-				}
-				if (changed) {
-					col = { norm.x * maxComp, norm.y * maxComp, norm.z * maxComp };
+			bool const instOpen = ImGui::CollapsingHeader("instances");
+			if (instOpen) {
+				u32 instDisplayIdx = 0u;
+				for (u32 i = 0u; i < (u32)sceneDesc.entities.size(); ++i) {
+					auto * ei = std::get_if<scene::EntityInstance>(
+						&sceneDesc.entities[i].data
+					);
+					if (!ei) { continue; }
+					ImGui::PushID((int)i);
+					std::string const label = scene::entity_label(
+						sceneDesc.entities[i], instDisplayIdx
+					);
+					bool const sel = sSelected.has_value() && *sSelected == i;
+					if (sel) { ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive)); }
+					if (ImGui::Button(label.c_str())) { sSelected = i; }
+					if (sel) { ImGui::PopStyleColor(); }
+					ImGui::PopID();
+					++instDisplayIdx;
+					(void)instDisplayIdx;
 				}
 			}
-			ImGui::PopID();
-		}
-		if (removeLightIdx >= 0) {
-			sceneDesc.lights.erase(sceneDesc.lights.begin() + removeLightIdx);
-		}
-		ImGui::End();
 
-		ImGui::Begin("ddgi volumes");
-		if (ImGui::Button("add volume")) {
-			SceneDescDdgiVolume const newVol = {
-				.origin = (
-					sFpMode ? fpCam.position : srat::camera_orbit_eye(cam)
-				),
-				.probeSpacing = { 1.0f, 1.0f, 1.0f },
-				.probeCounts = { 8u, 4u, 8u },
-				.raysPerProbe = 128u,
-			};
-			sceneDesc.ddgiVolumes.push_back(newVol);
-			ddgiVolumes.push_back(ddgi_volume_create(newVol));
-		}
-		i32 removeVolIdx = -1;
-		for (u32 i = 0u; i < (u32)sceneDesc.ddgiVolumes.size(); ++i) {
-			SceneDescDdgiVolume & vol = sceneDesc.ddgiVolumes[i];
-			ImGui::PushID((int)i);
-			char volLabel[32];
-			snprintf(volLabel, sizeof(volLabel), "volume %u", i);
+			// -- lights
 			ImGui::SetNextItemAllowOverlap();
-			bool const open = ImGui::CollapsingHeader(volLabel);
-			float const focusW = (
-				ImGui::CalcTextSize("focus").x
-				+ ImGui::GetStyle().FramePadding.x * 2.0f
-			);
-			float const removeW = (
-				ImGui::CalcTextSize("remove").x
-				+ ImGui::GetStyle().FramePadding.x * 2.0f
-			);
-			float const spacing = ImGui::GetStyle().ItemSpacing.x;
-			ImGui::SameLine(
-				ImGui::GetContentRegionMax().x - focusW - removeW - spacing
-			);
-			if (ImGui::SmallButton("focus")) {
-				f32v3 const volMax = vol.max();
-				cam.target = {
-					(vol.origin.x + volMax.x) * 0.5f,
-					(vol.origin.y + volMax.y) * 0.5f,
-					(vol.origin.z + volMax.z) * 0.5f,
-				};
-			}
-			ImGui::SameLine();
-			if (ImGui::SmallButton("remove")) { removeVolIdx = (i32)i; }
-			if (open) {
-				ImGui::DragFloat3("origin", &vol.origin.x, 0.1f);
-				ImGui::DragFloat3(
-					"spacing", &vol.probeSpacing.x, 0.01f, 0.01f, 100.0f
+			bool const lightsOpen = ImGui::CollapsingHeader("lights");
+			{
+				float const addW = (
+					ImGui::CalcTextSize("+").x
+					+ ImGui::GetStyle().FramePadding.x * 2.0f
 				);
+				ImGui::SameLine(ImGui::GetContentRegionMax().x - addW);
+				if (ImGui::SmallButton("+##addlight")) {
+					scene::desc_add_entity(
+						sceneDesc,
+						scene::EntityLight {
+							.color = { 50.0f, 50.0f, 50.0f },
+							.radius = 10.0f,
+						},
+						sFpMode ? fpCam.position : srat::camera_orbit_eye(cam)
+					);
+				}
+			}
+			if (lightsOpen) {
+				u32 lightDisplayIdx = 0u;
+				for (u32 i = 0u; i < (u32)sceneDesc.entities.size(); ++i) {
+					if (!std::holds_alternative<scene::EntityLight>(
+						sceneDesc.entities[i].data
+					)) { continue; }
+					ImGui::PushID((int)i);
+					std::string const label = scene::entity_label(
+						sceneDesc.entities[i], lightDisplayIdx
+					);
+					bool const sel = sSelected.has_value() && *sSelected == i;
+					if (sel) { ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive)); }
+					if (ImGui::Button(label.c_str())) { sSelected = i; }
+					if (sel) { ImGui::PopStyleColor(); }
+					ImGui::PopID();
+					++lightDisplayIdx;
+				}
+			}
+
+			// -- ddgi settings
+			if (ImGui::CollapsingHeader("ddgi")) {
 				int counts[3] = {
-					(int)vol.probeCounts.x,
-					(int)vol.probeCounts.y,
-					(int)vol.probeCounts.z,
+					(int)sDdgi.probeCounts.x,
+					(int)sDdgi.probeCounts.y,
+					(int)sDdgi.probeCounts.z,
 				};
 				if (ImGui::DragInt3("probe counts", counts, 1.0f, 1, 64)) {
-					vol.probeCounts.x = (u32)counts[0];
-					vol.probeCounts.y = (u32)counts[1];
-					vol.probeCounts.z = (u32)counts[2];
+					sDdgi.probeCounts.x = (u32)std::max(1, counts[0]);
+					sDdgi.probeCounts.y = (u32)std::max(1, counts[1]);
+					sDdgi.probeCounts.z = (u32)std::max(1, counts[2]);
+					sDdgi.dirty = true;
 				}
+				int cascadeCountI = (int)sDdgi.cascadeCount;
+				bool const cascadeDirty = ImGui::DragInt(
+					"cascade count",
+					&cascadeCountI,
+					1.0f, 1, (int)skMaxDdgiCascades
+				);
+				if (cascadeDirty) {
+					sDdgi.cascadeCount = (u32)i32_max(1, cascadeCountI);
+					sDdgi.dirty = true;
+				}
+				ImGui::DragFloat(
+					"probe spacing", &sDdgi.probeSpacing, 0.05f, 0.1f, 100.0f
+				);
+				ImGui::DragFloat(
+					"cascade scale", &sDdgi.cascadeScale, 0.1f, 1.1f, 16.0f
+				);
+				ImGui::Checkbox("freeze probes", &sDdgi.frozen);
 			}
-			ImGui::PopID();
 		}
-		if (removeVolIdx >= 0) {
-			DdgiVolume & dying = ddgiVolumes[(u32)removeVolIdx];
-			vkof::image_imgui_id_destroy(dying.irradianceImguiId);
-			vkof::image_imgui_id_destroy(dying.depthImguiId);
-			vkof::image_destroy(dying.imageIrradiance);
-			vkof::image_destroy(dying.imageDepth);
-			vkof::sampler_destroy(dying.sampler);
-			ddgiVolumes.erase(ddgiVolumes.begin() + removeVolIdx);
-			sceneDesc.ddgiVolumes.erase(
-				sceneDesc.ddgiVolumes.begin() + removeVolIdx
-			);
-		}
+
 		ImGui::End();
 
-		if (!ddgiVolumes.empty()) {
+		// -- execute deferred entity removal
+		if (removeEntityIdx.has_value()) {
+			u32 const removeIdx = *removeEntityIdx;
+			if (removeIdx < (u32)sceneDesc.entities.size()) {
+				sceneDesc.entities.erase(
+					sceneDesc.entities.begin() + (ptrdiff_t)removeIdx
+				);
+			}
+		}
+
+		{
 			ImGui::Begin("ddgi atlases");
-			DdgiVolume & dv = ddgiVolumes[0u];
+			DdgiVolume & dv = sDdgi.cascades[0].volume;
 			if (!dv.irradianceImguiId) {
 				dv.irradianceImguiId = (
 					vkof::image_imgui_id({
 						.image = dv.imageIrradiance,
-						.sampler = dv.sampler,
+						.sampler = dv.commonSampler,
 					})
 				);
 				dv.depthImguiId = (
 					vkof::image_imgui_id({
 						.image = dv.imageDepth,
-						.sampler = dv.sampler,
+						.sampler = dv.commonSampler,
 					})
 				);
 			}
@@ -1006,32 +1364,49 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			ImGui::End();
 		}
 
-		if (!sceneDesc.lights.empty()) {
-			vkof::buffer_upload({
-				.buffer = lightsBuffer,
-				.byteOffset = 0u,
-				.data = srat::slice<u8 const>(
-					reinterpret_cast<u8 const *>(sceneDesc.lights.data()),
-					sceneDesc.lights.size() * sizeof(GpuLight)
-				),
-			});
-		}
-
-		if (char const * msg = vkof::probe_message()) {
-			u32 pickedModel = 0u;
-			if (sscanf(msg, "__MODEL__: %u", &pickedModel) == 1) {
-				sSelectedObject = pickedModel;
+		{
+			ImGui::Begin("temporal");
+			if (!sSpecularHistory.normalImguiId) {
+				sSpecularHistory.normalImguiId = (
+					vkof::image_imgui_id({
+						.image = sSpecularHistory.normalImage,
+						.sampler = sSpecularHistory.commonSampler,
+					})
+				);
+				for (u32 i = 0u; i < 2u; ++i) {
+					sSpecularHistory.specularImguiId[i] = (
+						vkof::image_imgui_id({
+							.image = sSpecularHistory.specularImage[i],
+							.sampler = sSpecularHistory.commonSampler,
+						})
+					);
+					sSpecularHistory.momentImguiId[i] = (
+						vkof::image_imgui_id({
+							.image = sSpecularHistory.momentImage[i],
+							.sampler = sSpecularHistory.commonSampler,
+						})
+					);
+				}
 			}
-			ImGui::BeginTooltip();
-			ImGui::Text("%s", msg);
-			ImGui::EndTooltip();
+			u32 const readIdx = sFrameIndex % 2u;
+			f32 const w = ImGui::GetContentRegionAvail().x;
+			f32 const h = w * (f32)kScreenH / (f32)kScreenW;
+			ImGui::Text("prevFrameNormal");
+			ImGui::Image(sSpecularHistory.normalImguiId, ImVec2(w, h));
+			ImGui::Text("prevFrameSpecular");
+			ImGui::Image(sSpecularHistory.specularImguiId[readIdx], ImVec2(w, h));
+			ImGui::Text("prevFrameMoment");
+			ImGui::Image(sSpecularHistory.momentImguiId[readIdx], ImVec2(w, h));
+			ImGui::End();
 		}
 
 		// -- upload model indirects
 		{
 			std::vector<GpuResolveModelIndirect> drawDescs;
-			for (SceneInstance const & inst : sceneDesc.instances) {
-				auto const it = loadedModels.find(inst.filename);
+			for (scene::Entity const & entity : sceneDesc.entities) {
+				auto * ei = std::get_if<scene::EntityInstance>(&entity.data);
+				if (!ei) { continue; }
+				auto const it = loadedModels.find(ei->filename);
 				if (it == loadedModels.end()) { continue; }
 				LoadedModel const & model = modelList[it->second];
 				mor::Buffers const bufs = mor::scene_gpu_buffers(model.gpuScene);
@@ -1043,7 +1418,9 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 					.attributes = bufs.attributes,
 					.meshletVerts = bufs.meshletVerts,
 					.meshletTris = bufs.meshletTris,
-					.modelMatrix = make_model_matrix(inst),
+					.flatIndices = bufs.flatIndices,
+					.flatMeshlets = bufs.flatMeshlets,
+					.modelMatrix = scene::entity_model_matrix(entity, *ei),
 				});
 			}
 			if (!drawDescs.empty()) {
@@ -1058,48 +1435,51 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			}
 		}
 
-		// -- draw debug scenes
-		for (GpuLight const & light : sceneDesc.lights) {
-			vkof::debug_draw_sphere(
-				/*center=*/light.position,
-				/*radius=*/light.radius,
-				/*color=*/light.color
-			);
-			vkof::debug_draw_sphere(
-				/*center=*/light.position,
-				/*radius=*/0.1f,
-				/*color=*/{ 1.0f, 1.0f, 0.2f }
-			);
+		// -- debug draws
+		for (scene::Entity const & entity : sceneDesc.entities) {
+			if (auto * el = std::get_if<scene::EntityLight>(&entity.data)) {
+				vkof::debug_draw_sphere(
+					/*center=*/entity.position,
+					/*radius=*/el->radius,
+					/*color=*/el->color
+				);
+				vkof::debug_draw_sphere(
+					/*center=*/entity.position,
+					/*radius=*/0.1f,
+					/*color=*/{ 1.0f, 1.0f, 0.2f }
+				);
+			}
 		}
 		static std::vector<vkof::DebugSphere> probes;
 		probes.clear();
-		for (SceneDescDdgiVolume const & vol : sceneDesc.ddgiVolumes) {
-			vkof::debug_draw_box(
-				/*min=*/vol.min(),
-				/*max=*/vol.max(),
-				/*color=*/{ 0.0f, 1.0f, 1.0f }
-			);
-			f32 const probeRadius = (
-				std::min({
-					vol.probeSpacing.x,
-					vol.probeSpacing.y,
-					vol.probeSpacing.z,
-				}) * 0.2f
-			);
-			for (u32 pz = 0u; pz < vol.probeCounts.z; ++pz)
-			for (u32 py = 0u; py < vol.probeCounts.y; ++py)
-			for (u32 px = 0u; px < vol.probeCounts.x; ++px) {
-				probes.emplace_back(vkof::DebugSphere {
-					.position = {
-						vol.origin.x + vol.probeSpacing.x * (f32)px,
-						vol.origin.y + vol.probeSpacing.y * (f32)py,
-						vol.origin.z + vol.probeSpacing.z * (f32)pz,
-					},
-					.radius = probeRadius,
-				});
+		if (sShowDdgiProbes) {
+			f32 probeSpacingScale = 1.0f;
+			for (u32 ci = 0u; ci < sDdgi.cascadeCount; ++ci) {
+				f32 const s = sDdgi.probeSpacing * probeSpacingScale;
+				f32v3 const origin = sDdgi.cascades[ci].snappedOrigin;
+				f32v3 const gridMax = {
+					origin.x + s * f32(sDdgi.probeCounts.x),
+					origin.y + s * f32(sDdgi.probeCounts.y),
+					origin.z + s * f32(sDdgi.probeCounts.z),
+				};
+				vkof::debug_draw_box(origin, gridMax, { 0.0f, 1.0f, 1.0f });
+				f32 const probeRadius = s * 0.2f;
+				probeSpacingScale *= sDdgi.cascadeScale;
+				for (u32 pz = 0u; pz < sDdgi.probeCounts.z; ++pz)
+				for (u32 py = 0u; py < sDdgi.probeCounts.y; ++py)
+				for (u32 px = 0u; px < sDdgi.probeCounts.x; ++px) {
+					probes.emplace_back(vkof::DebugSphere {
+						.position = {
+							origin.x + s * ((f32)px + 0.5f),
+							origin.y + s * ((f32)py + 0.5f),
+							origin.z + s * ((f32)pz + 0.5f),
+						},
+						.radius = probeRadius,
+					});
+				}
 			}
 		}
-		if (!probes.empty()) {
+		if (!probes.empty() && sShowDdgiProbes) {
 			vkof::debug_draw_spheres(
 				srat::slice<vkof::DebugSphere const>(
 					probes.data(), probes.size()
@@ -1135,12 +1515,14 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 				.node = drawNode,
 				.callback = [&](vkof::CommandBuffer const & cmd) {
 					u32 drawIdx = 0u;
-					sDrawToInstIdx.clear();
-					for (u32 instIdx = 0u; instIdx < (u32)sceneDesc.instances.size(); ++instIdx) {
-						SceneInstance const & inst = sceneDesc.instances[instIdx];
-						auto const it = loadedModels.find(inst.filename);
+					sDrawToEntityIdx.clear();
+					for (u32 entityIdx = 0u; entityIdx < (u32)sceneDesc.entities.size(); ++entityIdx) {
+						scene::Entity const & entity = sceneDesc.entities[entityIdx];
+						auto * ei = std::get_if<scene::EntityInstance>(&entity.data);
+						if (!ei) { continue; }
+						auto const it = loadedModels.find(ei->filename);
 						if (it == loadedModels.end()) { continue; }
-						sDrawToInstIdx.emplace_back(instIdx);
+						sDrawToEntityIdx.emplace_back(entityIdx);
 						LoadedModel const & model = modelList[it->second];
 						mor::Buffers const bufs = (
 							mor::scene_gpu_buffers(model.gpuScene)
@@ -1155,7 +1537,7 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 							.instances = bufs.instances,
 							.meshletVerts = bufs.meshletVerts,
 							.meshletTris = bufs.meshletTris,
-							.modelMatrix = make_model_matrix(inst),
+							.modelMatrix = scene::entity_model_matrix(entity, *ei),
 						};
 						vkof::cmd_draw({
 							.cmd = cmd,
@@ -1192,16 +1574,18 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 				.node = tlasNode,
 				.callback = [&](vkof::CommandBuffer const & cmd) {
 					std::vector<vkof::TlasInstance> tlasInstances;
-					for (u32 di = 0u; di < (u32)sDrawToInstIdx.size(); ++di) {
-						SceneInstance const & inst = (
-							sceneDesc.instances[sDrawToInstIdx[di]]
+					for (u32 di = 0u; di < (u32)sDrawToEntityIdx.size(); ++di) {
+						scene::Entity const & entity = (
+							sceneDesc.entities[sDrawToEntityIdx[di]]
 						);
-						auto const it = loadedModels.find(inst.filename);
+						auto * ei = std::get_if<scene::EntityInstance>(&entity.data);
+						if (!ei) { continue; }
+						auto const it = loadedModels.find(ei->filename);
 						if (it == loadedModels.end()) { continue; }
 						LoadedModel const & model = modelList[it->second];
 						tlasInstances.emplace_back(vkof::TlasInstance {
 							.blas = model.blas,
-							.transform = make_model_matrix(inst),
+							.transform = scene::entity_model_matrix(entity, *ei),
 							.instanceCustomIndex = di,
 							.rayMask = 0xFFu,
 						});
@@ -1217,7 +1601,7 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			});
 			vkof::acceleration_structure_set_tlas(tlas);
 
-			// prepare resolve node for DDGI reads
+			// -- prepare resolve node (declared before ddgi nodes so it can receive persistent image reads)
 			vkof::RenderNode const resolveNode = (
 				vkof::render_node_create({
 					.queue = vkof::CommandQueue::graphics,
@@ -1225,69 +1609,74 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			);
 
 			// -- ddgi trace node
-			std::vector<vkof::RenderNode> ddgiTraceNodes;
-			for (auto const & ddgi : ddgiVolumes) {
-				vkof::RenderNode const ddgiNode = (
-					vkof::render_node_create({.queue = vkof::CommandQueue::graphics, })
-				);
-				vkof::render_node_add_persistent_image({
-					.node = ddgiNode,
-					.image = ddgi.imageIrradiance,
-					.access = vkof::RenderNodeAccess::write,
-				});
-				vkof::render_node_add_persistent_image({
-					.node = ddgiNode,
-					.image = ddgi.imageDepth,
-					.access = vkof::RenderNodeAccess::write,
-				});
-				vkof::render_node_add_persistent_image({
-					.node = resolveNode,
-					.image = ddgi.imageIrradiance,
-					.access = vkof::RenderNodeAccess::read,
-				});
-				vkof::render_node_add_persistent_image({
-					.node = resolveNode,
-					.image = ddgi.imageDepth,
-					.access = vkof::RenderNodeAccess::read,
-				});
+			vkof::RenderNode const ddgiNode = (
+				vkof::render_node_create({
+					.queue = vkof::CommandQueue::graphics,
+				})
+			);
+			{
+				for (u32 ci = 0u; ci < sDdgi.cascadeCount; ++ci) {
+					DdgiVolume const & dv = sDdgi.cascades[ci].volume;
+					vkof::render_node_add_persistent_image({
+						.node = ddgiNode,
+						.image = dv.imageIrradiance,
+						.access = vkof::RenderNodeAccess::write,
+					});
+					vkof::render_node_add_persistent_image({
+						.node = ddgiNode,
+						.image = dv.imageDepth,
+						.access = vkof::RenderNodeAccess::write,
+					});
+					vkof::render_node_add_persistent_image({
+						.node = resolveNode,
+						.image = dv.imageIrradiance,
+						.access = vkof::RenderNodeAccess::read,
+					});
+					vkof::render_node_add_persistent_image({
+						.node = resolveNode,
+						.image = dv.imageDepth,
+						.access = vkof::RenderNodeAccess::read,
+					});
+				}
 
 				vkof::render_node_callback({
 					.node = ddgiNode,
-					.callback = [&](vkof::CommandBuffer const & cmd) {
-						GpuDdgiGrid const tracePC = {
-							.origin = ddgi.origin,
-							.probeCounts = ddgi.probeCounts,
-							.probeSpacing = ddgi.probeSpacing,
-							.raysPerProbe = ddgi.raysPerProbe,
-							.irradianceStorageHandle = ddgi.irradianceStorageHandle,
-							.depthStorageHandle = ddgi.depthStorageHandle,
-							.irradianceSamplerHandle = ddgi.irradianceSamplerHandle,
-							.depthSamplerHandle = ddgi.depthSamplerHandle,
-						};
-						vkof::cmd_dispatch(vkof::CmdDispatch {
-							.cmd = cmd,
-							.pipeline = ddgiTraceIrradiancePipeline,
-							.pushconstant = srat::slice<u8 const>(
-								reinterpret_cast<u8 const *>(&tracePC), sizeof(tracePC)
-							),
-							.groupCountX = ddgi.probeCounts.x,
-							.groupCountY = ddgi.probeCounts.y * ddgi.probeCounts.z,
-							.groupCountZ = 1u,
-						});
-						vkof::cmd_dispatch(vkof::CmdDispatch {
-							.cmd = cmd,
-							.pipeline = ddgiTraceDepthPipeline,
-							.pushconstant = srat::slice<u8 const>(
-								reinterpret_cast<u8 const *>(&tracePC), sizeof(tracePC)
-							),
-							.groupCountX = ddgi.probeCounts.x,
-							.groupCountY = ddgi.probeCounts.y * ddgi.probeCounts.z,
-							.groupCountZ = 1u,
-						});
-					}
+					.callback = [
+						gpuCascades,
+						&ddgiTraceIrradiancePipeline,
+						&ddgiTraceDepthPipeline
+					](vkof::CommandBuffer const & cmd) {
+						for (u32 ci = 0u; ci < gpuCascades.count; ++ci) {
+							GpuDdgiGrid const & tracePC = gpuCascades.grids[ci];
+							vkof::cmd_dispatch(vkof::CmdDispatch {
+								.cmd = cmd,
+								.pipeline = ddgiTraceIrradiancePipeline,
+								.pushconstant = srat::slice<u8 const>(
+									reinterpret_cast<u8 const *>(&tracePC),
+									sizeof(tracePC)
+								),
+								.groupCountX = tracePC.probeCounts.x,
+								.groupCountY = (
+									tracePC.probeCounts.y * tracePC.probeCounts.z
+								),
+								.groupCountZ = 1u,
+							});
+							vkof::cmd_dispatch(vkof::CmdDispatch {
+								.cmd = cmd,
+								.pipeline = ddgiTraceDepthPipeline,
+								.pushconstant = srat::slice<u8 const>(
+									reinterpret_cast<u8 const *>(&tracePC),
+									sizeof(tracePC)
+								),
+								.groupCountX = tracePC.probeCounts.x,
+								.groupCountY = (
+									tracePC.probeCounts.y * tracePC.probeCounts.z
+								),
+								.groupCountZ = 1u,
+							});
+						}
+					},
 				});
-
-				ddgiTraceNodes.emplace_back(ddgiNode);
 			}
 
 			// -- resolve node
@@ -1307,7 +1696,6 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 					GpuResolvePC const resolvePC {
 						.visibilityImageHandle = visibilityHandle,
 						.outputImageHandle = colorHandle,
-						.models = vkof::buffer_virtual_address(modelsIndirectBuffer),
 					};
 					vkof::cmd_dispatch(vkof::CmdDispatch {
 						.cmd = cmd,
@@ -1323,21 +1711,11 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			});
 
 			// -- execute render graph
-			std::vector<vkof::RenderNode> allNodes;
-			allNodes.emplace_back(drawNode);
-			allNodes.emplace_back(tlasNode);
-			allNodes.insert(
-				allNodes.end(),
-				ddgiTraceNodes.begin(),
-				ddgiTraceNodes.end()
-			);
-			allNodes.emplace_back(resolveNode);
+			vkof::RenderNode const allNodes[] = {
+				drawNode, tlasNode, ddgiNode, resolveNode,
+			};
 			vkof::render_graph_execute({
-				.nodes = (
-					srat::slice<vkof::RenderNode const>(
-						allNodes.data(), allNodes.size()
-					)
-				),
+				.nodes = srat::slice<vkof::RenderNode const>(allNodes, 4u),
 				.rootPushconstant = srat::slice<u8 const>(
 					reinterpret_cast<u8 const *>(&globalPC), sizeof(globalPC)
 				),
@@ -1347,6 +1725,7 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			});
 			vkof::render_node_destroy(drawNode);
 			vkof::render_node_destroy(tlasNode);
+			vkof::render_node_destroy(ddgiNode);
 			vkof::render_node_destroy(resolveNode);
 		}
 	}
@@ -1360,6 +1739,10 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 	}
 	loadedModels.clear();
 	modelList.clear();
+	for (u32 ci = 0u; ci < sDdgi.cascadeCount; ++ci) {
+		ddgi_volume_destroy(sDdgi.cascades[ci].volume);
+	}
+	specular_history_destroy(sSpecularHistory);
 	vkof::buffer_destroy(modelsIndirectBuffer);
 	vkof::buffer_destroy(lightsBuffer);
 	vkof::pipeline_destroy(visibilityPipeline);

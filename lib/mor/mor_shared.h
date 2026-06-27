@@ -6,6 +6,12 @@
 #define MOR_DEBUG_VIEW_MODEL_ID 2
 #define MOR_DEBUG_VIEW_TRIANGLE_ID 3
 #define MOR_DEBUG_VIEW_MIP_HEATMAP 4
+#define MOR_DEBUG_VIEW_ALBEDO 5
+#define MOR_DEBUG_VIEW_WORLD_NORMAL 6
+#define MOR_DEBUG_VIEW_ROUGHNESS 7
+#define MOR_DEBUG_VIEW_METALLIC 8
+#define MOR_DEBUG_VIEW_EMISSIVE 9
+#define MOR_DEBUG_VIEW_UV 10
 
 #ifdef __cplusplus
 #include <srat/core-math.hpp>

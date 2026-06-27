@@ -7,20 +7,35 @@
 
 #include "global_pc.h"
 
+#ifdef __cplusplus
+static constexpr u32 skMaxDdgiCascades = 8u;
+#else
+const uint skMaxDdgiCascades = 8u;
+#endif
+
 struct GpuDdgiGrid {
 	f32v3 origin;
 	u32v3 probeCounts;
 	f32v3 probeSpacing;
-	u32 raysPerProbe;
 	u32 irradianceStorageHandle;
 	u32 depthStorageHandle;
 	u32 irradianceSamplerHandle;
 	u32 depthSamplerHandle;
+	// offset into the probes to scroll
+	u32v3 scrollOffset;
+	// a slice of invalid probes in the grid based off delta of previous frame position
+	u32v3 invalidStart;
+	u32v3 invalidCount;
+};
+
+struct GpuDdgiCascades {
+	GpuDdgiGrid grids[skMaxDdgiCascades];
+	u32 count;
 };
 
 #ifndef __cplusplus
-layout(buffer_reference, scalar) buffer GpuDdgiGridBuffer {
-	GpuDdgiGrid data;
+layout(buffer_reference, scalar) buffer GpuDdgiCascadesBuffer {
+	GpuDdgiCascades data;
 };
 
 #ifndef DDGI_NO_PC
@@ -28,6 +43,33 @@ layout(push_constant, scalar) uniform PC {
 	GpuGlobalPC global;
 	GpuDdgiGrid ddgi;
 } pc;
+
+// atlas slot = (worldIndex + scrollOffset) % probeCounts
+uvec3 ddgiAtlasSlot(const uvec3 probe) {
+	return uvec3(
+		(probe.x + pc.ddgi.scrollOffset.x) % pc.ddgi.probeCounts.x,
+		(probe.y + pc.ddgi.scrollOffset.y) % pc.ddgi.probeCounts.y,
+		(probe.z + pc.ddgi.scrollOffset.z) % pc.ddgi.probeCounts.z
+	);
+}
+
+// true if this atlas slot entered the grid this frame and has no valid history
+bool ddgiIsNewProbe(const uvec3 slot) {
+	bool isNew = false;
+	const uint cx = pc.ddgi.probeCounts.x;
+	if (pc.ddgi.invalidCount.x > 0u) {
+		isNew = isNew || ((slot.x - pc.ddgi.invalidStart.x + cx) % cx < pc.ddgi.invalidCount.x);
+	}
+	const uint cy = pc.ddgi.probeCounts.y;
+	if (pc.ddgi.invalidCount.y > 0u) {
+		isNew = isNew || ((slot.y - pc.ddgi.invalidStart.y + cy) % cy < pc.ddgi.invalidCount.y);
+	}
+	const uint cz = pc.ddgi.probeCounts.z;
+	if (pc.ddgi.invalidCount.z > 0u) {
+		isNew = isNew || ((slot.z - pc.ddgi.invalidStart.z + cz) % cz < pc.ddgi.invalidCount.z);
+	}
+	return isNew;
+}
 
 vec3 rayOrigin() {
 	const uint px = gl_WorkGroupID.x;

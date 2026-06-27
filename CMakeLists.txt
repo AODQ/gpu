@@ -213,6 +213,26 @@ target_link_libraries(
 )
 
 # ------------------------------------------------------------------------------
+# -- scene (scene descriptor; depends on srat + rapidjson)
+# ------------------------------------------------------------------------------
+
+add_library(scene STATIC lib/scene/scene.cpp)
+
+target_include_directories(scene PUBLIC lib/)
+
+target_include_directories(
+	scene
+	SYSTEM PRIVATE
+	${rapidjson_SOURCE_DIR}/include
+)
+
+target_link_libraries(
+	scene
+	PUBLIC  srat
+	PRIVATE cull_flags
+)
+
+# ------------------------------------------------------------------------------
 # -- vkof (Vulkan object framework; depends on srat)
 # ------------------------------------------------------------------------------
 
@@ -300,7 +320,6 @@ add_executable(
 	app/gfx.cpp
 	app/cull.cpp
 	app/asset_library.cpp
-	app/scene_desc.cpp
 	${imguizmo_SOURCE_DIR}/src/ImGuizmo.cpp
 )
 
@@ -316,6 +335,7 @@ target_link_libraries(
 	PRIVATE
 	cull_flags
 	srat
+	scene
 	vkof
 	mor
 	Vulkan::Vulkan
@@ -335,7 +355,6 @@ target_include_directories(
 	cull
 	SYSTEM PRIVATE
 	${vma_SOURCE_DIR}/include
-	${rapidjson_SOURCE_DIR}/include
 	${imguizmo_SOURCE_DIR}/src
 )
 
@@ -352,9 +371,7 @@ target_link_options(
 	${san_link}
 )
 
-if(VKOF_AFTERMATH)
-	set_target_properties(cull PROPERTIES INSTALL_RPATH "$ORIGIN")
-endif()
+set_target_properties(cull PROPERTIES INSTALL_RPATH "$ORIGIN")
 
 # copy compiled shaders next to the binary so relative paths work
 #add_custom_command(

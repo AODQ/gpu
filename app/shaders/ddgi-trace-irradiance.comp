@@ -11,11 +11,17 @@
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
-layout(set = 0, binding = 2) uniform image2D vkofImages[];
+layout(set = 0, binding = 5) uniform image3D vkofImages3D[];
+layout(set = 0, binding = 4) uniform sampler3D vkofTextures3D[];
 layout(set = 0, binding = 3) uniform accelerationStructureEXT vkofTlas;
 
 #include "shared/ddgi-shared.h"
 #include "shared/light_shared.h"
+#include "mor/mor_shared.h"
+#define RESOLVE_NO_PC
+#include "resolve_pc.h"
+#include "probe_sample.glsl"
+#include "sky.glsl"
 
 shared struct {
 	vec3 dir;
@@ -24,6 +30,7 @@ shared struct {
 } sharedRays[8*8];
 
 void traceRay(const vec3 rayDir) {
+	const GpuDebugPC dbg = GpuDebugPCBuffer(pc.global.debug).data;
 	const vec3 origin = rayOrigin();
 	sharedRays[gl_LocalInvocationIndex].dir = rayDir;
 	sharedRays[gl_LocalInvocationIndex].irradiance = vec3(0.0);
@@ -47,9 +54,8 @@ void traceRay(const vec3 rayDir) {
 		!= gl_RayQueryCommittedIntersectionNoneEXT
 	);
 	if (!hit) {
-		const float skyT = max(0.0, rayDir.y);
 		sharedRays[gl_LocalInvocationIndex].irradiance = (
-			mix(vec3(0.1, 0.15, 0.3), vec3(0.5, 0.7, 1.0), skyT * skyT)
+			sampleSky(rayDir, dbg.sunDir, dbg.skyTurbidity)
 		);
 		return;
 	}
@@ -58,7 +64,6 @@ void traceRay(const vec3 rayDir) {
 	sharedRays[gl_LocalInvocationIndex].dist = hitDist;
 	const vec3 hitPos = origin + rayDir * hitDist;
 
-	if (pc.global.lightCount == 0u) { return; }
 	GpuLightBuffer lightBuf = GpuLightBuffer(pc.global.lightsVa);
 	vec3 irradiance = vec3(0.0);
 	for (uint i = 0u; i < pc.global.lightCount; ++i) {
@@ -92,6 +97,88 @@ void traceRay(const vec3 rayDir) {
 		);
 		irradiance += light.color * atten;
 	}
+
+	// -- second bounce: look up geometry at hit, sample DDGI irradiance there
+	if (pc.global.ddgiGrid != 0u && pc.global.models != 0u) {
+		const uint di = uint(
+			rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true)
+		);
+		const uint primIdx = uint(
+			rayQueryGetIntersectionPrimitiveIndexEXT(rq, true)
+		);
+		const vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+
+		const GpuResolveModelIndirect desc = (
+			GpuResolveModelIndirectBuffer(pc.global.models).data[di]
+		);
+
+		const uint i0 = (
+			GpuFlatIndexBuffer(desc.flatIndices).data[primIdx * 3u + 0u]
+		);
+		const uint i1 = (
+			GpuFlatIndexBuffer(desc.flatIndices).data[primIdx * 3u + 1u]
+		);
+		const uint i2 = (
+			GpuFlatIndexBuffer(desc.flatIndices).data[primIdx * 3u + 2u]
+		);
+
+		const vec3 n0 = (
+			GpuMorVertexAttributeBuffer(desc.attributes).data[i0].normal
+		);
+		const vec3 n1 = (
+			GpuMorVertexAttributeBuffer(desc.attributes).data[i1].normal
+		);
+		const vec3 n2 = (
+			GpuMorVertexAttributeBuffer(desc.attributes).data[i2].normal
+		);
+
+		const vec3 localNormal = normalize(
+			n0 * (1.0 - bary.x - bary.y) + n1 * bary.x + n2 * bary.y
+		);
+		const mat3 normalMat = transpose(inverse(mat3(desc.modelMatrix)));
+		const vec3 worldNormal = normalize(normalMat * localNormal);
+
+		const uint hitMi = GpuFlatMeshletBuffer(desc.flatMeshlets).data[primIdx];
+		const GpuMorMeshlet hitMeshlet = (
+			GpuMorMeshletBuffer(desc.meshlets).data[hitMi]
+		);
+		const GpuMorMaterial hitMat = (
+			GpuMorMaterialBuffer(desc.materials).data[hitMeshlet.materialIndex]
+		);
+
+		// -- sun contribution at bounce hit
+		if (dbg.sunIntensity > 0.0) {
+			const float dotNL = max(dot(worldNormal, dbg.sunDir), 0.0);
+			if (dotNL > 0.0) {
+				rayQueryEXT sunRq;
+				rayQueryInitializeEXT(
+					sunRq,
+					vkofTlas,
+					gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
+					0xFFu,
+					hitPos + worldNormal * 0.001f,
+					0.001f,
+					dbg.sunDir,
+					10000.0f
+				);
+				rayQueryProceedEXT(sunRq);
+				const bool sunOccluded = (
+					rayQueryGetIntersectionTypeEXT(sunRq, true)
+					!= gl_RayQueryCommittedIntersectionNoneEXT
+				);
+				if (!sunOccluded) {
+					const vec3 sunColor = sunLightColor(dbg.sunDir, dbg.skyTurbidity);
+					irradiance += (
+						hitMat.baseColor.rgb * sunColor * dotNL * dbg.sunIntensity
+					);
+				}
+			}
+		}
+
+		irradiance += hitMat.emissive;
+		irradiance += hitMat.baseColor.rgb * sampleProbeIrradiance(hitPos, worldNormal);
+	}
+
 	sharedRays[gl_LocalInvocationIndex].irradiance = irradiance;
 }
 
@@ -106,8 +193,13 @@ void main() {
 	const uint probeOffI = gl_LocalInvocationID.x;
 	const uint probeOffJ = gl_LocalInvocationID.y;
 
-	const uint probeGridOffI = gl_WorkGroupID.x * gl_WorkGroupSize.x;
-	const uint probeGridOffJ = gl_WorkGroupID.y * gl_WorkGroupSize.y;
+	const uint px = gl_WorkGroupID.x;
+	const uint py = gl_WorkGroupID.y % pc.ddgi.probeCounts.y;
+	const uint pz = gl_WorkGroupID.y / pc.ddgi.probeCounts.y;
+
+	// -- toroidal atlas slot and history validity for this probe
+	const uvec3 atlasSlot = ddgiAtlasSlot(uvec3(px, py, pz));
+	const float blendWeight = ddgiIsNewProbe(atlasSlot) ? 1.0f : 0.1f;
 
 	// -- get texel direction from octahedron encoding
 	const vec2 texelCoord = (
@@ -129,21 +221,23 @@ void main() {
 	}
 
 	// -- combine with previous irradiance history
-	const ivec2 probeGridCoord = (
-		ivec2(probeGridOffI + probeOffI, probeGridOffJ + probeOffJ)
+	const ivec3 probeGridCoord = ivec3(
+		int(atlasSlot.x) * 8 + int(probeOffI),
+		int(atlasSlot.y) * 8 + int(probeOffJ),
+		int(atlasSlot.z)
 	);
 	const vec3 previousIrradiance = (
 		imageLoad(
-			vkofImages[nonuniformEXT(pc.ddgi.irradianceStorageHandle)],
+			vkofImages3D[nonuniformEXT(pc.ddgi.irradianceStorageHandle)],
 			probeGridCoord
 		).rgb
 	);
 	const vec3 newIrradiance = weightedIrradiance / max(1.0f, weightedSum);
 	const vec3 combinedIrradiance = (
-		mix(previousIrradiance, newIrradiance, 0.1f)
+		mix(previousIrradiance, newIrradiance, blendWeight)
 	);
 	imageStore(
-		vkofImages[nonuniformEXT(pc.ddgi.irradianceStorageHandle)],
+		vkofImages3D[nonuniformEXT(pc.ddgi.irradianceStorageHandle)],
 		probeGridCoord,
 		vec4(combinedIrradiance, 1.0f)
 	);

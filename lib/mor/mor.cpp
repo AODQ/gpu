@@ -12,6 +12,7 @@
 
 #include <imgui.h>
 
+#include <cfloat>
 #include <filesystem>
 #include <unordered_map>
 #include <vector>
@@ -88,6 +89,7 @@ struct ImplGpuScene {
 	vkof::Buffer materials;
 	vkof::Buffer textures;
 	vkof::Buffer flatIndices;
+	vkof::Buffer flatMeshlets;
 	u32 meshletCount;
 	u32 vertexCount;
 	u32 triangleCount;
@@ -559,6 +561,20 @@ u32 mor::scene_vertex_count(mor::Scene const & scene) {
 	return (u32)reinterpret_cast<ImplScene const *>(scene.id)->positions.size();
 }
 
+void mor::scene_bounds(mor::Scene const & scene, f32v3 & outMin, f32v3 & outMax) {
+	ImplScene const * const s = reinterpret_cast<ImplScene const *>(scene.id);
+	outMin = { FLT_MAX, FLT_MAX, FLT_MAX };
+	outMax = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+	for (f32v3 const & p : s->positions) {
+		outMin.x = std::min(outMin.x, p.x);
+		outMin.y = std::min(outMin.y, p.y);
+		outMin.z = std::min(outMin.z, p.z);
+		outMax.x = std::max(outMax.x, p.x);
+		outMax.y = std::max(outMax.y, p.y);
+		outMax.z = std::max(outMax.z, p.z);
+	}
+}
+
 void mor::scene_imgui_debug(mor::Scene const & scene) {
 	ImplScene const * const s = reinterpret_cast<ImplScene const *>(scene.id);
 
@@ -690,25 +706,34 @@ mor::GpuScene mor::scene_gpu_upload(mor::Scene const & scene) {
 	gpu->meshletCount = (u32)s->meshlets.size();
 	gpu->vertexCount = (u32)s->positions.size();
 
-	// -- flat u32 index buffer for BLAS geometry
+	// -- flat u32 index buffer for BLAS geometry + parallel meshlet index per triangle
 	std::vector<u32> flatIndices;
-	for (GpuMorMeshlet const & m : s->meshlets)
-	for (u32 tri = 0u; tri < m.triangleCount; ++tri) {
-		u32 const base = m.triangleOffset + tri * 3u;
-		flatIndices.emplace_back(
-			s->meshletVerts[m.vertexOffset + s->meshletTris[base + 0u]]
-		);
-		flatIndices.emplace_back(
-			s->meshletVerts[m.vertexOffset + s->meshletTris[base + 1u]]
-		);
-		flatIndices.emplace_back(
-			s->meshletVerts[m.vertexOffset + s->meshletTris[base + 2u]]
-		);
+	std::vector<u32> flatMeshlets;
+	for (u32 mi = 0u; mi < (u32)s->meshlets.size(); ++mi) {
+		GpuMorMeshlet const & m = s->meshlets[mi];
+		for (u32 tri = 0u; tri < m.triangleCount; ++tri) {
+			u32 const base = m.triangleOffset + tri * 3u;
+			flatIndices.emplace_back(
+				s->meshletVerts[m.vertexOffset + s->meshletTris[base + 0u]]
+			);
+			flatIndices.emplace_back(
+				s->meshletVerts[m.vertexOffset + s->meshletTris[base + 1u]]
+			);
+			flatIndices.emplace_back(
+				s->meshletVerts[m.vertexOffset + s->meshletTris[base + 2u]]
+			);
+			flatMeshlets.emplace_back(mi);
+		}
 	}
 	gpu->triangleCount = (u32)(flatIndices.size() / 3u);
 	gpu->flatIndices = (
 		upload_buffer(
 			flatIndices.data(), flatIndices.size() * sizeof(u32)
+		)
+	);
+	gpu->flatMeshlets = (
+		upload_buffer(
+			flatMeshlets.data(), flatMeshlets.size() * sizeof(u32)
 		)
 	);
 
@@ -726,6 +751,7 @@ void mor::scene_gpu_destroy(mor::GpuScene const & scene) {
 	vkof::buffer_destroy(gpu->materials);
 	vkof::buffer_destroy(gpu->textures);
 	vkof::buffer_destroy(gpu->flatIndices);
+	vkof::buffer_destroy(gpu->flatMeshlets);
 	delete gpu;
 }
 
@@ -741,6 +767,7 @@ mor::Buffers mor::scene_gpu_buffers(mor::GpuScene const & scene) {
 		.meshletVerts = vkof::buffer_virtual_address(gpu->meshletVerts),
 		.meshletTris = vkof::buffer_virtual_address(gpu->meshletTris),
 		.flatIndices = vkof::buffer_virtual_address(gpu->flatIndices),
+		.flatMeshlets = vkof::buffer_virtual_address(gpu->flatMeshlets),
 		.vertexCount = gpu->vertexCount,
 		.triangleCount = gpu->triangleCount,
 	};

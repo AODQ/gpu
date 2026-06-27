@@ -176,6 +176,7 @@ namespace vkof
 	struct ImageCreateInfo {
 		u32 width;
 		u32 height;
+		u32 depth { 1u };
 		ImageFormat format;
 		u32 mipLevels;
 		srat::slice<u8 const> optInitialData;
@@ -189,6 +190,7 @@ namespace vkof
 
 	u32 image_width(Image const & image);
 	u32 image_height(Image const & image);
+	u32 image_depth(Image const & image);
 	void image_generate_mipmaps(Image const & image);
 
 	struct Sampler { u64 id; };
@@ -221,7 +223,7 @@ namespace vkof
 	Sampler sampler_create(SamplerCreateInfo const & createInfo);
 	void sampler_destroy(Sampler const & sampler);
 
-	// for use with sampler2d
+	// for use with sampler2d (binding 0)
 	struct ImageSamplerHandleInfo {
 		Image image;
 		Sampler sampler;
@@ -230,12 +232,18 @@ namespace vkof
 	[[nodiscard]] ImTextureID image_imgui_id(ImageSamplerHandleInfo const & info);
 	void image_imgui_id_destroy(ImTextureID id);
 
-	// for use with image2d
+	// for use with image2d (bindings 1/2)
 	struct ImageStorageHandleInfo {
 		Image image;
 		u32 mipLevel;
 	};
 	u32 image_storage_handle(ImageStorageHandleInfo const & info);
+
+	// for use with sampler3d (binding 4)
+	u32 image_sampler3d_handle(ImageSamplerHandleInfo const & info);
+
+	// for use with image3d (binding 5)
+	u32 image_storage3d_handle(ImageStorageHandleInfo const & info);
 }
 
 // -----------------------------------------------------------------------------

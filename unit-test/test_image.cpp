@@ -267,4 +267,301 @@ TEST_CASE("image: rapid create/destroy cycle") {
 	}
 }
 
+TEST_CASE("image3d: create/destroy r16g16b16a16_sfloat") {
+	vkof::Image const img = vkof::image_create({
+		.width = 32u,
+		.height = 32u,
+		.depth = 8u,
+		.format = vkof::ImageFormat::r16g16b16a16_sfloat,
+		.mipLevels = 1u,
+		.optInitialData = {},
+	});
+	CHECK(img.id != 0u);
+	vkof::image_destroy(img);
+}
+
+TEST_CASE("image3d: depth accessor") {
+	vkof::Image const img = vkof::image_create({
+		.width = 16u,
+		.height = 8u,
+		.depth = 4u,
+		.format = vkof::ImageFormat::r32_float,
+		.mipLevels = 1u,
+		.optInitialData = {},
+	});
+	REQUIRE(img.id != 0u);
+	CHECK(vkof::image_width(img) == 16u);
+	CHECK(vkof::image_height(img) == 8u);
+	CHECK(vkof::image_depth(img) == 4u);
+	vkof::image_destroy(img);
+}
+
+TEST_CASE("image3d: image_sampler3d_handle non-zero") {
+	vkof::Image const img = vkof::image_create({
+		.width = 8u,
+		.height = 8u,
+		.depth = 4u,
+		.format = vkof::ImageFormat::r16g16b16a16_sfloat,
+		.mipLevels = 1u,
+		.optInitialData = {},
+	});
+	vkof::Sampler const smp = vkof::sampler_create({
+		.magFilter = vkof::SamplerFilter::linear,
+		.minFilter = vkof::SamplerFilter::linear,
+		.addressModeU = vkof::SamplerAddressMode::clamp_to_edge,
+		.addressModeV = vkof::SamplerAddressMode::clamp_to_edge,
+		.addressModeW = vkof::SamplerAddressMode::clamp_to_edge,
+	});
+	CHECK(vkof::image_sampler3d_handle({ .image = img, .sampler = smp }) != 0u);
+	vkof::sampler_destroy(smp);
+	vkof::image_destroy(img);
+}
+
+TEST_CASE("image3d: image_storage3d_handle non-zero") {
+	vkof::Image const img = vkof::image_create({
+		.width = 8u,
+		.height = 8u,
+		.depth = 4u,
+		.format = vkof::ImageFormat::r16g16b16a16_sfloat,
+		.mipLevels = 1u,
+		.optInitialData = {},
+	});
+	CHECK(vkof::image_storage3d_handle({ .image = img, .mipLevel = 0u }) != 0u);
+	vkof::image_destroy(img);
+}
+
+TEST_CASE("image3d: imageStore/imageLoad round-trip") {
+	constexpr u32 kW = 4u;
+	constexpr u32 kH = 4u;
+	constexpr u32 kD = 4u;
+	constexpr u32 kTotal = kW * kH * kD;
+
+	vkof::Image const img = vkof::image_create({
+		.width = kW,
+		.height = kH,
+		.depth = kD,
+		.format = vkof::ImageFormat::r32_float,
+		.mipLevels = 1u,
+		.optInitialData = {},
+	});
+	REQUIRE(img.id != 0u);
+
+	u32 const storageHandle = (
+		vkof::image_storage3d_handle({ .image = img, .mipLevel = 0u })
+	);
+	REQUIRE(storageHandle != 0u);
+
+	vkof::Buffer const outBuf = vkof::buffer_create({
+		.byteCount = kTotal * sizeof(f32),
+		.memory = vkof::BufferMemory::DeviceOnly,
+	});
+
+	vkof::Pipeline const fillPl = vkof::pipeline_compute_create({
+		.pathCompute = TEST_SHADER_DIR "image3d_fill.comp",
+	});
+	vkof::Pipeline const readPl = vkof::pipeline_compute_create({
+		.pathCompute = TEST_SHADER_DIR "image3d_read.comp",
+	});
+	REQUIRE(fillPl.id != 0u);
+	REQUIRE(readPl.id != 0u);
+
+	struct FillPush { u32 imgHandle; u32 w; u32 h; u32 d; };
+	struct ReadPush { u64 dstVa; u32 imgHandle; u32 w; u32 h; u32 d; };
+
+	vkof::RenderNode const fillNode = (
+		vkof::render_node_create({ .queue = vkof::CommandQueue::compute })
+	);
+	vkof::render_node_add_persistent_image({
+		.node = fillNode,
+		.image = img,
+		.access = vkof::RenderNodeAccess::write,
+	});
+	vkof::render_node_callback({
+		.node = fillNode,
+		.callback = [&](vkof::CommandBuffer const & cmd) {
+			FillPush const push {
+				.imgHandle = storageHandle,
+				.w = kW, .h = kH, .d = kD,
+			};
+			vkof::cmd_dispatch({
+				.cmd = cmd,
+				.pipeline = fillPl,
+				.pushconstant = test::as_bytes(push),
+				.groupCountX = (kTotal + 63u) / 64u,
+				.groupCountY = 1u,
+				.groupCountZ = 1u,
+			});
+		},
+	});
+
+	vkof::RenderNode const readNode = (
+		vkof::render_node_create({ .queue = vkof::CommandQueue::compute })
+	);
+	vkof::render_node_add_persistent_image({
+		.node = readNode,
+		.image = img,
+		.access = vkof::RenderNodeAccess::read,
+	});
+	vkof::render_node_callback({
+		.node = readNode,
+		.callback = [&](vkof::CommandBuffer const & cmd) {
+			ReadPush const push {
+				.dstVa = vkof::buffer_virtual_address(outBuf),
+				.imgHandle = storageHandle,
+				.w = kW, .h = kH, .d = kD,
+			};
+			vkof::cmd_dispatch({
+				.cmd = cmd,
+				.pipeline = readPl,
+				.pushconstant = test::as_bytes(push),
+				.groupCountX = (kTotal + 63u) / 64u,
+				.groupCountY = 1u,
+				.groupCountZ = 1u,
+			});
+		},
+	});
+
+	vkof::RenderNode const nodes[] = { fillNode, readNode };
+	vkof::render_graph_execute({
+		.nodes = srat::slice<vkof::RenderNode const>(nodes, 2u),
+		.rootPushconstant = srat::slice<u8 const>(nullptr, 0u),
+	});
+	vkof::render_node_destroy(fillNode);
+	vkof::render_node_destroy(readNode);
+
+	auto const result = test::readback<f32>(outBuf, 0u, kTotal);
+	for (u32 i = 0u; i < kTotal; ++i) {
+		CAPTURE(i);
+		f32 const expected = (f32)i / (f32)kTotal;
+		CHECK(result[i] == doctest::Approx(expected).epsilon(0.001f));
+	}
+
+	vkof::pipeline_destroy(fillPl);
+	vkof::pipeline_destroy(readPl);
+	vkof::buffer_destroy(outBuf);
+	vkof::image_destroy(img);
+}
+
+TEST_CASE("image3d: ddgi atlas probe-tile layout") {
+	// 3x2x4 probe grid → irradiance atlas (24, 16, 4)
+	// fill writes float(pz)*1000 + float(px)*10 + float(py) to every texel of probe (px,py,pz)
+	// read samples center of each 8x8 tile and verifies the per-probe value
+	static constexpr u32 kCountX = 3u;
+	static constexpr u32 kCountY = 2u;
+	static constexpr u32 kCountZ = 4u;
+	static constexpr u32 kTotalProbes = kCountX * kCountY * kCountZ;
+
+	vkof::Image const img = vkof::image_create({
+		.width = kCountX * 8u,
+		.height = kCountY * 8u,
+		.depth = kCountZ,
+		.format = vkof::ImageFormat::r32_float,
+		.mipLevels = 1u,
+		.optInitialData = {},
+	});
+	REQUIRE(img.id != 0u);
+
+	u32 const storageHandle = (
+		vkof::image_storage3d_handle({ .image = img, .mipLevel = 0u })
+	);
+	REQUIRE(storageHandle != 0u);
+
+	vkof::Buffer const outBuf = vkof::buffer_create({
+		.byteCount = kTotalProbes * sizeof(f32),
+		.memory = vkof::BufferMemory::DeviceOnly,
+	});
+
+	vkof::Pipeline const fillPl = vkof::pipeline_compute_create({
+		.pathCompute = TEST_SHADER_DIR "ddgi3d_probe_fill.comp",
+	});
+	vkof::Pipeline const readPl = vkof::pipeline_compute_create({
+		.pathCompute = TEST_SHADER_DIR "ddgi3d_probe_read.comp",
+	});
+	REQUIRE(fillPl.id != 0u);
+	REQUIRE(readPl.id != 0u);
+
+	struct FillPush { u32 imgHandle; u32 countX; u32 countY; u32 countZ; };
+	struct ReadPush { u64 dstVa; u32 imgHandle; u32 countX; u32 countY; u32 countZ; };
+
+	vkof::RenderNode const fillNode = (
+		vkof::render_node_create({ .queue = vkof::CommandQueue::compute })
+	);
+	vkof::render_node_add_persistent_image({
+		.node = fillNode,
+		.image = img,
+		.access = vkof::RenderNodeAccess::write,
+	});
+	vkof::render_node_callback({
+		.node = fillNode,
+		.callback = [&](vkof::CommandBuffer const & cmd) {
+			FillPush const push {
+				.imgHandle = storageHandle,
+				.countX = kCountX, .countY = kCountY, .countZ = kCountZ,
+			};
+			vkof::cmd_dispatch({
+				.cmd = cmd,
+				.pipeline = fillPl,
+				.pushconstant = test::as_bytes(push),
+				.groupCountX = kCountX,
+				.groupCountY = kCountY,
+				.groupCountZ = kCountZ,
+			});
+		},
+	});
+
+	vkof::RenderNode const readNode = (
+		vkof::render_node_create({ .queue = vkof::CommandQueue::compute })
+	);
+	vkof::render_node_add_persistent_image({
+		.node = readNode,
+		.image = img,
+		.access = vkof::RenderNodeAccess::read,
+	});
+	vkof::render_node_callback({
+		.node = readNode,
+		.callback = [&](vkof::CommandBuffer const & cmd) {
+			ReadPush const push {
+				.dstVa = vkof::buffer_virtual_address(outBuf),
+				.imgHandle = storageHandle,
+				.countX = kCountX, .countY = kCountY, .countZ = kCountZ,
+			};
+			vkof::cmd_dispatch({
+				.cmd = cmd,
+				.pipeline = readPl,
+				.pushconstant = test::as_bytes(push),
+				.groupCountX = (kTotalProbes + 63u) / 64u,
+				.groupCountY = 1u,
+				.groupCountZ = 1u,
+			});
+		},
+	});
+
+	vkof::RenderNode const nodes[] = { fillNode, readNode };
+	vkof::render_graph_execute({
+		.nodes = srat::slice<vkof::RenderNode const>(nodes, 2u),
+		.rootPushconstant = srat::slice<u8 const>(nullptr, 0u),
+	});
+	vkof::render_node_destroy(fillNode);
+	vkof::render_node_destroy(readNode);
+
+	auto const result = test::readback<f32>(outBuf, 0u, kTotalProbes);
+	for (u32 pz = 0u; pz < kCountZ; ++pz) {
+		for (u32 py = 0u; py < kCountY; ++py) {
+			for (u32 px = 0u; px < kCountX; ++px) {
+				u32 const idx = px + py * kCountX + pz * kCountX * kCountY;
+				CAPTURE(px); CAPTURE(py); CAPTURE(pz);
+				f32 const expected = (
+					f32(pz) * 1000.0f + f32(px) * 10.0f + f32(py)
+				);
+				CHECK(result[idx] == doctest::Approx(expected).epsilon(0.01f));
+			}
+		}
+	}
+
+	vkof::pipeline_destroy(fillPl);
+	vkof::pipeline_destroy(readPl);
+	vkof::buffer_destroy(outBuf);
+	vkof::image_destroy(img);
+}
+
 } // TEST_SUITE("[headless]")

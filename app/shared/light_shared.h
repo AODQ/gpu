@@ -4,6 +4,9 @@
 #include <srat/core-math.hpp>
 #endif
 
+#ifndef _LIGHT_SHARED_H
+#define _LIGHT_SHARED_H
+
 struct GpuLight {
 	f32v3 position;
 	f32 radius;
@@ -15,3 +18,5 @@ layout(buffer_reference, scalar) buffer GpuLightBuffer {
 	GpuLight data[];
 };
 #endif
+
+#endif // _LIGHT_SHARED_H
