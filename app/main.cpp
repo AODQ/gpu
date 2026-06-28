@@ -1040,7 +1040,6 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			.time = (f32)glfwGetTime(),
 			.cameraPos = sFpMode ? fpCam.position : srat::camera_orbit_eye(cam),
 			.lightCount = (u32)gpuLights.size(),
-			.shadowsEnabled = (tlas.id != 0u && !modelList.empty()) ? 1u : 0u,
 			.lightsVa = vkof::buffer_virtual_address(lightsBuffer),
 			.exposure = sExposure,
 			.selectedObject = selectedDrawIdx,

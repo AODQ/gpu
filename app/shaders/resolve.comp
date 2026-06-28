@@ -7,6 +7,18 @@
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_ray_query : require
 
+// resolve pass, this has a lot of fused functionality:
+//  * fetch visibility texel data and compute the world surface data
+//  * compute lighting for the surface, including:
+//     * direct lighting from light sources
+//     * indirect diffuse lighting via DDGI probes
+//     * specular reflections
+//  * tonemapping
+// in the future probably the following will also be fused:
+//  * temporal accumulation
+//  * denoising
+//  * fog marching
+
 layout(set = 0, binding = 0) uniform sampler2D vkofTextures[];
 layout(set = 0, binding = 1) uniform uimage2D vkofImagesU[];
 layout(set = 0, binding = 2) uniform image2D vkofImages[];
@@ -17,9 +29,8 @@ layout(set = 0, binding = 4) uniform sampler3D vkofTextures3D[];
 #define DDGI_NO_PC
 #include "shared/ddgi-shared.h"
 #include "resolve_pc.h"
-#include "material.glsl"
+#include "util-material-gltf.glsl"
 #include "probe.glsl"
-#include "util-ggx-sample.glsl"
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
@@ -35,27 +46,6 @@ vec3 index_color(uint idx) {
 	);
 }
 
-f32v3 fnBarycentric(
-	const f32v2 p,
-	const f32v2 a,
-	const f32v2 b,
-	const f32v2 c,
-	out f32 outDenom
-) {
-	const f32v2 ra = a - p;
-	const f32v2 rb = b - p;
-	const f32v2 rc = c - p;
-	outDenom = (
-		  ra.x * (rb.y - rc.y)
-		+ rb.x * (rc.y - ra.y)
-		+ rc.x * (ra.y - rb.y)
-	);
-	const f32 inv = 1.0f / outDenom;
-	const f32 u = (rb.x * rc.y - rc.x * rb.y) * inv;
-	const f32 v = (rc.x * ra.y - ra.x * rc.y) * inv;
-	return vec3(u, v, 1.0f - u - v);
-}
-
 f32v3 fnAces(const f32v3 x) {
 	const f32 a = 2.51;
 	const f32 b = 0.03;
@@ -65,583 +55,613 @@ f32v3 fnAces(const f32v3 x) {
 	return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
 }
 
-f32v2 fnNdcToClip(f32v4 ndc, const ivec2 screensize) {
-	const f32v2 screen = ndc.xy / ndc.w * 0.5f + 0.5f;
-	return screen * f32v2(screensize);
-}
-
 #include "probe_sample.glsl"
 #include "sky.glsl"
 
-void main() {
-	const ivec2 coord  = ivec2(gl_GlobalInvocationID.xy);
-	const ivec2 screensize = ivec2(1280, 720);
-	const GpuDebugPC dbg = GpuDebugPCBuffer(pc.global.debug).data;
+#include "util-mesh.glsl"
+#include "util-raytrace.glsl"
 
-	const uint packed = (
+void main() {
+	// -- fetch texel visibility data
+	const GpuDebugPC unf = GpuDebugPCBuffer(pc.global.debug).data;
+	const ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+	const ivec2 screensize = ivec2(1280, 720);
+	const uint texelPacked = (
 		imageLoad(vkofImagesU[pc.resolve.visibilityImageHandle], coord).r
 	);
 
-	// -- store sky color for pixels that didn't hit anything
-	if (packed == 0u || packed == 0xFFFFFFFFu) {
-		const vec2 ndc = ((vec2(coord) + 0.5) / vec2(screensize)) * 2.0 - 1.0;
-		const vec4 worldFar = inverse(pc.global.viewProj) * vec4(ndc, 1.0, 1.0);
-		const vec3 skyDir = normalize(worldFar.xyz / worldFar.w - pc.global.cameraPos);
-		const vec3 skyColor = (
-			sampleSky(skyDir, dbg.sunDir, dbg.skyTurbidity, dbg.skyIntensity)
-		);
+	// -- store miss for pixels that weren't rendered
+	if (texelPacked == 0u || texelPacked == 0xFFFFFFFFu) {
 		imageStore(
 			vkofImages[pc.resolve.outputImageHandle],
 			coord,
-			vec4(fnAces(skyColor * pc.global.exposure), 1.0)
-		);
-		imageStore(
-			vkofImages[pc.resolve.prevFrameNormalStorageHandle],
-			coord,
-			vec4(0.0f)
-		);
-		imageStore(
-			vkofImages[pc.resolve.prevFrameDepthStorageHandle],
-			coord,
-			vec4(0.0f)
-		);
-		// TODO store the specular component, FOR NOW ITS JUST HDR but it's wrong
-		imageStore(
-			vkofImages[pc.resolve.prevFrameSpecularStorageHandle],
-			coord,
-			vec4(0.0f)
-		);
-		// TODO store the moment but this is not AVAILABLE YET TODO
-		imageStore(
-			vkofImages[pc.resolve.prevFrameMomentStorageHandle],
-			coord,
-			vec4(0.0f)
+			vec4(0.1f, 0.1f, 0.1f, 1.0f)
 		);
 		return;
 	}
 
 	// -- unpack model/meshlet/triangle data
-	const uint triangleId = packed & 0x7Fu;
-	const uint meshletId = ((packed >> 7u) & 0x1FFFFu) - 1u;
-	const uint modelId = (packed >> 24u) & 0xFFu;
-
-	// -- unpack model/meshlet/triangle data
-	GpuResolveModelIndirectBuffer modelsBuf = (
-		GpuResolveModelIndirectBuffer(pc.global.models)
-	);
-	const GpuResolveModelIndirect modelDesc = modelsBuf.data[modelId];
-	const GpuMorMeshlet meshlet = (
-		GpuMorMeshletBuffer(modelDesc.meshlets).data[meshletId]
-	);
-	const GpuMorMaterial material = (
-		GpuMorMaterialBuffer(modelDesc.materials).data[meshlet.materialIndex]
-	);
-	GpuMorMeshletTriBuffer meshletTriBuffer = (
-		GpuMorMeshletTriBuffer(modelDesc.meshletTris)
-	);
-	GpuMorMeshletVertBuffer meshletVertBuffer = (
-		GpuMorMeshletVertBuffer(modelDesc.meshletVerts)
-	);
-	const GpuMorInstance instance = (
-		GpuMorInstanceBuffer(modelDesc.instances).data[meshlet.instanceIndex]
-	);
-	
-	// -- unpack/reconstruct vertex attribute data
-
-	// get triangle indices
-	const uint triangleBaseIdx = meshlet.triangleOffset + triangleId * 3;
-	const uint localIdx0 = uint(meshletTriBuffer.data[triangleBaseIdx + 0]);
-	const uint localIdx1 = uint(meshletTriBuffer.data[triangleBaseIdx + 1]);
-	const uint localIdx2 = uint(meshletTriBuffer.data[triangleBaseIdx + 2]);
-
-	// convert local vertex indices to global through the indirection buffer
-	const uint globalIdx0 = (
-		meshletVertBuffer.data[meshlet.vertexOffset + localIdx0]
-	);
-	const uint globalIdx1 = (
-		meshletVertBuffer.data[meshlet.vertexOffset + localIdx1]
-	);
-	const uint globalIdx2 = (
-		meshletVertBuffer.data[meshlet.vertexOffset + localIdx2]
-	);
-
-	// fetch position
-	GpuMorPositionBuffer positionBuf = (
-		GpuMorPositionBuffer(modelDesc.positions)
-	);
-	const f32v3 pos0 = positionBuf.data[globalIdx0];
-	const f32v3 pos1 = positionBuf.data[globalIdx1];
-	const f32v3 pos2 = positionBuf.data[globalIdx2];
-
-	// fetch attributes
-	GpuMorVertexAttributeBuffer attrBuf = (
-		GpuMorVertexAttributeBuffer(modelDesc.attributes)
-	);
-	const GpuMorVertexAttribute attr0 = attrBuf.data[globalIdx0];
-	const GpuMorVertexAttribute attr1 = attrBuf.data[globalIdx1];
-	const GpuMorVertexAttribute attr2 = attrBuf.data[globalIdx2];
-
-	// reconstruct clip space
-	const f32m44 modelTransform = (
-		modelDesc.modelMatrix * instance.transform
-	);
-	const f32v4 ndc0 = pc.global.viewProj * modelTransform * f32v4(pos0, 1.0);
-	const f32v4 ndc1 = pc.global.viewProj * modelTransform * f32v4(pos1, 1.0);
-	const f32v4 ndc2 = pc.global.viewProj * modelTransform * f32v4(pos2, 1.0);
-
-	const f32v2 clip0 = fnNdcToClip(ndc0, screensize);
-	const f32v2 clip1 = fnNdcToClip(ndc1, screensize);
-	const f32v2 clip2 = fnNdcToClip(ndc2, screensize);
-
-	f32 barycentricDenom;
-	const f32v3 barycentric = (
-		fnBarycentric(f32v2(coord) + 0.5f, clip0, clip1, clip2, barycentricDenom)
-	);
-
-	// compute perspective correction
-	const float invW0 = 1.0f / ndc0.w;
-	const float invW1 = 1.0f / ndc1.w;
-	const float invW2 = 1.0f / ndc2.w;
-	const float perspectiveDenom = (
-		  barycentric.x * invW0
-		+ barycentric.y * invW1
-		+ barycentric.z * invW2
-	);
-
-	// interpolate attributes
-	const f32v2 uv = (
-		(
-			  attr0.uv * barycentric.x * invW0
-			+ attr1.uv * barycentric.y * invW1
-			+ attr2.uv * barycentric.z * invW2
+	const UtilMeshUnpacked texelData = utilMeshUnpackTexel(texelPacked);
+	const UtilMeshAttributeData attributeData = (
+		utilMeshDecodeAttributes(
+			/*texelUnpacked=*/texelData,
+			/*unpackWorldOrigin=*/true,
+			/*unpackNormal=*/true,
+			/*unpackUv=*/true,
+			/*unpackUvDerviatives=*/true,
+			/*unpackMaterial=*/true
 		)
-		/ perspectiveDenom
 	);
-	const f32v3 normal = (
-		(
-			  attr0.normal * barycentric.x * invW0
-			+ attr1.normal * barycentric.y * invW1
-			+ attr2.normal * barycentric.z * invW2
+	const f32v3 bitangent = (
+		cross(
+			attributeData.normal,
+			attributeData.tangent.xyz
 		)
-		/ perspectiveDenom
+		* attributeData.tangent.w
 	);
-	const f32v4 tangent = (
-		(
-			  attr0.tangent * barycentric.x * invW0
-			+ attr1.tangent * barycentric.y * invW1
-			+ attr2.tangent * barycentric.z * invW2
-		)
-		/ perspectiveDenom
-	);
-	const f32v3 bitangent = cross(normal, tangent.xyz) * tangent.w;
-	const f32v3 objectPos = (
-		(
-			  pos0 * barycentric.x * invW0
-			+ pos1 * barycentric.y * invW1
-			+ pos2 * barycentric.z * invW2
-		)
-		/ perspectiveDenom
-	);
-	const f32v3 worldPos = (modelTransform * f32v4(objectPos, 1.0)).xyz;
-	const f32v3 wPos0 = (modelTransform * f32v4(pos0, 1.0)).xyz;
-	const f32v3 wPos1 = (modelTransform * f32v4(pos1, 1.0)).xyz;
-	const f32v3 wPos2 = (modelTransform * f32v4(pos2, 1.0)).xyz;
-
-	// barycentric derivatives
-	const f32 duDx = (clip1.y - clip2.y) / barycentricDenom;
-	const f32 dvDx = (clip2.y - clip0.y) / barycentricDenom;
-	const f32 dwDx = (clip0.y - clip1.y) / barycentricDenom;
-	const f32 duDy = (clip2.x - clip1.x) / barycentricDenom;
-	const f32 dvDy = (clip0.x - clip2.x) / barycentricDenom;
-	const f32 dwDy = (clip1.x - clip0.x) / barycentricDenom;
-
-	const f32 perspDenomDx = duDx*invW0 + dvDx*invW1 + dwDx*invW2;
-	const f32 perspDenomDy = duDy*invW0 + dvDy*invW1 + dwDy*invW2;
-	const f32v2 uvNumerDx = (
-		  attr0.uv*duDx*invW0
-		+ attr1.uv*dvDx*invW1
-		+ attr2.uv*dwDx*invW2
-	);
-	const f32v2 uvNumerDy = (
-		  attr0.uv*duDy*invW0
-		+ attr1.uv*dvDy*invW1
-		+ attr2.uv*dwDy*invW2
-	);
-	const f32v2 uvDx = (uvNumerDx - uv*perspDenomDx) / perspectiveDenom;
-	const f32v2 uvDy = (uvNumerDy - uv*perspDenomDy) / perspectiveDenom;
-
-	// -- material bsdf
-	const mat3 TBN = (
+	const mat3 tbn = (
 		mat3(
-			normalize(tangent.xyz),
+			normalize(attributeData.tangent.xyz),
 			normalize(bitangent),
-			normalize(normal)
+			normalize(attributeData.normal)
 		)
 	);
+
+	// -- unpack material data and angles
 	const BsdfMaterial bsdfMaterial = (
-		bsdfMaterialFromGltf(material, uv, uvDx, uvDy)
+		bsdfMaterialFromGltf(
+			/*material=*/attributeData.material,
+			/*normalGeometrical=*/ attributeData.normalGeometrical,
+			/*tbn=*/tbn,
+			/*uv=*/attributeData.uv,
+			/*uvDx=*/attributeData.uvDx,
+			/*uvDy=*/attributeData.uvDy
+		)
 	);
-	const f32v3 worldNormal = normalize(TBN * bsdfMaterial.modelNormal);
-	const f32v3 wi = normalize(worldPos - pc.global.cameraPos);
-	const f32v3 rawGeomNormal = normalize(cross(wPos1 - wPos0, wPos2 - wPos0));
-	const f32v3 geomNormal = (
-		dot(rawGeomNormal, -wi) >= 0.0 ? rawGeomNormal : -rawGeomNormal
+	const f32v3 wi = normalize(attributeData.origin - pc.global.cameraPos);
+
+	// -- compute lighting
+	const f32v4 irradiance = (
+		utilIrradiancePropagationEntry(
+			/*originalMaterial=*/bsdfMaterial,
+			/*origin=*/attributeData.origin,
+			/*wi=*/wi,
+			/*propagationDepth=*/ 1u
+		)
 	);
-	f32v3 irradiance = f32v3(0.0);
-	if (pc.global.lightCount > 0u) {
-		GpuLightBuffer lightBuf = GpuLightBuffer(pc.global.lightsVa);
-		for (uint i = 0u; i < pc.global.lightCount; ++i) {
-			const GpuLight light = lightBuf.data[i];
-			const f32v3 toLight = light.position - worldPos;
-			const f32 dist = length(toLight);
-			const f32v3 wo = toLight / dist;
-			const f32 dotNL = max(dot(worldNormal, wo), 0.0);
-			if (dotNL <= 0.0) { continue; }
-			if (pc.global.shadowsEnabled != 0u) {
-				rayQueryEXT rq;
-				rayQueryInitializeEXT(
-					/*rayQuery=*/rq,
-					/*topLevel=*/vkofTlas,
-					/*rayFlags=*/ (
-						gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT
-					),
-					/*cullMask=*/0xFFu,
-					/*origin=*/worldPos + geomNormal * 0.0005f,
-					/*tMin=*/0.001f,
-					/*direction=*/wo,
-					/*tMax=*/dist + 0.0025f
-				);
-				rayQueryProceedEXT(rq);
-				const bool hasHit = (
-					rayQueryGetIntersectionTypeEXT(/*rayQuery=*/rq, /*committed=*/true)
-					!= gl_RayQueryCommittedIntersectionNoneEXT
-				);
-				const bool inShadow = (
-					hasHit
-					&& rayQueryGetIntersectionTEXT(/*rayQuery=*/rq, /*committed=*/true) < dist
-				);
-				if (inShadow) { continue; }
-			}
-			const f32 distNorm = dist / light.radius;
-			const f32 falloff = (
-				clamp(1.0 - distNorm * distNorm * distNorm * distNorm, 0.0, 1.0)
-			);
-			const f32 attenuation = (falloff * falloff) / (dist * dist + 1.0);
-			irradiance += (
-				fnBsdfF(worldNormal, wi, wo, bsdfMaterial)
-				* light.color * dotNL * attenuation
-			);
-		}
-	}
-	// -- sun directional light
-	if (dbg.sunIntensity > 0.0 && pc.global.shadowsEnabled != 0u) {
-		const float dotNL = max(dot(worldNormal, dbg.sunDir), 0.0);
-		// sun also has to be above horizon
-		if (dotNL > 0.0 && dbg.sunDir.y > 0.0) {
-			rayQueryEXT sunRq;
-			rayQueryInitializeEXT(
-				sunRq,
-				vkofTlas,
-				gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
-				0xFFu,
-				worldPos + geomNormal * 0.0005f,
-				0.001f,
-				dbg.sunDir,
-				10000.0f
-			);
-			rayQueryProceedEXT(sunRq);
-			const bool sunOccluded = (
-				rayQueryGetIntersectionTypeEXT(sunRq, true)
-				!= gl_RayQueryCommittedIntersectionNoneEXT
-			);
-			if (!sunOccluded) {
-				const vec3 sunColor = sunLightColor(dbg.sunDir, dbg.skyTurbidity);
-				irradiance += (
-					fnBsdfF(worldNormal, wi, dbg.sunDir, bsdfMaterial)
-					* sunColor * dotNL * dbg.sunIntensity
-				);
-			}
-		}
-	}
 
-	const f32v3 ambient = (
-		pc.global.ddgiGrid != 0u
-		? bsdfMaterial.albedo * sampleProbeIrradiance(worldPos, worldNormal)
-		: bsdfMaterial.albedo * vec3(1.0f, 0.0f, 0.0f)
-	);
-	f32v3 hdr = irradiance + ambient + bsdfMaterial.emissive;
-
-	// -- mirror reflection for metallic surfaces
-	// TODO use material
-	if (pc.global.shadowsEnabled != 0u && bsdfMaterial.diffuse < 0.9) {
-		// -- calculate reflection direction
-		vec3 T;
-		vec3 B;
-		ggxBuildFrame(worldNormal, T, B);
-		float outPdf;
-		vec2 u = ( // TODO uniform sample
-			vec2(
-				fract(sin(pc.global.time*94.814 + dot(worldPos.xy, vec2(8.185, 93.123))) * 13290.123),
-				fract(sin(pc.global.time*12.194 + dot(worldPos.xy, vec2(12.9898, 78.233))) * 43758.5453)
-			)
-		);
-		const vec3 reflDir = (
-			ggxSampleReflect(
-				/*incident=*/wi,
-				/*N=*/worldNormal,
-				/*alpha=*/bsdfMaterial.alpha,
-				/*u=*/u,
-				/*outPdf=*/outPdf
-			)
-		);
-
-		// -- cast ray
-		rayQueryEXT reflRq;
-		rayQueryInitializeEXT(
-			reflRq,
-			vkofTlas,
-			gl_RayFlagsOpaqueEXT,
-			0xFFu,
-			worldPos + reflDir * 0.001f,
-			0.001f,
-			reflDir,
-			1000.0f
-		);
-		rayQueryProceedEXT(reflRq);
-
-		// -- resolve bounce
-		vec3 reflColor;
-		if (
-			rayQueryGetIntersectionTypeEXT(reflRq, true)
-			!= gl_RayQueryCommittedIntersectionNoneEXT
-		) {
-			const float reflDist = (
-				rayQueryGetIntersectionTEXT(reflRq, true)
-			);
-			const vec3 reflPos = worldPos + reflDir * reflDist;
-			const uint reflDi = uint(
-				rayQueryGetIntersectionInstanceCustomIndexEXT(reflRq, true)
-			);
-			const uint reflPrim = uint(
-				rayQueryGetIntersectionPrimitiveIndexEXT(reflRq, true)
-			);
-			const vec2 reflBary = rayQueryGetIntersectionBarycentricsEXT(reflRq, true);
-
-			const GpuResolveModelIndirect rd = modelsBuf.data[reflDi];
-
-			const uint ri0 = (
-				GpuFlatIndexBuffer(rd.flatIndices).data[reflPrim * 3u + 0u]
-			);
-			const uint ri1 = (
-				GpuFlatIndexBuffer(rd.flatIndices).data[reflPrim * 3u + 1u]
-			);
-			const uint ri2 = (
-				GpuFlatIndexBuffer(rd.flatIndices).data[reflPrim * 3u + 2u]
-			);
-
-			const vec3 rn0 = (
-				GpuMorVertexAttributeBuffer(rd.attributes).data[ri0].normal
-			);
-			const vec3 rn1 = (
-				GpuMorVertexAttributeBuffer(rd.attributes).data[ri1].normal
-			);
-			const vec3 rn2 = (
-				GpuMorVertexAttributeBuffer(rd.attributes).data[ri2].normal
-			);
-			const vec3 reflLocalNormal = normalize(
-				rn0 * (1.0 - reflBary.x - reflBary.y)
-				+ rn1 * reflBary.x
-				+ rn2 * reflBary.y
-			);
-			const mat3 reflNormalMat = transpose(inverse(mat3(rd.modelMatrix)));
-			const vec3 reflNormal = normalize(reflNormalMat * reflLocalNormal);
-
-			const uint reflMi = (
-				GpuFlatMeshletBuffer(rd.flatMeshlets).data[reflPrim]
-			);
-			const GpuMorMeshlet reflMeshlet = (
-				GpuMorMeshletBuffer(rd.meshlets).data[reflMi]
-			);
-			const GpuMorMaterial reflMat = (
-				GpuMorMaterialBuffer(rd.materials).data[reflMeshlet.materialIndex]
-			);
-
-			// -- direct lighting at reflection hit
-			vec3 reflIrradiance = vec3(0.0);
-			// if (pc.global.lightCount > 0u) {
-			// 	GpuLightBuffer reflLightBuf = GpuLightBuffer(pc.global.lightsVa);
-			// 	for (uint i = 0u; i < pc.global.lightCount; ++i) {
-			// 		const GpuLight rlight = reflLightBuf.data[i];
-			// 		const vec3 toLight = rlight.position - reflPos;
-			// 		const float rDist = length(toLight);
-			// 		const vec3 rWo = toLight / rDist;
-			// 		const float dotNL = max(dot(reflNormal, rWo), 0.0);
-			// 		if (dotNL <= 0.0) { continue; }
-			// 		rayQueryEXT shadowRq;
-			// 		rayQueryInitializeEXT(
-			// 			shadowRq,
-			// 			vkofTlas,
-			// 			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
-			// 			0xFFu,
-			// 			reflPos + reflNormal * 0.001f,
-			// 			0.001f,
-			// 			rWo,
-			// 			rDist - 0.001f
-			// 		);
-			// 		rayQueryProceedEXT(shadowRq);
-			// 		if (
-			// 			rayQueryGetIntersectionTypeEXT(shadowRq, true)
-			// 			!= gl_RayQueryCommittedIntersectionNoneEXT
-			// 		) {
-			// 			continue;
-			// 		}
-			// 		const float distNorm = rDist / rlight.radius;
-			// 		const float falloff = (
-			// 			clamp(
-			// 				1.0 - distNorm * distNorm * distNorm * distNorm,
-			// 				0.0, 1.0
-			// 			)
-			// 		);
-			// 		const float atten = (falloff * falloff) / (rDist * rDist + 1.0);
-			// 		reflIrradiance += (
-			// 			reflMat.baseColor.rgb * dotNL * atten * rlight.color
-			// 		);
-			// 	}
-			// }
-			reflIrradiance += (
-				reflMat.baseColor.rgb * sampleProbeIrradiance(reflPos, reflNormal)
-			);
-			reflIrradiance += reflMat.emissive;
-			reflColor = reflIrradiance;
-		} else {
-			reflColor = (
-				sampleSky(reflDir, dbg.sunDir, dbg.skyTurbidity, dbg.skyIntensity)
-			);
-		}
-
-		// -- fresnel
-		const vec3 F0 = mix(vec3(0.04), bsdfMaterial.albedo, 1.0 - bsdfMaterial.diffuse);
-		const float cosTheta = max(dot(-wi, worldNormal), 0.0);
-		const vec3 fresnel = F0 + (vec3(1.0) - F0) * pow(1.0 - cosTheta, 5.0);
-		hdr += fresnel * reflColor;
-	}
-
-	f32v4 outColor = f32v4(fnAces(hdr * pc.global.exposure), 1.0f);
-
-	// -- debug visualization
-	switch (dbg.debugMode) {
-		case MOR_DEBUG_VIEW_MESHLET_ID: {
-			outColor.rgb = index_color(meshletId);
-			break;
-		}
-		case MOR_DEBUG_VIEW_MODEL_ID: {
-			outColor.rgb = index_color(modelId);
-			break;
-		}
-		case MOR_DEBUG_VIEW_TRIANGLE_ID: {
-			outColor.rgb = index_color(packed);
-			break;
-		}
-		case MOR_DEBUG_VIEW_MIP_HEATMAP: {
-			const uint texHandle = (
-				material.textureBaseColor != 0u
-				? material.textureBaseColor
-				: 0u
-			);
-			f32 mip = 0.0f;
-			if (texHandle != 0u) {
-				const f32v2 texSize = f32v2(
-					textureSize(vkofTextures[nonuniformEXT(texHandle)], 0)
-				);
-				const f32v2 dxPx = uvDx * texSize;
-				const f32v2 dyPx = uvDy * texSize;
-				mip = (
-					0.5f * log2(max(dot(dxPx, dxPx), dot(dyPx, dyPx)))
-				);
-				mip = clamp(mip, 0.0f, 8.0f);
-			}
-			const f32 t = mip / 8.0f;
-			outColor.rgb = (
-				t < 0.5f
-				? mix(f32v3(0.0, 0.0, 1.0), f32v3(0.0, 1.0, 0.0), t * 2.0f)
-				: mix(f32v3(0.0, 1.0, 0.0), f32v3(1.0, 0.0, 0.0), t * 2.0f - 1.0f)
-			);
-			break;
-		}
-		case MOR_DEBUG_VIEW_ALBEDO: {
-			outColor.rgb = bsdfMaterial.albedo;
-			break;
-		}
-		case MOR_DEBUG_VIEW_WORLD_NORMAL: {
-			outColor.rgb = worldNormal * 0.5 + 0.5;
-			break;
-		}
-		case MOR_DEBUG_VIEW_ROUGHNESS: {
-			outColor.rgb = f32v3(bsdfMaterial.alpha);
-			break;
-		}
-		case MOR_DEBUG_VIEW_METALLIC: {
-			outColor.rgb = f32v3(1.0 - bsdfMaterial.diffuse);
-			break;
-		}
-		case MOR_DEBUG_VIEW_EMISSIVE: {
-			outColor.rgb = fnAces(bsdfMaterial.emissive * pc.global.exposure);
-			break;
-		}
-		case MOR_DEBUG_VIEW_UV: {
-			outColor.rgb = f32v3(fract(uv), 0.0);
-			break;
-		}
-	}
-
-	// -- selection highlight
-	if (pc.global.selectedObject != 0xFFFFFFFFu && modelId == pc.global.selectedObject) {
-		// outColor.rgb = mix(outColor.rgb, f32v3(1.0, 0.6, 0.1), 0.4f);
-	}
-
-	// -- pixel probe
-	if (shader_probe_is_active_pixel(ivec2(gl_GlobalInvocationID.xy))) {
-		outColor.rgb = f32v3(1.0, 0.0, 1.0);
-		debugPrintfEXT(
-			"__MODEL__: %u\nbarycentric: %f %f %f (sum %f)\nmodelId: %u, meshletId: %u, triangleId: %u\n",
-			modelId,
-			barycentric.x, barycentric.y, barycentric.z,
-			barycentric.x + barycentric.y + barycentric.z,
-			modelId, meshletId, triangleId
-		);
-	}
-
-	// -- blend results
+	// -- store results
 	imageStore(
 		vkofImages[pc.resolve.outputImageHandle],
 		coord,
-		outColor
+		irradiance
 	);
+}
 
-	// -- write out 'previous frame' data
-	imageStore(
-		vkofImages[pc.resolve.prevFrameNormalStorageHandle],
-		coord,
-		vec4(worldNormal, 1.0)
-	);
-	// might not need to store depth due to 2pass occlusion storing depth, just
-	// need to see if its available or need to make an extra copy etc
-	const vec4 clipPos = pc.global.viewProj * vec4(worldPos, 1.0);
-	imageStore(
-		vkofImages[pc.resolve.prevFrameDepthStorageHandle],
-		coord,
-		vec4(clipPos.z / clipPos.w, 0.0, 0.0, 1.0)
-	);
-	// TODO store the specular component, FOR NOW ITS JUST HDR but it's wrong
-	imageStore(
-		vkofImages[pc.resolve.prevFrameSpecularStorageHandle],
-		coord,
-		vec4(hdr, 1.0f)
-	);
-	// TODO store the moment but this is not AVAILABLE YET TODO
-	imageStore(
-		vkofImages[pc.resolve.prevFrameMomentStorageHandle],
-		coord,
-		vec4(0.0, 0.0, 0.0, 1.0)
-	);
+void mainReference() {
+	// const ivec2 coord  = ivec2(gl_GlobalInvocationID.xy);
+	// const ivec2 screensize = ivec2(1280, 720);
+	// const GpuDebugPC dbg = GpuDebugPCBuffer(pc.global.debug).data;
+
+	// const uint packed = (
+	// 	imageLoad(vkofImagesU[pc.resolve.visibilityImageHandle], coord).r
+	// );
+
+	// // -- store sky color for pixels that didn't hit anything
+	// if (packed == 0u || packed == 0xFFFFFFFFu) {
+	// 	const vec2 ndc = ((vec2(coord) + 0.5) / vec2(screensize)) * 2.0 - 1.0;
+	// 	const vec4 worldFar = inverse(pc.global.viewProj) * vec4(ndc, 1.0, 1.0);
+	// 	const vec3 skyDir = normalize(worldFar.xyz / worldFar.w - pc.global.cameraPos);
+	// 	const vec3 skyColor = (
+	// 		sampleSky(skyDir, dbg.sunDir, dbg.skyTurbidity, dbg.skyIntensity)
+	// 	);
+	// 	imageStore(
+	// 		vkofImages[pc.resolve.outputImageHandle],
+	// 		coord,
+	// 		vec4(fnAces(skyColor * pc.global.exposure), 1.0)
+	// 	);
+	// 	imageStore(
+	// 		vkofImages[pc.resolve.prevFrameNormalStorageHandle],
+	// 		coord,
+	// 		vec4(0.0f)
+	// 	);
+	// 	imageStore(
+	// 		vkofImages[pc.resolve.prevFrameDepthStorageHandle],
+	// 		coord,
+	// 		vec4(0.0f)
+	// 	);
+	// 	// TODO store the specular component, FOR NOW ITS JUST HDR but it's wrong
+	// 	imageStore(
+	// 		vkofImages[pc.resolve.prevFrameSpecularStorageHandle],
+	// 		coord,
+	// 		vec4(0.0f)
+	// 	);
+	// 	// TODO store the moment but this is not AVAILABLE YET TODO
+	// 	imageStore(
+	// 		vkofImages[pc.resolve.prevFrameMomentStorageHandle],
+	// 		coord,
+	// 		vec4(0.0f)
+	// 	);
+	// 	return;
+	// }
+
+	// // -- unpack model/meshlet/triangle data
+	// const uint triangleId = packed & 0x7Fu;
+	// const uint meshletId = ((packed >> 7u) & 0x1FFFFu) - 1u;
+	// const uint modelId = (packed >> 24u) & 0xFFu;
+
+	// // -- unpack model/meshlet/triangle data
+	// GpuResolveModelIndirectBuffer modelsBuf = (
+	// 	GpuResolveModelIndirectBuffer(pc.global.models)
+	// );
+	// const GpuResolveModelIndirect modelDesc = modelsBuf.data[modelId];
+	// const GpuMorMeshlet meshlet = (
+	// 	GpuMorMeshletBuffer(modelDesc.meshlets).data[meshletId]
+	// );
+	// const GpuMorMaterial material = (
+	// 	GpuMorMaterialBuffer(modelDesc.materials).data[meshlet.materialIndex]
+	// );
+	// GpuMorMeshletTriBuffer meshletTriBuffer = (
+	// 	GpuMorMeshletTriBuffer(modelDesc.meshletTris)
+	// );
+	// GpuMorMeshletVertBuffer meshletVertBuffer = (
+	// 	GpuMorMeshletVertBuffer(modelDesc.meshletVerts)
+	// );
+	// const GpuMorInstance instance = (
+	// 	GpuMorInstanceBuffer(modelDesc.instances).data[meshlet.instanceIndex]
+	// );
+	
+	// // -- unpack/reconstruct vertex attribute data
+
+	// // get triangle indices
+	// const uint triangleBaseIdx = meshlet.triangleOffset + triangleId * 3;
+	// const uint localIdx0 = uint(meshletTriBuffer.data[triangleBaseIdx + 0]);
+	// const uint localIdx1 = uint(meshletTriBuffer.data[triangleBaseIdx + 1]);
+	// const uint localIdx2 = uint(meshletTriBuffer.data[triangleBaseIdx + 2]);
+
+	// // convert local vertex indices to global through the indirection buffer
+	// const uint globalIdx0 = (
+	// 	meshletVertBuffer.data[meshlet.vertexOffset + localIdx0]
+	// );
+	// const uint globalIdx1 = (
+	// 	meshletVertBuffer.data[meshlet.vertexOffset + localIdx1]
+	// );
+	// const uint globalIdx2 = (
+	// 	meshletVertBuffer.data[meshlet.vertexOffset + localIdx2]
+	// );
+
+	// // fetch position
+	// GpuMorPositionBuffer positionBuf = (
+	// 	GpuMorPositionBuffer(modelDesc.positions)
+	// );
+	// const f32v3 pos0 = positionBuf.data[globalIdx0];
+	// const f32v3 pos1 = positionBuf.data[globalIdx1];
+	// const f32v3 pos2 = positionBuf.data[globalIdx2];
+
+	// // fetch attributes
+	// GpuMorVertexAttributeBuffer attrBuf = (
+	// 	GpuMorVertexAttributeBuffer(modelDesc.attributes)
+	// );
+	// const GpuMorVertexAttribute attr0 = attrBuf.data[globalIdx0];
+	// const GpuMorVertexAttribute attr1 = attrBuf.data[globalIdx1];
+	// const GpuMorVertexAttribute attr2 = attrBuf.data[globalIdx2];
+
+	// // reconstruct clip space
+	// const f32m44 modelTransform = (
+	// 	modelDesc.modelMatrix * instance.transform
+	// );
+	// const f32v4 ndc0 = pc.global.viewProj * modelTransform * f32v4(pos0, 1.0);
+	// const f32v4 ndc1 = pc.global.viewProj * modelTransform * f32v4(pos1, 1.0);
+	// const f32v4 ndc2 = pc.global.viewProj * modelTransform * f32v4(pos2, 1.0);
+
+	// const f32v2 clip0 = fnNdcToClip(ndc0, screensize);
+	// const f32v2 clip1 = fnNdcToClip(ndc1, screensize);
+	// const f32v2 clip2 = fnNdcToClip(ndc2, screensize);
+
+	// f32 barycentricDenom;
+	// const f32v3 barycentric = (
+	// 	fnBarycentric(f32v2(coord) + 0.5f, clip0, clip1, clip2, barycentricDenom)
+	// );
+
+	// // compute perspective correction
+	// const float invW0 = 1.0f / ndc0.w;
+	// const float invW1 = 1.0f / ndc1.w;
+	// const float invW2 = 1.0f / ndc2.w;
+	// const float perspectiveDenom = (
+	// 	  barycentric.x * invW0
+	// 	+ barycentric.y * invW1
+	// 	+ barycentric.z * invW2
+	// );
+
+	// // interpolate attributes
+	// const f32v2 uv = (
+	// 	(
+	// 		  attr0.uv * barycentric.x * invW0
+	// 		+ attr1.uv * barycentric.y * invW1
+	// 		+ attr2.uv * barycentric.z * invW2
+	// 	)
+	// 	/ perspectiveDenom
+	// );
+	// const f32v3 normal = (
+	// 	(
+	// 		  attr0.normal * barycentric.x * invW0
+	// 		+ attr1.normal * barycentric.y * invW1
+	// 		+ attr2.normal * barycentric.z * invW2
+	// 	)
+	// 	/ perspectiveDenom
+	// );
+	// const f32v4 tangent = (
+	// 	(
+	// 		  attr0.tangent * barycentric.x * invW0
+	// 		+ attr1.tangent * barycentric.y * invW1
+	// 		+ attr2.tangent * barycentric.z * invW2
+	// 	)
+	// 	/ perspectiveDenom
+	// );
+	// const f32v3 bitangent = cross(normal, tangent.xyz) * tangent.w;
+	// const f32v3 objectPos = (
+	// 	(
+	// 		  pos0 * barycentric.x * invW0
+	// 		+ pos1 * barycentric.y * invW1
+	// 		+ pos2 * barycentric.z * invW2
+	// 	)
+	// 	/ perspectiveDenom
+	// );
+	// const f32v3 worldPos = (modelTransform * f32v4(objectPos, 1.0)).xyz;
+	// const f32v3 wPos0 = (modelTransform * f32v4(pos0, 1.0)).xyz;
+	// const f32v3 wPos1 = (modelTransform * f32v4(pos1, 1.0)).xyz;
+	// const f32v3 wPos2 = (modelTransform * f32v4(pos2, 1.0)).xyz;
+
+	// // barycentric derivatives
+	// const f32 duDx = (clip1.y - clip2.y) / barycentricDenom;
+	// const f32 dvDx = (clip2.y - clip0.y) / barycentricDenom;
+	// const f32 dwDx = (clip0.y - clip1.y) / barycentricDenom;
+	// const f32 duDy = (clip2.x - clip1.x) / barycentricDenom;
+	// const f32 dvDy = (clip0.x - clip2.x) / barycentricDenom;
+	// const f32 dwDy = (clip1.x - clip0.x) / barycentricDenom;
+
+	// const f32 perspDenomDx = duDx*invW0 + dvDx*invW1 + dwDx*invW2;
+	// const f32 perspDenomDy = duDy*invW0 + dvDy*invW1 + dwDy*invW2;
+	// const f32v2 uvNumerDx = (
+	// 	  attr0.uv*duDx*invW0
+	// 	+ attr1.uv*dvDx*invW1
+	// 	+ attr2.uv*dwDx*invW2
+	// );
+	// const f32v2 uvNumerDy = (
+	// 	  attr0.uv*duDy*invW0
+	// 	+ attr1.uv*dvDy*invW1
+	// 	+ attr2.uv*dwDy*invW2
+	// );
+	// const f32v2 uvDx = (uvNumerDx - uv*perspDenomDx) / perspectiveDenom;
+	// const f32v2 uvDy = (uvNumerDy - uv*perspDenomDy) / perspectiveDenom;
+
+	// // -- material bsdf
+	// const mat3 TBN = (
+	// 	mat3(
+	// 		normalize(tangent.xyz),
+	// 		normalize(bitangent),
+	// 		normalize(normal)
+	// 	)
+	// );
+	// const BsdfMaterial bsdfMaterial = (
+	// 	bsdfMaterialFromGltf(material, uv, uvDx, uvDy)
+	// );
+	// const f32v3 normalWorld = normalize(TBN * bsdfMaterial.modelNormal);
+	// const f32v3 wi = normalize(worldPos - pc.global.cameraPos);
+	// const f32v3 rawGeomNormal = normalize(cross(wPos1 - wPos0, wPos2 - wPos0));
+	// const f32v3 geomNormal = (
+	// 	dot(rawGeomNormal, -wi) >= 0.0 ? rawGeomNormal : -rawGeomNormal
+	// );
+	// f32v3 irradiance = f32v3(0.0);
+	// // -- sun directional light
+	// if (dbg.sunIntensity > 0.0) {
+	// 	const float dotNL = max(dot(normalWorld, dbg.sunDir), 0.0);
+	// 	// sun also has to be above horizon
+	// 	if (dotNL > 0.0 && dbg.sunDir.y > 0.0) {
+	// 		rayQueryEXT sunRq;
+	// 		rayQueryInitializeEXT(
+	// 			sunRq,
+	// 			vkofTlas,
+	// 			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
+	// 			0xFFu,
+	// 			worldPos + geomNormal * 0.0005f,
+	// 			0.001f,
+	// 			dbg.sunDir,
+	// 			10000.0f
+	// 		);
+	// 		rayQueryProceedEXT(sunRq);
+	// 		const bool sunOccluded = (
+	// 			rayQueryGetIntersectionTypeEXT(sunRq, true)
+	// 			!= gl_RayQueryCommittedIntersectionNoneEXT
+	// 		);
+	// 		if (!sunOccluded) {
+	// 			const vec3 sunColor = sunLightColor(dbg.sunDir, dbg.skyTurbidity);
+	// 			irradiance += (
+	// 				fnBsdfF(normalWorld, wi, dbg.sunDir, bsdfMaterial)
+	// 				* sunColor * dotNL * dbg.sunIntensity
+	// 			);
+	// 		}
+	// 	}
+	// }
+
+	// const f32v3 ambient = (
+	// 	pc.global.ddgiGrid != 0u
+	// 	? bsdfMaterial.albedo * sampleProbeIrradiance(worldPos, normalWorld)
+	// 	: bsdfMaterial.albedo * vec3(1.0f, 0.0f, 0.0f)
+	// );
+	// f32v3 hdr = irradiance + ambient + bsdfMaterial.emissive;
+
+	// // -- mirror reflection for metallic surfaces
+	// // TODO use material
+	// if (bsdfMaterial.diffuse < 0.9) {
+	// 	// -- calculate reflection direction
+	// 	vec3 T;
+	// 	vec3 B;
+	// 	ggxBuildFrame(normalWorld, T, B);
+	// 	float outPdf;
+	// 	vec2 u = ( // TODO uniform sample
+	// 		vec2(
+	// 			fract(sin(pc.global.time*94.814 + dot(worldPos.xy, vec2(8.185, 93.123))) * 13290.123),
+	// 			fract(sin(pc.global.time*12.194 + dot(worldPos.xy, vec2(12.9898, 78.233))) * 43758.5453)
+	// 		)
+	// 	);
+	// 	const vec3 reflDir = (
+	// 		ggxSampleReflect(
+	// 			/*incident=*/wi,
+	// 			/*N=*/normalWorld,
+	// 			/*alpha=*/bsdfMaterial.alpha,
+	// 			/*u=*/u,
+	// 			/*outPdf=*/outPdf
+	// 		)
+	// 	);
+
+	// 	// -- cast ray
+	// 	rayQueryEXT reflRq;
+	// 	rayQueryInitializeEXT(
+	// 		reflRq,
+	// 		vkofTlas,
+	// 		gl_RayFlagsOpaqueEXT,
+	// 		0xFFu,
+	// 		worldPos + reflDir * 0.001f,
+	// 		0.001f,
+	// 		reflDir,
+	// 		1000.0f
+	// 	);
+	// 	rayQueryProceedEXT(reflRq);
+
+	// 	// -- resolve bounce
+	// 	vec3 reflColor;
+	// 	if (
+	// 		rayQueryGetIntersectionTypeEXT(reflRq, true)
+	// 		!= gl_RayQueryCommittedIntersectionNoneEXT
+	// 	) {
+	// 		const float reflDist = (
+	// 			rayQueryGetIntersectionTEXT(reflRq, true)
+	// 		);
+	// 		const vec3 reflPos = worldPos + reflDir * reflDist;
+	// 		const uint reflDi = uint(
+	// 			rayQueryGetIntersectionInstanceCustomIndexEXT(reflRq, true)
+	// 		);
+	// 		const uint reflPrim = uint(
+	// 			rayQueryGetIntersectionPrimitiveIndexEXT(reflRq, true)
+	// 		);
+	// 		const vec2 reflBary = rayQueryGetIntersectionBarycentricsEXT(reflRq, true);
+
+	// 		const GpuResolveModelIndirect rd = modelsBuf.data[reflDi];
+
+	// 		const uint ri0 = (
+	// 			GpuFlatIndexBuffer(rd.flatIndices).data[reflPrim * 3u + 0u]
+	// 		);
+	// 		const uint ri1 = (
+	// 			GpuFlatIndexBuffer(rd.flatIndices).data[reflPrim * 3u + 1u]
+	// 		);
+	// 		const uint ri2 = (
+	// 			GpuFlatIndexBuffer(rd.flatIndices).data[reflPrim * 3u + 2u]
+	// 		);
+
+	// 		const vec3 rn0 = (
+	// 			GpuMorVertexAttributeBuffer(rd.attributes).data[ri0].normal
+	// 		);
+	// 		const vec3 rn1 = (
+	// 			GpuMorVertexAttributeBuffer(rd.attributes).data[ri1].normal
+	// 		);
+	// 		const vec3 rn2 = (
+	// 			GpuMorVertexAttributeBuffer(rd.attributes).data[ri2].normal
+	// 		);
+	// 		const vec3 reflLocalNormal = normalize(
+	// 			rn0 * (1.0 - reflBary.x - reflBary.y)
+	// 			+ rn1 * reflBary.x
+	// 			+ rn2 * reflBary.y
+	// 		);
+	// 		const mat3 reflNormalMat = transpose(inverse(mat3(rd.modelMatrix)));
+	// 		const vec3 reflNormal = normalize(reflNormalMat * reflLocalNormal);
+
+	// 		const uint reflMi = (
+	// 			GpuFlatMeshletBuffer(rd.flatMeshlets).data[reflPrim]
+	// 		);
+	// 		const GpuMorMeshlet reflMeshlet = (
+	// 			GpuMorMeshletBuffer(rd.meshlets).data[reflMi]
+	// 		);
+	// 		const GpuMorMaterial reflMat = (
+	// 			GpuMorMaterialBuffer(rd.materials).data[reflMeshlet.materialIndex]
+	// 		);
+
+	// 		// -- direct lighting at reflection hit
+	// 		vec3 reflIrradiance = vec3(0.0);
+	// 		// if (pc.global.lightCount > 0u) {
+	// 		// 	GpuLightBuffer reflLightBuf = GpuLightBuffer(pc.global.lightsVa);
+	// 		// 	for (uint i = 0u; i < pc.global.lightCount; ++i) {
+	// 		// 		const GpuLight rlight = reflLightBuf.data[i];
+	// 		// 		const vec3 toLight = rlight.position - reflPos;
+	// 		// 		const float rDist = length(toLight);
+	// 		// 		const vec3 rWo = toLight / rDist;
+	// 		// 		const float dotNL = max(dot(reflNormal, rWo), 0.0);
+	// 		// 		if (dotNL <= 0.0) { continue; }
+	// 		// 		rayQueryEXT shadowRq;
+	// 		// 		rayQueryInitializeEXT(
+	// 		// 			shadowRq,
+	// 		// 			vkofTlas,
+	// 		// 			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
+	// 		// 			0xFFu,
+	// 		// 			reflPos + reflNormal * 0.001f,
+	// 		// 			0.001f,
+	// 		// 			rWo,
+	// 		// 			rDist - 0.001f
+	// 		// 		);
+	// 		// 		rayQueryProceedEXT(shadowRq);
+	// 		// 		if (
+	// 		// 			rayQueryGetIntersectionTypeEXT(shadowRq, true)
+	// 		// 			!= gl_RayQueryCommittedIntersectionNoneEXT
+	// 		// 		) {
+	// 		// 			continue;
+	// 		// 		}
+	// 		// 		const float distNorm = rDist / rlight.radius;
+	// 		// 		const float falloff = (
+	// 		// 			clamp(
+	// 		// 				1.0 - distNorm * distNorm * distNorm * distNorm,
+	// 		// 				0.0, 1.0
+	// 		// 			)
+	// 		// 		);
+	// 		// 		const float atten = (falloff * falloff) / (rDist * rDist + 1.0);
+	// 		// 		reflIrradiance += (
+	// 		// 			reflMat.baseColor.rgb * dotNL * atten * rlight.color
+	// 		// 		);
+	// 		// 	}
+	// 		// }
+	// 		reflIrradiance += (
+	// 			reflMat.baseColor.rgb * sampleProbeIrradiance(reflPos, reflNormal)
+	// 		);
+	// 		reflIrradiance += reflMat.emissive;
+	// 		reflColor = reflIrradiance;
+	// 	} else {
+	// 		reflColor = (
+	// 			sampleSky(reflDir, dbg.sunDir, dbg.skyTurbidity, dbg.skyIntensity)
+	// 		);
+	// 	}
+
+	// 	// -- fresnel
+	// 	const vec3 F0 = mix(vec3(0.04), bsdfMaterial.albedo, 1.0 - bsdfMaterial.diffuse);
+	// 	const float cosTheta = max(dot(-wi, normalWorld), 0.0);
+	// 	const vec3 fresnel = F0 + (vec3(1.0) - F0) * pow(1.0 - cosTheta, 5.0);
+	// 	hdr += fresnel * reflColor;
+	// }
+
+	// f32v4 outColor = f32v4(fnAces(hdr * pc.global.exposure), 1.0f);
+
+	// // -- debug visualization
+	// switch (dbg.debugMode) {
+	// 	case MOR_DEBUG_VIEW_MESHLET_ID: {
+	// 		outColor.rgb = index_color(meshletId);
+	// 		break;
+	// 	}
+	// 	case MOR_DEBUG_VIEW_MODEL_ID: {
+	// 		outColor.rgb = index_color(modelId);
+	// 		break;
+	// 	}
+	// 	case MOR_DEBUG_VIEW_TRIANGLE_ID: {
+	// 		outColor.rgb = index_color(packed);
+	// 		break;
+	// 	}
+	// 	case MOR_DEBUG_VIEW_MIP_HEATMAP: {
+	// 		const uint texHandle = (
+	// 			material.textureBaseColor != 0u
+	// 			? material.textureBaseColor
+	// 			: 0u
+	// 		);
+	// 		f32 mip = 0.0f;
+	// 		if (texHandle != 0u) {
+	// 			const f32v2 texSize = f32v2(
+	// 				textureSize(vkofTextures[nonuniformEXT(texHandle)], 0)
+	// 			);
+	// 			const f32v2 dxPx = uvDx * texSize;
+	// 			const f32v2 dyPx = uvDy * texSize;
+	// 			mip = (
+	// 				0.5f * log2(max(dot(dxPx, dxPx), dot(dyPx, dyPx)))
+	// 			);
+	// 			mip = clamp(mip, 0.0f, 8.0f);
+	// 		}
+	// 		const f32 t = mip / 8.0f;
+	// 		outColor.rgb = (
+	// 			t < 0.5f
+	// 			? mix(f32v3(0.0, 0.0, 1.0), f32v3(0.0, 1.0, 0.0), t * 2.0f)
+	// 			: mix(f32v3(0.0, 1.0, 0.0), f32v3(1.0, 0.0, 0.0), t * 2.0f - 1.0f)
+	// 		);
+	// 		break;
+	// 	}
+	// 	case MOR_DEBUG_VIEW_ALBEDO: {
+	// 		outColor.rgb = bsdfMaterial.albedo;
+	// 		break;
+	// 	}
+	// 	case MOR_DEBUG_VIEW_WORLD_NORMAL: {
+	// 		outColor.rgb = normalWorld * 0.5 + 0.5;
+	// 		break;
+	// 	}
+	// 	case MOR_DEBUG_VIEW_ROUGHNESS: {
+	// 		outColor.rgb = f32v3(bsdfMaterial.alpha);
+	// 		break;
+	// 	}
+	// 	case MOR_DEBUG_VIEW_METALLIC: {
+	// 		outColor.rgb = f32v3(1.0 - bsdfMaterial.diffuse);
+	// 		break;
+	// 	}
+	// 	case MOR_DEBUG_VIEW_EMISSIVE: {
+	// 		outColor.rgb = fnAces(bsdfMaterial.emissive * pc.global.exposure);
+	// 		break;
+	// 	}
+	// 	case MOR_DEBUG_VIEW_UV: {
+	// 		outColor.rgb = f32v3(fract(uv), 0.0);
+	// 		break;
+	// 	}
+	// }
+
+	// // -- selection highlight
+	// if (pc.global.selectedObject != 0xFFFFFFFFu && modelId == pc.global.selectedObject) {
+	// 	// outColor.rgb = mix(outColor.rgb, f32v3(1.0, 0.6, 0.1), 0.4f);
+	// }
+
+	// // -- pixel probe
+	// if (shader_probe_is_active_pixel(ivec2(gl_GlobalInvocationID.xy))) {
+	// 	outColor.rgb = f32v3(1.0, 0.0, 1.0);
+	// 	debugPrintfEXT(
+	// 		"__MODEL__: %u\nbarycentric: %f %f %f (sum %f)\nmodelId: %u, meshletId: %u, triangleId: %u\n",
+	// 		modelId,
+	// 		barycentric.x, barycentric.y, barycentric.z,
+	// 		barycentric.x + barycentric.y + barycentric.z,
+	// 		modelId, meshletId, triangleId
+	// 	);
+	// }
+
+	// // -- blend results
+	// imageStore(
+	// 	vkofImages[pc.resolve.outputImageHandle],
+	// 	coord,
+	// 	outColor
+	// );
+
+	// // -- write out 'previous frame' data
+	// imageStore(
+	// 	vkofImages[pc.resolve.prevFrameNormalStorageHandle],
+	// 	coord,
+	// 	vec4(normalWorld, 1.0)
+	// );
+	// // might not need to store depth due to 2pass occlusion storing depth, just
+	// // need to see if its available or need to make an extra copy etc
+	// const vec4 clipPos = pc.global.viewProj * vec4(worldPos, 1.0);
+	// imageStore(
+	// 	vkofImages[pc.resolve.prevFrameDepthStorageHandle],
+	// 	coord,
+	// 	vec4(clipPos.z / clipPos.w, 0.0, 0.0, 1.0)
+	// );
+	// // TODO store the specular component, FOR NOW ITS JUST HDR but it's wrong
+	// imageStore(
+	// 	vkofImages[pc.resolve.prevFrameSpecularStorageHandle],
+	// 	coord,
+	// 	vec4(hdr, 1.0f)
+	// );
+	// // TODO store the moment but this is not AVAILABLE YET TODO
+	// imageStore(
+	// 	vkofImages[pc.resolve.prevFrameMomentStorageHandle],
+	// 	coord,
+	// 	vec4(0.0, 0.0, 0.0, 1.0)
+	// );
 }

@@ -34,7 +34,7 @@ In resolve.comp add `GL_EXT_ray_query` and cast the VA to
 accelerationStructureEXT tlas = accelerationStructureEXT(pc.global.tlasVa);
 rayQueryEXT rq;
 rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF,
-    worldPos + worldNormal*0.01, 0.001, toLight, dist);
+    worldPos + normalWorld*0.01, 0.001, toLight, dist);
 rayQueryProceedEXT(rq);
 bool inShadow = (
     rayQueryGetIntersectionTypeEXT(rq, true)
@@ -97,6 +97,6 @@ Separate compute pass or done in the same shader:
 
 Replace ambient term `bsdfMaterial.albedo * 0.02f` with proper DDGI lookup:
 - Find 8 surrounding probes for `worldPos`.
-- For each: sample irradiance atlas at oct-encoded `worldNormal` direction.
+- For each: sample irradiance atlas at oct-encoded `normalWorld` direction.
 - Weight by trilinear + visibility (Chebyshev test against depth atlas).
 - Normalize and multiply by `albedo / PI`.

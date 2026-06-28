@@ -43,7 +43,6 @@ struct GpuGlobalPC {
 	f32 time;
 	f32v3 cameraPos;
 	u32 lightCount;
-	u32 shadowsEnabled;
 	u64 lightsVa;
 	f32 exposure;
 	u32 selectedObject;
