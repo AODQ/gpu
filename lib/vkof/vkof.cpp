@@ -4141,12 +4141,19 @@ void vkof::cmd_dispatch(CmdDispatch const & dispatch)
 		);
 	}
 
-	vkCmdDispatch(
-		implCmd->cmd,
-		dispatch.groupCountX,
-		dispatch.groupCountY,
-		dispatch.groupCountZ
+	u32 const gx = (
+		(dispatch.invocationCount.x + dispatch.threadgroupSize.x - 1u)
+		/ dispatch.threadgroupSize.x
 	);
+	u32 const gy = (
+		(dispatch.invocationCount.y + dispatch.threadgroupSize.y - 1u)
+		/ dispatch.threadgroupSize.y
+	);
+	u32 const gz = (
+		(dispatch.invocationCount.z + dispatch.threadgroupSize.z - 1u)
+		/ dispatch.threadgroupSize.z
+	);
+	vkCmdDispatch(implCmd->cmd, gx, gy, gz);
 }
 
 static bool resolve_image(

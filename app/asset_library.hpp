@@ -1,7 +1,9 @@
 #pragma once
 
+#include <srat/core-types.hpp>
 #include <filesystem>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 struct AssetEntry
@@ -17,4 +19,7 @@ struct AssetLibrary
 
 [[nodiscard]] AssetLibrary asset_library_create(std::filesystem::path const & assetsDir);
 
-[[nodiscard]] char const * asset_library_imgui(AssetLibrary const & lib);
+[[nodiscard]] char const * asset_library_imgui(
+	AssetLibrary const & lib,
+	std::unordered_map<std::string, u32> const & ratings
+);

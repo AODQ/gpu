@@ -200,4 +200,9 @@ struct array {
 		{ return slice<T, N> { const_cast<T *>(data), N }; } // NOLINT
 };
 
+template<typename T>
+inline slice<u8 const> slice_as_bytes(T const & value) {
+	return { reinterpret_cast<u8 const *>(&value), sizeof(T) };
+}
+
 } // namespace srat

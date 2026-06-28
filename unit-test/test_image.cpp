@@ -229,10 +229,9 @@ TEST_CASE("image: initial data round-trip") {
 			vkof::cmd_dispatch({
 				.cmd = cmd,
 				.pipeline = pl,
-				.pushconstant = test::as_bytes(push),
-				.groupCountX = (kCount + 63u) / 64u,
-				.groupCountY = 1u,
-				.groupCountZ = 1u,
+				.pushconstant = srat::slice_as_bytes(push),
+				.threadgroupSize = u32v3{ 64u, 1u, 1u },
+				.invocationCount = u32v3{ kCount, 1u, 1u },
 			});
 		},
 	});
@@ -386,10 +385,9 @@ TEST_CASE("image3d: imageStore/imageLoad round-trip") {
 			vkof::cmd_dispatch({
 				.cmd = cmd,
 				.pipeline = fillPl,
-				.pushconstant = test::as_bytes(push),
-				.groupCountX = (kTotal + 63u) / 64u,
-				.groupCountY = 1u,
-				.groupCountZ = 1u,
+				.pushconstant = srat::slice_as_bytes(push),
+				.threadgroupSize = u32v3{ 64u, 1u, 1u },
+				.invocationCount = u32v3{ kTotal, 1u, 1u },
 			});
 		},
 	});
@@ -413,10 +411,9 @@ TEST_CASE("image3d: imageStore/imageLoad round-trip") {
 			vkof::cmd_dispatch({
 				.cmd = cmd,
 				.pipeline = readPl,
-				.pushconstant = test::as_bytes(push),
-				.groupCountX = (kTotal + 63u) / 64u,
-				.groupCountY = 1u,
-				.groupCountZ = 1u,
+				.pushconstant = srat::slice_as_bytes(push),
+				.threadgroupSize = u32v3{ 64u, 1u, 1u },
+				.invocationCount = u32v3{ kTotal, 1u, 1u },
 			});
 		},
 	});
@@ -501,10 +498,9 @@ TEST_CASE("image3d: ddgi atlas probe-tile layout") {
 			vkof::cmd_dispatch({
 				.cmd = cmd,
 				.pipeline = fillPl,
-				.pushconstant = test::as_bytes(push),
-				.groupCountX = kCountX,
-				.groupCountY = kCountY,
-				.groupCountZ = kCountZ,
+				.pushconstant = srat::slice_as_bytes(push),
+				.threadgroupSize = u32v3{ 1u, 1u, 1u },
+				.invocationCount = u32v3{ kCountX, kCountY, kCountZ },
 			});
 		},
 	});
@@ -528,10 +524,9 @@ TEST_CASE("image3d: ddgi atlas probe-tile layout") {
 			vkof::cmd_dispatch({
 				.cmd = cmd,
 				.pipeline = readPl,
-				.pushconstant = test::as_bytes(push),
-				.groupCountX = (kTotalProbes + 63u) / 64u,
-				.groupCountY = 1u,
-				.groupCountZ = 1u,
+				.pushconstant = srat::slice_as_bytes(push),
+				.threadgroupSize = u32v3{ 64u, 1u, 1u },
+				.invocationCount = u32v3{ kTotalProbes, 1u, 1u },
 			});
 		},
 	});

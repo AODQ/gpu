@@ -63,21 +63,18 @@ TEST_CASE("rendernode: compute callback executes on GPU") {
 		.value  = kValue,
 		.count  = kCount,
 	};
-	srat::slice<u8 const> const pushBytes = test::as_bytes(push);
-
 	auto node = vkof::render_node_create(
 		{ .queue = vkof::CommandQueue::compute }
 	);
 	vkof::render_node_callback({
-		.node	 = node,
+		.node = node,
 		.callback = [&](vkof::CommandBuffer const & cmd) {
 			vkof::cmd_dispatch({
-				.cmd		  = cmd,
-				.pipeline	 = pl,
-				.pushconstant = pushBytes,
-				.groupCountX  = groups_for(kCount),
-				.groupCountY  = 1,
-				.groupCountZ  = 1,
+				.cmd = cmd,
+				.pipeline = pl,
+				.pushconstant = srat::slice_as_bytes(push),
+				.threadgroupSize = u32v3{ kLocalSize, 1u, 1u },
+				.invocationCount = u32v3{ kCount, 1u, 1u },
 			});
 		},
 	});

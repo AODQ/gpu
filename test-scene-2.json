@@ -1,0 +1,634 @@
+{
+    "entities": [
+        {
+            "type": "instance",
+            "position": [
+                2.42179274559021,
+                8.09577465057373,
+                5.8088860511779785
+            ],
+            "filename": "assets/Models/AlphaBlendModeTest/glTF/AlphaBlendModeTest.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.0
+        },
+        {
+            "type": "instance",
+            "position": [
+                12.283597946166992,
+                8.592133522033691,
+                4.8389058113098145
+            ],
+            "filename": "assets/Models/AnimatedColorsCube/glTF/AnimatedColorsCube.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.0
+        },
+        {
+            "type": "instance",
+            "position": [
+                18.644981384277344,
+                8.593807220458984,
+                4.820589542388916
+            ],
+            "filename": "assets/Models/AnimatedMorphCube/glTF/AnimatedMorphCube.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.0
+        },
+        {
+            "type": "instance",
+            "position": [
+                31.18378257751465,
+                11.89954662322998,
+                5.262679576873779
+            ],
+            "filename": "assets/Models/AnimationPointerUVs/glTF/AnimationPointerUVs.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.0
+        },
+        {
+            "type": "instance",
+            "position": [
+                46.050926208496094,
+                8.112653732299805,
+                5.300987720489502
+            ],
+            "filename": "assets/Models/AnisotropyDiscTest/glTF/AnisotropyDiscTest.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.0
+        },
+        {
+            "type": "instance",
+            "position": [
+                55.48044967651367,
+                11.296224594116211,
+                5.531015396118164
+            ],
+            "filename": "assets/Models/AnisotropyRotationTest/glTF/AnisotropyRotationTest.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.0
+        },
+        {
+            "type": "instance",
+            "position": [
+                67.1823959350586,
+                9.014339447021484,
+                6.051529884338379
+            ],
+            "filename": "assets/Models/AnisotropyStrengthTest/glTF/AnisotropyStrengthTest.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.0
+        },
+        {
+            "type": "instance",
+            "position": [
+                81.8385009765625,
+                16.08672332763672,
+                5.4912028312683105
+            ],
+            "filename": "assets/Models/AttenuationTest/glTF/AttenuationTest.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.0
+        },
+        {
+            "type": "instance",
+            "position": [
+                100.04081726074219,
+                11.03896427154541,
+                2.2511236667633057
+            ],
+            "filename": "assets/Models/Box With Spaces/glTF/Box With Spaces.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 2.309999942779541
+        },
+        {
+            "type": "instance",
+            "position": [
+                105.80403900146484,
+                11.396483421325684,
+                2.73846435546875
+            ],
+            "filename": "assets/Models/BoxInterleaved/glTF/BoxInterleaved.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 4.090000152587891
+        },
+        {
+            "type": "instance",
+            "position": [
+                111.49917602539063,
+                11.900945663452148,
+                2.5693421363830566
+            ],
+            "filename": "assets/Models/BoxTexturedNonPowerOfTwo/glTF/BoxTexturedNonPowerOfTwo.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 3.690000057220459
+        },
+        {
+            "type": "instance",
+            "position": [
+                117.9810791015625,
+                9.952079772949219,
+                2.2661375999450684
+            ],
+            "filename": "assets/Models/BrainStem/glTF/BrainStem.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 4.309999942779541
+        },
+        {
+            "type": "instance",
+            "position": [
+                126.0187759399414,
+                10.15139102935791,
+                1.861841082572937
+            ],
+            "filename": "assets/Models/CarConcept/glTF/CarConcept.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.7899999618530273
+        },
+        {
+            "type": "instance",
+            "position": [
+                126.08934020996094,
+                13.526143074035645,
+                2.572028398513794
+            ],
+            "filename": "assets/Models/CarbonFibre/glTF/CarbonFibre.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 2.0899999141693115
+        },
+        {
+            "type": "instance",
+            "position": [
+                130.99240112304688,
+                10.777947425842285,
+                3.6809051036834717
+            ],
+            "filename": "assets/Models/ClearCoatCarPaint/glTF/ClearCoatCarPaint.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.8899999856948853
+        },
+        {
+            "type": "instance",
+            "position": [
+                133.60589599609375,
+                10.955177307128906,
+                3.4169816970825195
+            ],
+            "filename": "assets/Models/ClearcoatWicker/glTF/ClearcoatWicker.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.8600000143051147
+        },
+        {
+            "type": "instance",
+            "position": [
+                138.38438415527344,
+                11.060840606689453,
+                2.9495272636413574
+            ],
+            "filename": "assets/Models/CompareAlphaCoverage/glTF/CompareAlphaCoverage.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.7799999713897705
+        },
+        {
+            "type": "instance",
+            "position": [
+                143.600341796875,
+                12.05419921875,
+                2.719841957092285
+            ],
+            "filename": "assets/Models/CompareAmbientOcclusion/glTF/CompareAmbientOcclusion.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.0
+        },
+        {
+            "type": "instance",
+            "position": [
+                146.57376098632813,
+                11.977509498596191,
+                2.719841957092285
+            ],
+            "filename": "assets/Models/CompareAnisotropy/glTF/CompareAnisotropy.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.0
+        },
+        {
+            "type": "instance",
+            "position": [
+                158.73959350585938,
+                11.977509498596191,
+                2.719841957092285
+            ],
+            "filename": "assets/Models/CompareBaseColor/glTF/CompareBaseColor.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.0
+        },
+        {
+            "type": "instance",
+            "position": [
+                149.80264282226563,
+                11.977509498596191,
+                2.719841957092285
+            ],
+            "filename": "assets/Models/CompareClearcoat/glTF/CompareClearcoat.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.0
+        },
+        {
+            "type": "instance",
+            "position": [
+                172.15138244628906,
+                11.977509498596191,
+                2.719841957092285
+            ],
+            "filename": "assets/Models/CompareDispersion/glTF/CompareDispersion.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.0
+        },
+        {
+            "type": "instance",
+            "position": [
+                162.06317138671875,
+                13.272002220153809,
+                2.719841957092285
+            ],
+            "filename": "assets/Models/CompareEmissiveStrength/glTF/CompareEmissiveStrength.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.0
+        },
+        {
+            "type": "instance",
+            "position": [
+                175.56129455566406,
+                11.977509498596191,
+                2.719841957092285
+            ],
+            "filename": "assets/Models/CompareIor/glTF/CompareIor.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.0
+        },
+        {
+            "type": "instance",
+            "position": [
+                162.17706298828125,
+                14.342281341552734,
+                2.719841957092285
+            ],
+            "filename": "assets/Models/CompareIridescence/glTF/CompareIridescence.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.0
+        },
+        {
+            "type": "instance",
+            "position": [
+                178.70555114746094,
+                11.977509498596191,
+                2.719841957092285
+            ],
+            "filename": "assets/Models/CompareMetallic/glTF/CompareMetallic.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.0
+        },
+        {
+            "type": "instance",
+            "position": [
+                181.43072509765625,
+                12.01272201538086,
+                2.719841957092285
+            ],
+            "filename": "assets/Models/CompareNormal/glTF/CompareNormal.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.0
+        },
+        {
+            "type": "instance",
+            "position": [
+                162.04995727539063,
+                11.977509498596191,
+                2.719841957092285
+            ],
+            "filename": "assets/Models/CompareRoughness/glTF/CompareRoughness.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.0
+        },
+        {
+            "type": "instance",
+            "position": [
+                153.03721618652344,
+                11.977509498596191,
+                2.719841957092285
+            ],
+            "filename": "assets/Models/CompareSheen/glTF/CompareSheen.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.0
+        },
+        {
+            "type": "instance",
+            "position": [
+                155.7061767578125,
+                11.977509498596191,
+                2.719841957092285
+            ],
+            "filename": "assets/Models/CompareSpecular/glTF/CompareSpecular.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.0
+        },
+        {
+            "type": "instance",
+            "position": [
+                168.9005889892578,
+                11.977509498596191,
+                2.719841957092285
+            ],
+            "filename": "assets/Models/CompareTransmission/glTF/CompareTransmission.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.0
+        },
+        {
+            "type": "instance",
+            "position": [
+                165.57115173339844,
+                11.977509498596191,
+                2.719841957092285
+            ],
+            "filename": "assets/Models/CompareVolume/glTF/CompareVolume.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.0
+        },
+        {
+            "type": "instance",
+            "position": [
+                184.75491333007813,
+                12.11789321899414,
+                2.401397943496704
+            ],
+            "filename": "assets/Models/CubeVisibility/glTF/CubeVisibility.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.0
+        },
+        {
+            "type": "instance",
+            "position": [
+                188.37850952148438,
+                12.217793464660645,
+                2.6518168449401855
+            ],
+            "filename": "assets/Models/DiffuseTransmissionPlant/glTF/DiffuseTransmissionPlant.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.659999966621399
+        },
+        {
+            "type": "instance",
+            "position": [
+                190.43182373046875,
+                12.251974105834961,
+                2.588937520980835
+            ],
+            "filename": "assets/Models/DiffuseTransmissionTeacup/glTF/DiffuseTransmissionTeacup.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 8.029999732971191
+        },
+        {
+            "type": "instance",
+            "position": [
+                195.2915802001953,
+                15.651724815368652,
+                2.7026140689849854
+            ],
+            "filename": "assets/Models/DiffuseTransmissionTest/glTF/DiffuseTransmissionTest.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.0
+        },
+        {
+            "type": "instance",
+            "position": [
+                202.58560180664063,
+                12.83015251159668,
+                2.441204786300659
+            ],
+            "filename": "assets/Models/DirectionalLight/glTF/DirectionalLight.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.0
+        },
+        {
+            "type": "instance",
+            "position": [
+                207.84288024902344,
+                13.129515647888184,
+                1.846334457397461
+            ],
+            "filename": "assets/Models/DispersionTest/glTF/DispersionTest.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 32.54999923706055
+        },
+        {
+            "type": "instance",
+            "position": [
+                214.08773803710938,
+                12.411199569702148,
+                1.7916113138198853
+            ],
+            "filename": "assets/Models/DragonAttenuation/glTF/DragonAttenuation.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.0
+        },
+        {
+            "type": "instance",
+            "position": [
+                222.16380310058594,
+                12.06418228149414,
+                1.2044308185577393
+            ],
+            "filename": "assets/Models/DragonDispersion/glTF/DragonDispersion.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.1699999570846558
+        },
+        {
+            "type": "instance",
+            "position": [
+                235.10372924804688,
+                15.234243392944336,
+                3.3906829357147217
+            ],
+            "filename": "assets/Models/EmissiveStrengthTest/glTF/EmissiveStrengthTest.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.0
+        },
+        {
+            "type": "instance",
+            "position": [
+                256.0260925292969,
+                10.680634498596191,
+                2.6061668395996094
+            ],
+            "filename": "assets/Models/EnvironmentTest/glTF/EnvironmentTest.gltf",
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": 1.0
+        }
+    ]
+}

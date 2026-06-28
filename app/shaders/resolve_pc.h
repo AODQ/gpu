@@ -42,6 +42,10 @@ layout(buffer_reference, scalar) buffer GpuResolveModelIndirectBuffer {
 struct GpuResolvePC {
 	u32 visibilityImageHandle;
 	u32 outputImageHandle;
+	u32 prevFrameNormalStorageHandle;
+	u32 prevFrameDepthStorageHandle;
+	u32 prevFrameSpecularStorageHandle;
+	u32 prevFrameMomentStorageHandle;
 };
 
 #ifndef __cplusplus

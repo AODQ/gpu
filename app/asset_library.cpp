@@ -42,13 +42,23 @@ AssetLibrary asset_library_create(std::filesystem::path const & assetsDir)
 	return lib;
 }
 
-char const * asset_library_imgui(AssetLibrary const & lib)
-{
+char const * asset_library_imgui(
+	AssetLibrary const & lib,
+	std::unordered_map<std::string, u32> const & ratings
+) {
 	char const * selected = nullptr;
 	ImGui::Begin("Assets");
 	for (int i = 0; i < (int)lib.entries.size(); ++i) {
-		if (ImGui::Button(lib.entries[i].name.c_str(), ImVec2(-1.0f, 0.0f))) {
-			selected = lib.entries[i].path.c_str();
+		AssetEntry const & entry = lib.entries[i];
+		std::string label = entry.name;
+		auto const it = ratings.find(entry.name);
+		if (it != ratings.end() && it->second > 0u) {
+			label += " [";
+			label += std::to_string(it->second);
+			label += "]";
+		}
+		if (ImGui::Button(label.c_str(), ImVec2(-1.0f, 0.0f))) {
+			selected = entry.path.c_str();
 		}
 	}
 	ImGui::End();

@@ -19,9 +19,9 @@ layout(set = 0, binding = 4) uniform sampler3D vkofTextures3D[];
 #include "resolve_pc.h"
 #include "material.glsl"
 #include "probe.glsl"
+#include "util-ggx-sample.glsl"
 
 layout(local_size_x = 16, local_size_y = 16) in;
-
 
 vec3 index_color(uint idx) {
 	uint h = idx * 2654435761u;
@@ -82,19 +82,45 @@ void main() {
 		imageLoad(vkofImagesU[pc.resolve.visibilityImageHandle], coord).r
 	);
 
-	// -- unpack u32
+	// -- store sky color for pixels that didn't hit anything
 	if (packed == 0u || packed == 0xFFFFFFFFu) {
 		const vec2 ndc = ((vec2(coord) + 0.5) / vec2(screensize)) * 2.0 - 1.0;
 		const vec4 worldFar = inverse(pc.global.viewProj) * vec4(ndc, 1.0, 1.0);
 		const vec3 skyDir = normalize(worldFar.xyz / worldFar.w - pc.global.cameraPos);
-		const vec3 skyColor = sampleSky(skyDir, dbg.sunDir, dbg.skyTurbidity);
+		const vec3 skyColor = (
+			sampleSky(skyDir, dbg.sunDir, dbg.skyTurbidity, dbg.skyIntensity)
+		);
 		imageStore(
 			vkofImages[pc.resolve.outputImageHandle],
 			coord,
 			vec4(fnAces(skyColor * pc.global.exposure), 1.0)
 		);
+		imageStore(
+			vkofImages[pc.resolve.prevFrameNormalStorageHandle],
+			coord,
+			vec4(0.0f)
+		);
+		imageStore(
+			vkofImages[pc.resolve.prevFrameDepthStorageHandle],
+			coord,
+			vec4(0.0f)
+		);
+		// TODO store the specular component, FOR NOW ITS JUST HDR but it's wrong
+		imageStore(
+			vkofImages[pc.resolve.prevFrameSpecularStorageHandle],
+			coord,
+			vec4(0.0f)
+		);
+		// TODO store the moment but this is not AVAILABLE YET TODO
+		imageStore(
+			vkofImages[pc.resolve.prevFrameMomentStorageHandle],
+			coord,
+			vec4(0.0f)
+		);
 		return;
 	}
+
+	// -- unpack model/meshlet/triangle data
 	const uint triangleId = packed & 0x7Fu;
 	const uint meshletId = ((packed >> 7u) & 0x1FFFFu) - 1u;
 	const uint modelId = (packed >> 24u) & 0xFFu;
@@ -310,7 +336,8 @@ void main() {
 	// -- sun directional light
 	if (dbg.sunIntensity > 0.0 && pc.global.shadowsEnabled != 0u) {
 		const float dotNL = max(dot(worldNormal, dbg.sunDir), 0.0);
-		if (dotNL > 0.0) {
+		// sun also has to be above horizon
+		if (dotNL > 0.0 && dbg.sunDir.y > 0.0) {
 			rayQueryEXT sunRq;
 			rayQueryInitializeEXT(
 				sunRq,
@@ -346,21 +373,43 @@ void main() {
 
 	// -- mirror reflection for metallic surfaces
 	// TODO use material
-	if (pc.global.shadowsEnabled != 0u && bsdfMaterial.diffuse < 0.5) {
-		const vec3 reflDir = reflect(wi, worldNormal);
+	if (pc.global.shadowsEnabled != 0u && bsdfMaterial.diffuse < 0.9) {
+		// -- calculate reflection direction
+		vec3 T;
+		vec3 B;
+		ggxBuildFrame(worldNormal, T, B);
+		float outPdf;
+		vec2 u = ( // TODO uniform sample
+			vec2(
+				fract(sin(pc.global.time*94.814 + dot(worldPos.xy, vec2(8.185, 93.123))) * 13290.123),
+				fract(sin(pc.global.time*12.194 + dot(worldPos.xy, vec2(12.9898, 78.233))) * 43758.5453)
+			)
+		);
+		const vec3 reflDir = (
+			ggxSampleReflect(
+				/*incident=*/wi,
+				/*N=*/worldNormal,
+				/*alpha=*/bsdfMaterial.alpha,
+				/*u=*/u,
+				/*outPdf=*/outPdf
+			)
+		);
+
+		// -- cast ray
 		rayQueryEXT reflRq;
 		rayQueryInitializeEXT(
 			reflRq,
 			vkofTlas,
 			gl_RayFlagsOpaqueEXT,
 			0xFFu,
-			worldPos + geomNormal * 0.001f,
+			worldPos + reflDir * 0.001f,
 			0.001f,
 			reflDir,
 			1000.0f
 		);
 		rayQueryProceedEXT(reflRq);
 
+		// -- resolve bounce
 		vec3 reflColor;
 		if (
 			rayQueryGetIntersectionTypeEXT(reflRq, true)
@@ -380,13 +429,25 @@ void main() {
 
 			const GpuResolveModelIndirect rd = modelsBuf.data[reflDi];
 
-			const uint ri0 = GpuFlatIndexBuffer(rd.flatIndices).data[reflPrim * 3u + 0u];
-			const uint ri1 = GpuFlatIndexBuffer(rd.flatIndices).data[reflPrim * 3u + 1u];
-			const uint ri2 = GpuFlatIndexBuffer(rd.flatIndices).data[reflPrim * 3u + 2u];
+			const uint ri0 = (
+				GpuFlatIndexBuffer(rd.flatIndices).data[reflPrim * 3u + 0u]
+			);
+			const uint ri1 = (
+				GpuFlatIndexBuffer(rd.flatIndices).data[reflPrim * 3u + 1u]
+			);
+			const uint ri2 = (
+				GpuFlatIndexBuffer(rd.flatIndices).data[reflPrim * 3u + 2u]
+			);
 
-			const vec3 rn0 = GpuMorVertexAttributeBuffer(rd.attributes).data[ri0].normal;
-			const vec3 rn1 = GpuMorVertexAttributeBuffer(rd.attributes).data[ri1].normal;
-			const vec3 rn2 = GpuMorVertexAttributeBuffer(rd.attributes).data[ri2].normal;
+			const vec3 rn0 = (
+				GpuMorVertexAttributeBuffer(rd.attributes).data[ri0].normal
+			);
+			const vec3 rn1 = (
+				GpuMorVertexAttributeBuffer(rd.attributes).data[ri1].normal
+			);
+			const vec3 rn2 = (
+				GpuMorVertexAttributeBuffer(rd.attributes).data[ri2].normal
+			);
 			const vec3 reflLocalNormal = normalize(
 				rn0 * (1.0 - reflBary.x - reflBary.y)
 				+ rn1 * reflBary.x
@@ -407,53 +468,55 @@ void main() {
 
 			// -- direct lighting at reflection hit
 			vec3 reflIrradiance = vec3(0.0);
-			if (pc.global.lightCount > 0u) {
-				GpuLightBuffer reflLightBuf = GpuLightBuffer(pc.global.lightsVa);
-				for (uint i = 0u; i < pc.global.lightCount; ++i) {
-					const GpuLight rlight = reflLightBuf.data[i];
-					const vec3 toLight = rlight.position - reflPos;
-					const float rDist = length(toLight);
-					const vec3 rWo = toLight / rDist;
-					const float dotNL = max(dot(reflNormal, rWo), 0.0);
-					if (dotNL <= 0.0) { continue; }
-					rayQueryEXT shadowRq;
-					rayQueryInitializeEXT(
-						shadowRq,
-						vkofTlas,
-						gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
-						0xFFu,
-						reflPos + reflNormal * 0.001f,
-						0.001f,
-						rWo,
-						rDist - 0.001f
-					);
-					rayQueryProceedEXT(shadowRq);
-					if (
-						rayQueryGetIntersectionTypeEXT(shadowRq, true)
-						!= gl_RayQueryCommittedIntersectionNoneEXT
-					) {
-						continue;
-					}
-					const float distNorm = rDist / rlight.radius;
-					const float falloff = (
-						clamp(
-							1.0 - distNorm * distNorm * distNorm * distNorm,
-							0.0, 1.0
-						)
-					);
-					const float atten = (falloff * falloff) / (rDist * rDist + 1.0);
-					reflIrradiance += (
-						reflMat.baseColor.rgb * dotNL * atten * rlight.color
-					);
-				}
-			}
+			// if (pc.global.lightCount > 0u) {
+			// 	GpuLightBuffer reflLightBuf = GpuLightBuffer(pc.global.lightsVa);
+			// 	for (uint i = 0u; i < pc.global.lightCount; ++i) {
+			// 		const GpuLight rlight = reflLightBuf.data[i];
+			// 		const vec3 toLight = rlight.position - reflPos;
+			// 		const float rDist = length(toLight);
+			// 		const vec3 rWo = toLight / rDist;
+			// 		const float dotNL = max(dot(reflNormal, rWo), 0.0);
+			// 		if (dotNL <= 0.0) { continue; }
+			// 		rayQueryEXT shadowRq;
+			// 		rayQueryInitializeEXT(
+			// 			shadowRq,
+			// 			vkofTlas,
+			// 			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
+			// 			0xFFu,
+			// 			reflPos + reflNormal * 0.001f,
+			// 			0.001f,
+			// 			rWo,
+			// 			rDist - 0.001f
+			// 		);
+			// 		rayQueryProceedEXT(shadowRq);
+			// 		if (
+			// 			rayQueryGetIntersectionTypeEXT(shadowRq, true)
+			// 			!= gl_RayQueryCommittedIntersectionNoneEXT
+			// 		) {
+			// 			continue;
+			// 		}
+			// 		const float distNorm = rDist / rlight.radius;
+			// 		const float falloff = (
+			// 			clamp(
+			// 				1.0 - distNorm * distNorm * distNorm * distNorm,
+			// 				0.0, 1.0
+			// 			)
+			// 		);
+			// 		const float atten = (falloff * falloff) / (rDist * rDist + 1.0);
+			// 		reflIrradiance += (
+			// 			reflMat.baseColor.rgb * dotNL * atten * rlight.color
+			// 		);
+			// 	}
+			// }
 			reflIrradiance += (
 				reflMat.baseColor.rgb * sampleProbeIrradiance(reflPos, reflNormal)
 			);
 			reflIrradiance += reflMat.emissive;
 			reflColor = reflIrradiance;
 		} else {
-			reflColor = sampleSky(reflDir, dbg.sunDir, dbg.skyTurbidity);
+			reflColor = (
+				sampleSky(reflDir, dbg.sunDir, dbg.skyTurbidity, dbg.skyIntensity)
+			);
 		}
 
 		// -- fresnel
@@ -556,4 +619,29 @@ void main() {
 	);
 
 	// -- write out 'previous frame' data
+	imageStore(
+		vkofImages[pc.resolve.prevFrameNormalStorageHandle],
+		coord,
+		vec4(worldNormal, 1.0)
+	);
+	// might not need to store depth due to 2pass occlusion storing depth, just
+	// need to see if its available or need to make an extra copy etc
+	const vec4 clipPos = pc.global.viewProj * vec4(worldPos, 1.0);
+	imageStore(
+		vkofImages[pc.resolve.prevFrameDepthStorageHandle],
+		coord,
+		vec4(clipPos.z / clipPos.w, 0.0, 0.0, 1.0)
+	);
+	// TODO store the specular component, FOR NOW ITS JUST HDR but it's wrong
+	imageStore(
+		vkofImages[pc.resolve.prevFrameSpecularStorageHandle],
+		coord,
+		vec4(hdr, 1.0f)
+	);
+	// TODO store the moment but this is not AVAILABLE YET TODO
+	imageStore(
+		vkofImages[pc.resolve.prevFrameMomentStorageHandle],
+		coord,
+		vec4(0.0, 0.0, 0.0, 1.0)
+	);
 }

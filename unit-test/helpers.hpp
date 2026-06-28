@@ -13,19 +13,8 @@
 namespace test {
 
 // ---------------------------------------------------------------------------
-// slice helpers — cast a POD struct to a byte slice
-// ---------------------------------------------------------------------------
-
-template <typename T>
-inline srat::slice<u8 const> as_bytes(T const & value) {
-	return srat::slice<u8 const>(
-		reinterpret_cast<u8 const *>(&value),
-		sizeof(T)
-	);
-}
-
-// ---------------------------------------------------------------------------
 // dispatch — submit one compute render-node and return immediately.
+// groupX/Y/Z are exact group counts (already divided by local_size).
 // The GPU work is not yet complete when this returns; call readback() (which
 // uses vkQueueWaitIdle internally) to drain the queue before inspecting data.
 // ---------------------------------------------------------------------------
@@ -35,23 +24,21 @@ inline void dispatch(
 	vkof::Pipeline pipeline,
 	Push const & push,
 	u32 groupX,
-	u32 groupY = 1,
-	u32 groupZ = 1
+	u32 groupY = 1u,
+	u32 groupZ = 1u
 ) {
 	vkof::RenderNode node = vkof::render_node_create(
 		{ .queue = vkof::CommandQueue::compute }
 	);
-	srat::slice<u8 const> const pushBytes = as_bytes(push);
 	vkof::render_node_callback({
 		.node = node,
 		.callback = [&](vkof::CommandBuffer const & cmd) {
 			vkof::cmd_dispatch({
-				.cmd		  = cmd,
-				.pipeline	 = pipeline,
-				.pushconstant = pushBytes,
-				.groupCountX  = groupX,
-				.groupCountY  = groupY,
-				.groupCountZ  = groupZ,
+				.cmd = cmd,
+				.pipeline = pipeline,
+				.pushconstant = srat::slice_as_bytes(push),
+				.threadgroupSize = u32v3{ 1u, 1u, 1u },
+				.invocationCount = u32v3{ groupX, groupY, groupZ },
 			});
 		},
 	});

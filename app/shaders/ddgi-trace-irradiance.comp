@@ -55,7 +55,7 @@ void traceRay(const vec3 rayDir) {
 	);
 	if (!hit) {
 		sharedRays[gl_LocalInvocationIndex].irradiance = (
-			sampleSky(rayDir, dbg.sunDir, dbg.skyTurbidity)
+			sampleSky(rayDir, dbg.sunDir, dbg.skyTurbidity, dbg.skyIntensity)
 		);
 		return;
 	}
@@ -149,7 +149,7 @@ void traceRay(const vec3 rayDir) {
 		// -- sun contribution at bounce hit
 		if (dbg.sunIntensity > 0.0) {
 			const float dotNL = max(dot(worldNormal, dbg.sunDir), 0.0);
-			if (dotNL > 0.0) {
+			if (dotNL > 0.0 && dbg.sunDir.y > 0.0) {
 				rayQueryEXT sunRq;
 				rayQueryInitializeEXT(
 					sunRq,

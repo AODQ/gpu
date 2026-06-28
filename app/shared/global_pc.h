@@ -35,6 +35,7 @@ struct GpuDebugPC {
 	f32 mipLodOverride;
 	f32v3 sunDir;
 	f32 skyTurbidity;
+	f32 skyIntensity;
 	f32 sunIntensity;
 };
 

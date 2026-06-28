@@ -112,6 +112,7 @@ Tests use **doctest v2.4.11** and the `vkof::init_headless()` path — no window
 - **`comments`** never place a comment on the same line as code. comments always go on their own line, above the code they describe.
 - **`indent parameter blocks`** if a list of items -- for a function call, function signature, if statement, etc -- breaks into multiple lines, then break into a new line and indent the block. Do not ever align them.
 - **`multi-line expression wrapping`** when breaking a long expression across lines, the outer parens must wrap the *entire* expression including any trailing operator, division, or comparison. Nothing is left outside the closing paren. Example — wrong: `return vec3(...\n) / 255.0;` — correct: `return (\n    vec3(...) / 255.0\n);`
+- **`numeric literal suffixes`** always suffix integer literals with `u` (`4u`, `0u`, `1u`) and float literals with `f` (`0.0f`, `1.0f`, `255.0f`) in both C++ and GLSL. Never use bare unsuffixed literals.
 
 ### C++ idioms
 

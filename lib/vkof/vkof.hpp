@@ -265,11 +265,50 @@ namespace vkof
 		CommandBuffer cmd;
 		Pipeline pipeline;
 		srat::slice<u8 const> pushconstant;
-		u32 groupCountX;
-		u32 groupCountY;
-		u32 groupCountZ;
+		u32v3 threadgroupSize;
+		u32v3 invocationCount;
 	};
 	void cmd_dispatch(CmdDispatch const & dispatch);
+
+	template<typename PushT>
+	struct CmdDispatchPushconst {
+		CommandBuffer cmd;
+		Pipeline pipeline;
+		PushT push;
+		u32v3 threadgroupSize;
+		u32v3 invocationCount;
+	};
+	template<typename PushT>
+	inline void cmd_dispatch_pushconst(CmdDispatchPushconst<PushT> const & info)
+	{
+		cmd_dispatch({
+			.cmd = info.cmd,
+			.pipeline = info.pipeline,
+			.pushconstant = srat::slice_as_bytes(info.push),
+			.threadgroupSize = info.threadgroupSize,
+			.invocationCount = info.invocationCount,
+		});
+	}
+
+	template<typename PushT>
+	struct CmdDrawPushconst {
+		CommandBuffer cmd;
+		Pipeline pipeline;
+		PushT push;
+		u32 vertexCount;
+		u32 instanceCount;
+	};
+	template<typename PushT>
+	inline void cmd_draw_pushconst(CmdDrawPushconst<PushT> const & info)
+	{
+		cmd_draw({
+			.cmd = info.cmd,
+			.pipeline = info.pipeline,
+			.pushconstant = srat::slice_as_bytes(info.push),
+			.vertexCount = info.vertexCount,
+			.instanceCount = info.instanceCount,
+		});
+	}
 
 	struct CmdCopyImage {
 		CommandBuffer cmd;

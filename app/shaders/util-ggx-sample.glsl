@@ -31,8 +31,8 @@ void ggxBuildFrame(const vec3 N, out vec3 T, out vec3 B) {
 }
 
 // sample a GGX-distributed half-vector in world space
-// u: uniform [0,1]² sample
-// alpha: GGX roughness (linearRoughness², not perceptual roughness)
+// u: uniform [0,1] sample
+// alpha: GGX roughness (linearRoughness)
 // N: surface normal
 vec3 ggxSampleH(const vec2 u, const float alpha, const vec3 N) {
 	const float a2 = alpha * alpha;
@@ -64,8 +64,8 @@ float ggxReflectPdf(const float alpha, const float dotNH, const float dotVH) {
 // sample a reflection direction with GGX importance sampling
 // incident: direction FROM camera TOWARD surface (normalize(worldPos - camPos))
 // N: surface normal
-// alpha: GGX roughness (linearRoughness², not perceptual roughness)
-// u: uniform [0,1]² sample
+// alpha: GGX roughness (linearRoughness^2, not perceptual roughness)
+// u: uniform [0,1] sample
 // outPdf: output PDF for the sampled direction (0 if below-surface reflection)
 vec3 ggxSampleReflect(
 	const vec3 incident,

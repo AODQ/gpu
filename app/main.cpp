@@ -13,6 +13,10 @@
 #include <ImGuizmo.h>
 #include <backends/imgui_impl_glfw.h>
 #include <GLFW/glfw3.h>
+#include <rapidjson/document.h>
+#include <rapidjson/filereadstream.h>
+#include <rapidjson/filewritestream.h>
+#include <rapidjson/prettywriter.h>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -32,7 +36,8 @@ static float sAnisotropy = 16.0f;
 static float sAnisotropyPending = 16.0f;
 static float sExposure = 1.0f;
 static float sSkyTurbidity = 1.7f;
-static float sSkyTimeScale = 0.05f;
+static float sSkyIntensity = 1.7f;
+static float sSkySunAngle = 0.05f;
 static float sSunIntensity = 1.0f;
 static bool sFpMode = false;
 static float sFlyCamSpeed = 0.05f;
@@ -40,6 +45,10 @@ static std::optional<u32> sSelected;
 static std::vector<u32> sDrawToEntityIdx;
 static ImGuizmo::OPERATION sGizmoOp = ImGuizmo::TRANSLATE;
 static bool sShowDdgiProbes = false;
+static bool sSingleModelView = false;
+static std::string sCurrentModelName;
+static std::unordered_map<std::string, u32> sAssetRatings;
+static std::filesystem::path sRatingsPath;
 
 using Clock = std::chrono::steady_clock;
 using Ms = std::chrono::duration<double, std::milli>;
@@ -133,7 +142,9 @@ DdgiVolume ddgi_volume_create(u32v3 const probeCounts)
 
 void ddgi_volume_destroy(DdgiVolume & dv)
 {
-	if (dv.irradianceImguiId) { vkof::image_imgui_id_destroy(dv.irradianceImguiId); }
+	if (dv.irradianceImguiId) {
+		vkof::image_imgui_id_destroy(dv.irradianceImguiId);
+	}
 	if (dv.depthImguiId) { vkof::image_imgui_id_destroy(dv.depthImguiId); }
 	vkof::image_destroy(dv.imageIrradiance);
 	vkof::image_destroy(dv.imageDepth);
@@ -157,7 +168,11 @@ struct SpecularHistory
 	u32 specularStorageHandle[2] { 0u, 0u };
 	u32 momentSamplerHandle[2] { 0u, 0u };
 	u32 momentStorageHandle[2] { 0u, 0u };
+	vkof::Image depthImage {};
+	u32 depthSamplerHandle { 0u };
+	u32 depthStorageHandle { 0u };
 	ImTextureID normalImguiId { nullptr };
+	ImTextureID depthImguiId { nullptr };
 	ImTextureID specularImguiId[2] { nullptr, nullptr };
 	ImTextureID momentImguiId[2] { nullptr, nullptr };
 };
@@ -171,6 +186,14 @@ SpecularHistory specular_history_create(u32 const width, u32 const height)
 		.height = height,
 		.depth = 1u,
 		.format = vkof::ImageFormat::r16g16b16a16_sfloat,
+		.mipLevels = 1u,
+		.optInitialData = {},
+	});
+	sh.depthImage = vkof::image_create({
+		.width = width,
+		.height = height,
+		.depth = 1u,
+		.format = vkof::ImageFormat::r32_float,
 		.mipLevels = 1u,
 		.optInitialData = {},
 	});
@@ -210,6 +233,14 @@ SpecularHistory specular_history_create(u32 const width, u32 const height)
 		.image = sh.normalImage,
 		.mipLevel = 0u,
 	});
+	sh.depthSamplerHandle = vkof::image_sampler_handle({
+		.image = sh.depthImage,
+		.sampler = sh.commonSampler,
+	});
+	sh.depthStorageHandle = vkof::image_storage_handle({
+		.image = sh.depthImage,
+		.mipLevel = 0u,
+	});
 	for (u32 i = 0u; i < 2u; ++i) {
 		sh.specularSamplerHandle[i] = vkof::image_sampler_handle({
 			.image = sh.specularImage[i],
@@ -237,6 +268,9 @@ void specular_history_destroy(SpecularHistory & sh)
 	if (sh.normalImguiId) {
 		vkof::image_imgui_id_destroy(sh.normalImguiId);
 	}
+	if (sh.depthImguiId) {
+		vkof::image_imgui_id_destroy(sh.depthImguiId);
+	}
 	for (u32 i = 0u; i < 2u; ++i) {
 		if (sh.specularImguiId[i]) {
 			vkof::image_imgui_id_destroy(sh.specularImguiId[i]);
@@ -246,6 +280,7 @@ void specular_history_destroy(SpecularHistory & sh)
 		}
 	}
 	vkof::image_destroy(sh.normalImage);
+	vkof::image_destroy(sh.depthImage);
 	for (u32 i = 0u; i < 2u; ++i) {
 		vkof::image_destroy(sh.specularImage[i]);
 		vkof::image_destroy(sh.momentImage[i]);
@@ -268,8 +303,8 @@ struct DdgiSystem
 	DdgiCascade cascades[skMaxDdgiCascades] {};
 	u32 cascadeCount { 3u };
 	u32v3 probeCounts { 16u, 16u, 16u };
-	f32 probeSpacing { 2.0f };
-	f32 cascadeScale { 8.0f };
+	f32 probeSpacing { 0.5f };
+	f32 cascadeScale { 10.0f };
 	bool dirty { true };
 	bool frozen { false };
 };
@@ -291,6 +326,48 @@ struct LoadedModel
 	f32v3 boundsMin;
 	f32v3 boundsMax;
 };
+
+static std::unordered_map<std::string, u32> ratings_load(
+	std::filesystem::path const & path
+) {
+	std::unordered_map<std::string, u32> ratings;
+	FILE * f = fopen(path.c_str(), "r");
+	if (!f) { return ratings; }
+	char buf[65536];
+	rapidjson::FileReadStream stream(f, buf, sizeof(buf));
+	rapidjson::Document doc;
+	doc.ParseStream(stream);
+	fclose(f);
+	if (doc.HasParseError() || !doc.IsObject()) { return ratings; }
+	if (!doc.HasMember("ratings") || !doc["ratings"].IsObject()) { return ratings; }
+	for (auto const & member : doc["ratings"].GetObject()) {
+		if (member.value.IsUint()) {
+			ratings[member.name.GetString()] = member.value.GetUint();
+		}
+	}
+	return ratings;
+}
+
+static void ratings_save(
+	std::filesystem::path const & path,
+	std::unordered_map<std::string, u32> const & ratings
+) {
+	FILE * f = fopen(path.c_str(), "w");
+	if (!f) { return; }
+	char buf[65536];
+	rapidjson::FileWriteStream stream(f, buf, sizeof(buf));
+	rapidjson::PrettyWriter<rapidjson::FileWriteStream> writer(stream);
+	writer.StartObject();
+	writer.Key("ratings");
+	writer.StartObject();
+	for (auto const & [name, rating] : ratings) {
+		writer.Key(name.c_str());
+		writer.Uint(rating);
+	}
+	writer.EndObject();
+	writer.EndObject();
+	fclose(f);
+}
 
 int32_t main(int32_t const argc, char const * const * const argv) {
 	char const * gltfPath = nullptr;
@@ -338,8 +415,11 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 	std::filesystem::path const repoDir = appDir.parent_path();
 
 	AssetLibrary const assetLib = asset_library_create(assetsDir);
+	sRatingsPath = assetsDir / "index.json";
+	sAssetRatings = ratings_load(sRatingsPath);
 
 	bool const singleModelMode = (gltfPath != nullptr && scenePath == nullptr);
+	if (!gltfPath && !scenePath) { sSingleModelView = true; }
 	std::filesystem::path sceneFilePath = [&]() -> std::filesystem::path {
 		if (scenePath) { return std::filesystem::path(scenePath); }
 		if (singleModelMode) {
@@ -581,7 +661,9 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 
 		{
 			static bool sPrevEsc = false;
-			bool const currEsc = (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS);
+			bool const currEsc = (
+				(glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
+			);
 			if (currEsc && !sPrevEsc) {
 				if (sFpMode) {
 					sFpMode = false;
@@ -628,7 +710,9 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			static bool sPrevT = false, sPrevR = false, sPrevGrave = false;
 			bool const currT = glfwGetKey(window, GLFW_KEY_T) == GLFW_PRESS;
 			bool const currR = glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS;
-			bool const currGrave = glfwGetKey(window, GLFW_KEY_GRAVE_ACCENT) == GLFW_PRESS;
+			bool const currGrave = (
+				glfwGetKey(window, GLFW_KEY_GRAVE_ACCENT) == GLFW_PRESS
+			);
 			if (currT && !sPrevT) { sGizmoOp = ImGuizmo::TRANSLATE; }
 			if (currR && !sPrevR) { sGizmoOp = ImGuizmo::ROTATE; }
 			if (currGrave && !sPrevGrave) { sSelected = std::nullopt; }
@@ -647,7 +731,9 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			f32v3 bboxMin = { 1e30f, 1e30f, 1e30f };
 			f32v3 bboxMax = { -1e30f, -1e30f, -1e30f };
 			for (scene::Entity const & entity : sceneDesc.entities) {
-				if (!std::holds_alternative<scene::EntityInstance>(entity.data)) { continue; }
+				if (!std::holds_alternative<scene::EntityInstance>(entity.data)) {
+					continue;
+				}
 				bboxMin.x = std::min(bboxMin.x, entity.position.x);
 				bboxMin.y = std::min(bboxMin.y, entity.position.y);
 				bboxMin.z = std::min(bboxMin.z, entity.position.z);
@@ -672,6 +758,18 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 				|| glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS
 			)
 		);
+		bool const cameraMoving = (
+			fpLookActive
+			|| (
+				!sFpMode
+				&& !ImGui::GetIO().WantCaptureMouse
+				&& !ImGuizmo::IsUsing()
+				&& (
+					ImGui::IsMouseDragging(ImGuiMouseButton_Left)
+					|| ImGui::IsMouseDragging(ImGuiMouseButton_Middle)
+				)
+			)
+		);
 		if (!fpLookActive && prevFpLookActive) {
 			glfwGetCursorPos(window, &prevMouseX, &prevMouseY);
 		}
@@ -684,12 +782,24 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 		if (sFpMode && !ImGui::GetIO().WantCaptureKeyboard) {
 			f32 const speed = sFlyCamSpeed * sceneBboxExtent * dt;
 			f32v3 localDelta = {};
-			if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) { localDelta.z += speed; }
-			if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) { localDelta.z -= speed; }
-			if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) { localDelta.x += speed; }
-			if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) { localDelta.x -= speed; }
-			if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS) { localDelta.y += speed; }
-			if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) { localDelta.y -= speed; }
+			if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) {
+				localDelta.z += speed;
+			}
+			if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) {
+				localDelta.z -= speed;
+			}
+			if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) {
+				localDelta.x += speed;
+			}
+			if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) {
+				localDelta.x -= speed;
+			}
+			if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS) {
+				localDelta.y += speed;
+			}
+			if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) {
+				localDelta.y -= speed;
+			}
 			srat::camera_fp_move(fpCam, localDelta);
 		} else if (!sFpMode && !ImGui::GetIO().WantCaptureMouse) {
 			if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS) {
@@ -730,10 +840,9 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			&& ImGui::IsMouseReleased(ImGuiMouseButton_Left)
 			&& !ImGui::IsMouseDragging(ImGuiMouseButton_Left)
 		);
-		f32 const sunAngle = (f32)glfwGetTime() * sSkyTimeScale;
 		f32v3 const sunDir = f32v3_normalize({
-			cosf(sunAngle),
-			sinf(sunAngle) * 0.8f + 0.2f,
+			cosf(sSkySunAngle*6.283185f),
+			sinf(sSkySunAngle*6.283185f) * 0.8f + 0.2f,
 			0.3f,
 		});
 		GpuDebugPC const debugPC {
@@ -746,14 +855,13 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			.mipLodOverride = sMipLodOverride,
 			.sunDir = sunDir,
 			.skyTurbidity = sSkyTurbidity,
+			.skyIntensity = sSkyIntensity,
 			.sunIntensity = sSunIntensity,
 		};
 		vkof::buffer_upload({
 			.buffer = debugPcBuffer,
 			.byteOffset = 0u,
-			.data = srat::slice<u8 const>(
-				reinterpret_cast<u8 const *>(&debugPC), sizeof(debugPC)
-			),
+			.data = srat::slice_as_bytes(debugPC),
 		});
 
 		// -- build gpu lights from entities
@@ -904,14 +1012,12 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			vkof::buffer_upload({
 				.buffer = ddgiGridBuffer,
 				.byteOffset = 0u,
-				.data = srat::slice<u8 const>(
-					reinterpret_cast<u8 const *>(&gpuCascades),
-					sizeof(gpuCascades)
-				),
+				.data = srat::slice_as_bytes(gpuCascades),
 			});
 		}
 
-		// -- compute selected draw index for gpu highlighting (uses previous frame's sDrawToEntityIdx)
+		// -- compute selected draw index for gpu highlighting
+		// (uses previous frame's sDrawToEntityIdx)
 		u32 selectedDrawIdx = 0xFFFFFFFFu;
 		if (sSelected.has_value()) {
 			u32 const selEntityIdx = *sSelected;
@@ -957,20 +1063,79 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			ImGuizmo::SetRect(0.0f, 0.0f, io.DisplaySize.x, io.DisplaySize.y);
 		}
 
-		if (char const * uri = asset_library_imgui(assetLib)) {
+		if (char const * uri = asset_library_imgui(assetLib, sAssetRatings)) {
 			std::string const relPath = std::filesystem::relative(
 				std::filesystem::path(uri), repoDir
 			).string();
-			scene::desc_add_entity(
-				sceneDesc,
-				scene::EntityInstance {
-					.filename = relPath,
-					.rotation = {},
-					.scale = 1.0f,
-				},
-				sFpMode ? fpCam.position : srat::camera_orbit_eye(cam)
-			);
-			fnVerifyModelLoaded(relPath);
+			if (sSingleModelView) {
+				vkof::device_wait_idle();
+				for (auto & [filename, modelIndex] : loadedModels) {
+					LoadedModel const & model = modelList[modelIndex];
+					mor::scene_destroy(model.scene);
+					mor::scene_gpu_destroy(model.gpuScene);
+					vkof::blas_destroy(model.blas);
+				}
+				loadedModels.clear();
+				modelList.clear();
+				sceneDesc.entities.clear();
+				sSelected = std::nullopt;
+				scene::desc_add_entity(
+					sceneDesc,
+					scene::EntityInstance {
+						.filename = relPath,
+						.rotation = {},
+						.scale = 1.0f,
+					},
+					{}
+				);
+				fnVerifyModelLoaded(relPath);
+				sCurrentModelName = (
+					std::filesystem::path(relPath)
+						.parent_path()
+						.parent_path()
+						.filename()
+						.string()
+				);
+				if (sAssetRatings.find(sCurrentModelName) == sAssetRatings.end()) {
+					sAssetRatings[sCurrentModelName] = 0u;
+					ratings_save(sRatingsPath, sAssetRatings);
+				}
+				cam.azimuth = 0.0f;
+				cam.elevation = 0.3f;
+				auto const it = loadedModels.find(relPath);
+				if (it != loadedModels.end()) {
+					LoadedModel const & lm = modelList[it->second];
+					f32v3 const center = {
+						(lm.boundsMin.x + lm.boundsMax.x) * 0.5f,
+						(lm.boundsMin.y + lm.boundsMax.y) * 0.5f,
+						(lm.boundsMin.z + lm.boundsMax.z) * 0.5f,
+					};
+					f32v3 const diag = {
+						lm.boundsMax.x - lm.boundsMin.x,
+						lm.boundsMax.y - lm.boundsMin.y,
+						lm.boundsMax.z - lm.boundsMin.z,
+					};
+					f32 const halfDiag = (
+						f32v3_length(diag) * 0.5f
+					);
+					cam.target = center;
+					cam.distance = halfDiag / tanf(cam.fovY * 0.5f);
+				} else {
+					cam.target = { 0.0f, 0.0f, 0.0f };
+					cam.distance = 5.0f;
+				}
+			} else {
+				scene::desc_add_entity(
+					sceneDesc,
+					scene::EntityInstance {
+						.filename = relPath,
+						.rotation = {},
+						.scale = 1.0f,
+					},
+					sFpMode ? fpCam.position : srat::camera_orbit_eye(cam)
+				);
+				fnVerifyModelLoaded(relPath);
+			}
 		}
 
 		if (char const * msg = vkof::probe_message()) {
@@ -1012,6 +1177,34 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 		ImGui::Separator();
 
 		ImGui::Text("fps: %.1f", ImGui::GetIO().Framerate);
+		ImGui::Separator();
+		ImGui::BeginDisabled();
+		ImGui::Checkbox("single model view", &sSingleModelView);
+		ImGui::EndDisabled();
+		if (sSingleModelView && !sCurrentModelName.empty()) {
+			static char const * const kRatingLabels[] = { "1", "2", "3", "4", "5" };
+			ImGui::Text("rating:");
+			ImGui::SameLine();
+			u32 const cur = (
+				sAssetRatings.count(sCurrentModelName)
+				? sAssetRatings.at(sCurrentModelName)
+				: 0u
+			);
+			for (u32 i = 1u; i <= 5u; ++i) {
+				if (i > 1u) { ImGui::SameLine(); }
+				if (cur == i) {
+					ImGui::PushStyleColor(
+						ImGuiCol_Button,
+						ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive)
+					);
+				}
+				if (ImGui::Button(kRatingLabels[i - 1u])) {
+					sAssetRatings[sCurrentModelName] = i;
+					ratings_save(sRatingsPath, sAssetRatings);
+				}
+				if (cur == i) { ImGui::PopStyleColor(); }
+			}
+		}
 
 		// -- selected entity panel
 		if (
@@ -1028,7 +1221,9 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 					!ImGui::GetIO().WantCaptureKeyboard
 					&& glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS
 				);
-				bool const focusPressed = ImGui::Button("focus") || (currF && !sPrevF);
+				bool const focusPressed = (
+					ImGui::Button("focus") || (currF && !sPrevF)
+				);
 				sPrevF = currF;
 				if (focusPressed) {
 					cam.target = scene::entity_focus_target(selEntity);
@@ -1046,6 +1241,22 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			if (ImGui::Button("remove")) {
 				removeEntityIdx = *sSelected;
 				sSelected = std::nullopt;
+			}
+
+			{
+				u32 displayIdx = 0u;
+				u32 const selIdx = *sSelected;
+				for (u32 i = 0u; i < selIdx; ++i) {
+					if (
+						sceneDesc.entities[i].data.index()
+						== selEntity.data.index()
+					) {
+						++displayIdx;
+					}
+				}
+				ImGui::TextUnformatted(
+					scene::entity_label(selEntity, displayIdx).c_str()
+				);
 			}
 
 			// -- position (shared across all entity types)
@@ -1091,7 +1302,7 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			);
 
 			// -- gizmo: translate for all; also rotate for instances (T/R keys)
-			{
+			if (!cameraMoving) {
 				f32m44 const viewMat = (
 					sFpMode
 					? srat::camera_fp_view(fpCam)
@@ -1102,7 +1313,7 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 					? srat::camera_fp_proj(fpCam)
 					: srat::camera_orbit_proj(cam)
 				);
-				// undo Vulkan Y-flip so ImGuizmo (OpenGL convention) renders correctly
+				// undo Vulkan Y-flip since ImGuizmo is OpenGL convention
 				projMat.m[5] = -projMat.m[5];
 				ImGuizmo::OPERATION const gizmoOp = (
 					std::holds_alternative<scene::EntityInstance>(selEntity.data)
@@ -1110,7 +1321,9 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 					: ImGuizmo::TRANSLATE
 				);
 				f32m44 matrix;
-				if (auto * ei = std::get_if<scene::EntityInstance>(&selEntity.data)) {
+				if (
+					auto * ei = std::get_if<scene::EntityInstance>(&selEntity.data)
+				) {
 					matrix = scene::entity_model_matrix(selEntity, *ei);
 				} else {
 					matrix = f32m44_translate(
@@ -1128,7 +1341,11 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 				)) {
 					f32 const * m = matrix.m.ptr();
 					selEntity.position = { m[12], m[13], m[14] };
-					if (auto * ei = std::get_if<scene::EntityInstance>(&selEntity.data)) {
+					if (
+						auto * ei = (
+							std::get_if<scene::EntityInstance>(&selEntity.data)
+						)
+					) {
 						if (sGizmoOp == ImGuizmo::ROTATE) {
 							f32 const invS = (
 								1.0f / sqrtf(m[0]*m[0] + m[1]*m[1] + m[2]*m[2])
@@ -1211,11 +1428,25 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			ImGui::SliderFloat("mip LOD bias", &sMipLodBias, -4.0f, 4.0f, "%.1f");
 		}
 		ImGui::DragFloat("exposure", &sExposure, 0.01f, 0.0f, 10.0f, "%.2f");
-		ImGui::SliderFloat("turbidity", &sSkyTurbidity, 1.0f, 10.0f, "%.1f");
-		ImGui::DragFloat("sun speed", &sSkyTimeScale, 0.001f, 0.0f, 1.0f, "%.3f");
-		ImGui::DragFloat("sun intensity", &sSunIntensity, 0.01f, 0.0f, 10.0f, "%.2f");
-		ImGui::SliderFloat("anisotropy", &sAnisotropyPending, 1.0f, 16.0f, "%.0f");
-		if (ImGui::IsItemDeactivatedAfterEdit() && sAnisotropyPending != sAnisotropy) {
+		ImGui::SliderFloat("turbidity", &sSkyTurbidity, 1.7f, 5.0f, "%.1f");
+		ImGui::SliderFloat(
+			"sky intensity", &sSkyIntensity, 0.0f, 100.0f,
+			"%.1f",
+			ImGuiSliderFlags_Logarithmic
+			);
+		ImGui::SliderFloat("sun angle", &sSkySunAngle, 0.0f, 1.0f, "%.3f");
+		ImGui::SliderFloat(
+			"sun intensity", &sSunIntensity, 0.0f, 1000.0f,
+			"%.2f",
+			ImGuiSliderFlags_Logarithmic
+		);
+		ImGui::SliderFloat(
+			"anisotropy", &sAnisotropyPending, 1.0f, 16.0f, "%.0f"
+		);
+		if (
+			ImGui::IsItemDeactivatedAfterEdit()
+			&& sAnisotropyPending != sAnisotropy
+		) {
 			sAnisotropy = sAnisotropyPending;
 			vkof::device_wait_idle();
 			for (auto const & [filename, modelIdx] : loadedModels) {
@@ -1246,7 +1477,12 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 						sceneDesc.entities[i], instDisplayIdx
 					);
 					bool const sel = sSelected.has_value() && *sSelected == i;
-					if (sel) { ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive)); }
+					if (sel) {
+						ImGui::PushStyleColor(
+							ImGuiCol_Button,
+							ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive)
+						);
+					}
 					if (ImGui::Button(label.c_str())) { sSelected = i; }
 					if (sel) { ImGui::PopStyleColor(); }
 					ImGui::PopID();
@@ -1286,7 +1522,12 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 						sceneDesc.entities[i], lightDisplayIdx
 					);
 					bool const sel = sSelected.has_value() && *sSelected == i;
-					if (sel) { ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive)); }
+					if (sel) {
+						ImGui::PushStyleColor(
+							ImGuiCol_Button,
+							ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive)
+						);
+					}
 					if (ImGui::Button(label.c_str())) { sSelected = i; }
 					if (sel) { ImGui::PopStyleColor(); }
 					ImGui::PopID();
@@ -1373,6 +1614,12 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 						.sampler = sSpecularHistory.commonSampler,
 					})
 				);
+				sSpecularHistory.depthImguiId = (
+					vkof::image_imgui_id({
+						.image = sSpecularHistory.depthImage,
+						.sampler = sSpecularHistory.commonSampler,
+					})
+				);
 				for (u32 i = 0u; i < 2u; ++i) {
 					sSpecularHistory.specularImguiId[i] = (
 						vkof::image_imgui_id({
@@ -1393,6 +1640,8 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			f32 const h = w * (f32)kScreenH / (f32)kScreenW;
 			ImGui::Text("prevFrameNormal");
 			ImGui::Image(sSpecularHistory.normalImguiId, ImVec2(w, h));
+			ImGui::Text("prevFrameDepth");
+			ImGui::Image(sSpecularHistory.depthImguiId, ImVec2(w, h));
 			ImGui::Text("prevFrameSpecular");
 			ImGui::Image(sSpecularHistory.specularImguiId[readIdx], ImVec2(w, h));
 			ImGui::Text("prevFrameMoment");
@@ -1494,7 +1743,9 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			vkof::RenderNode const drawNode = vkof::render_node_create({
 				.queue = vkof::CommandQueue::graphics,
 			});
-			static constexpr f32 kVisibilityClearColor[] = { 0.0f, 0.0f, 0.0f, 0.0f };
+			static constexpr f32 kVisibilityClearColor[] = {
+				0.0f, 0.0f, 0.0f, 0.0f
+			};
 			static constexpr f32 kDepthClear = 1.0f;
 			vkof::render_node_attachment_color({
 				.node = drawNode,
@@ -1516,7 +1767,11 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 				.callback = [&](vkof::CommandBuffer const & cmd) {
 					u32 drawIdx = 0u;
 					sDrawToEntityIdx.clear();
-					for (u32 entityIdx = 0u; entityIdx < (u32)sceneDesc.entities.size(); ++entityIdx) {
+					for (
+						u32 entityIdx = 0u;
+						entityIdx < (u32)sceneDesc.entities.size();
+						++entityIdx
+					) {
 						scene::Entity const & entity = sceneDesc.entities[entityIdx];
 						auto * ei = std::get_if<scene::EntityInstance>(&entity.data);
 						if (!ei) { continue; }
@@ -1539,14 +1794,12 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 							.meshletTris = bufs.meshletTris,
 							.modelMatrix = scene::entity_model_matrix(entity, *ei),
 						};
-						vkof::cmd_draw({
+						vkof::cmd_draw_pushconst(vkof::CmdDrawPushconst {
 							.cmd = cmd,
 							.pipeline = visibilityPipeline,
-							.pushconstant = srat::slice<u8 const>(
-								reinterpret_cast<u8 const *>(&drawPC), sizeof(drawPC)
-							),
+							.push = drawPC,
 							.vertexCount = count,
-							.instanceCount = 1,
+							.instanceCount = 1u,
 						});
 						++drawIdx;
 					}
@@ -1578,11 +1831,12 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 						scene::Entity const & entity = (
 							sceneDesc.entities[sDrawToEntityIdx[di]]
 						);
-						auto * ei = std::get_if<scene::EntityInstance>(&entity.data);
-						if (!ei) { continue; }
-						auto const it = loadedModels.find(ei->filename);
-						if (it == loadedModels.end()) { continue; }
-						LoadedModel const & model = modelList[it->second];
+						scene::EntityInstance const * ei = (
+							std::get_if<scene::EntityInstance>(&entity.data)
+						);
+						LoadedModel const & model = (
+							modelList[loadedModels.at(ei->filename)]
+						);
 						tlasInstances.emplace_back(vkof::TlasInstance {
 							.blas = model.blas,
 							.transform = scene::entity_model_matrix(entity, *ei),
@@ -1601,7 +1855,7 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			});
 			vkof::acceleration_structure_set_tlas(tlas);
 
-			// -- prepare resolve node (declared before ddgi nodes so it can receive persistent image reads)
+			// -- prepare resolve node
 			vkof::RenderNode const resolveNode = (
 				vkof::render_node_create({
 					.queue = vkof::CommandQueue::graphics,
@@ -1648,31 +1902,27 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 					](vkof::CommandBuffer const & cmd) {
 						for (u32 ci = 0u; ci < gpuCascades.count; ++ci) {
 							GpuDdgiGrid const & tracePC = gpuCascades.grids[ci];
-							vkof::cmd_dispatch(vkof::CmdDispatch {
+							vkof::cmd_dispatch_pushconst(vkof::CmdDispatchPushconst {
 								.cmd = cmd,
 								.pipeline = ddgiTraceIrradiancePipeline,
-								.pushconstant = srat::slice<u8 const>(
-									reinterpret_cast<u8 const *>(&tracePC),
-									sizeof(tracePC)
-								),
-								.groupCountX = tracePC.probeCounts.x,
-								.groupCountY = (
-									tracePC.probeCounts.y * tracePC.probeCounts.z
-								),
-								.groupCountZ = 1u,
+								.push = tracePC,
+								.threadgroupSize = u32v3{ 8u, 8u, 1u },
+								.invocationCount = u32v3{
+									tracePC.probeCounts.x * 8u,
+									tracePC.probeCounts.y * tracePC.probeCounts.z * 8u,
+									1u,
+								},
 							});
-							vkof::cmd_dispatch(vkof::CmdDispatch {
+							vkof::cmd_dispatch_pushconst(vkof::CmdDispatchPushconst {
 								.cmd = cmd,
 								.pipeline = ddgiTraceDepthPipeline,
-								.pushconstant = srat::slice<u8 const>(
-									reinterpret_cast<u8 const *>(&tracePC),
-									sizeof(tracePC)
-								),
-								.groupCountX = tracePC.probeCounts.x,
-								.groupCountY = (
-									tracePC.probeCounts.y * tracePC.probeCounts.z
-								),
-								.groupCountZ = 1u,
+								.push = tracePC,
+								.threadgroupSize = u32v3{ 16u, 16u, 1u },
+								.invocationCount = u32v3{
+									tracePC.probeCounts.x * 16u,
+									tracePC.probeCounts.y * tracePC.probeCounts.z * 16u,
+									1u,
+								},
 							});
 						}
 					},
@@ -1690,22 +1940,52 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 				.image = colorTarget,
 				.access = vkof::RenderNodeAccess::write,
 			});
+			u32 const writeIdx = sFrameIndex % 2u;
+			vkof::render_node_add_persistent_image({
+				.node = resolveNode,
+				.image = sSpecularHistory.normalImage,
+				.access = vkof::RenderNodeAccess::write,
+			});
+			vkof::render_node_add_persistent_image({
+				.node = resolveNode,
+				.image = sSpecularHistory.depthImage,
+				.access = vkof::RenderNodeAccess::write,
+			});
+			vkof::render_node_add_persistent_image({
+				.node = resolveNode,
+				.image = sSpecularHistory.specularImage[writeIdx],
+				.access = vkof::RenderNodeAccess::write,
+			});
+			vkof::render_node_add_persistent_image({
+				.node = resolveNode,
+				.image = sSpecularHistory.momentImage[writeIdx],
+				.access = vkof::RenderNodeAccess::write,
+			});
 			vkof::render_node_callback({
 				.node = resolveNode,
 				.callback = [&](vkof::CommandBuffer const & cmd) {
 					GpuResolvePC const resolvePC {
 						.visibilityImageHandle = visibilityHandle,
 						.outputImageHandle = colorHandle,
+						.prevFrameNormalStorageHandle = (
+							sSpecularHistory.normalStorageHandle
+						),
+						.prevFrameDepthStorageHandle = (
+							sSpecularHistory.depthStorageHandle
+						),
+						.prevFrameSpecularStorageHandle = (
+							sSpecularHistory.specularStorageHandle[writeIdx]
+						),
+						.prevFrameMomentStorageHandle = (
+							sSpecularHistory.momentStorageHandle[writeIdx]
+						),
 					};
-					vkof::cmd_dispatch(vkof::CmdDispatch {
+					vkof::cmd_dispatch_pushconst(vkof::CmdDispatchPushconst {
 						.cmd = cmd,
 						.pipeline = resolvePipeline,
-						.pushconstant = srat::slice<u8 const>(
-							reinterpret_cast<u8 const *>(&resolvePC), sizeof(resolvePC)
-						),
-						.groupCountX = (kScreenW + 15) / 16,
-						.groupCountY = (kScreenH + 15) / 16,
-						.groupCountZ = 1,
+						.push = resolvePC,
+						.threadgroupSize = u32v3{ 16u, 16u, 1u },
+						.invocationCount = u32v3{ kScreenW, kScreenH, 1u },
 					});
 				}
 			});
@@ -1716,9 +1996,7 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			};
 			vkof::render_graph_execute({
 				.nodes = srat::slice<vkof::RenderNode const>(allNodes, 4u),
-				.rootPushconstant = srat::slice<u8 const>(
-					reinterpret_cast<u8 const *>(&globalPC), sizeof(globalPC)
-				),
+				.rootPushconstant = srat::slice_as_bytes(globalPC),
 				.finalImage = colorTarget,
 				.debugDrawViewProj = globalPC.viewProj,
 				.debugDrawDepth = depthTarget,
