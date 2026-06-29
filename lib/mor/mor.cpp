@@ -299,9 +299,151 @@ static void load_primitive(
 		} else {
 			materialIndex = (u32)s->materials.size();
 			cgltf_material const & mat = *prim.material;
-			cgltf_pbr_metallic_roughness const & mr = (
-				mat.pbr_metallic_roughness
+			cgltf_pbr_metallic_roughness const & mr = mat.pbr_metallic_roughness;
+
+			f32v3 specularColor = { 1.0f, 1.0f, 1.0f };
+			f32 specularWeight = 1.0f;
+			u32 textureSpecular = 0u;
+			u32 textureSpecularColor = 0u;
+			if (mat.has_specular) {
+				specularColor = {
+					mat.specular.specular_color_factor[0],
+					mat.specular.specular_color_factor[1],
+					mat.specular.specular_color_factor[2],
+				};
+				specularWeight = mat.specular.specular_factor;
+				textureSpecular = load_texture(
+					*s, mat.specular.specular_texture.texture, false
+				);
+				textureSpecularColor = load_texture(
+					*s, mat.specular.specular_color_texture.texture, true
+				);
+			}
+
+			f32 specularIor = 1.5f;
+			if (mat.has_ior) {
+				specularIor = mat.ior.ior;
+			}
+
+			f32 coatWeight = 0.0f;
+			f32 coatRoughness = 0.0f;
+			u32 textureClearcoat = 0u;
+			u32 textureClearcoatRoughness = 0u;
+			if (mat.has_clearcoat) {
+				coatWeight = mat.clearcoat.clearcoat_factor;
+				coatRoughness = mat.clearcoat.clearcoat_roughness_factor;
+				textureClearcoat = load_texture(
+					*s, mat.clearcoat.clearcoat_texture.texture, false
+				);
+				textureClearcoatRoughness = load_texture(
+					*s, mat.clearcoat.clearcoat_roughness_texture.texture, false
+				);
+			}
+
+			f32v3 fuzzColor = { 1.0f, 1.0f, 1.0f };
+			f32 fuzzRoughness = 0.5f;
+			u32 textureFuzz = 0u;
+			if (mat.has_sheen) {
+				fuzzColor = {
+					mat.sheen.sheen_color_factor[0],
+					mat.sheen.sheen_color_factor[1],
+					mat.sheen.sheen_color_factor[2],
+				};
+				fuzzRoughness = mat.sheen.sheen_roughness_factor;
+				textureFuzz = load_texture(
+					*s, mat.sheen.sheen_color_texture.texture, true
+				);
+			}
+
+			f32 subsurfaceWeight = 0.0f;
+			f32v3 subsurfaceColor = { 0.8f, 0.8f, 0.8f };
+			f32 subsurfaceRadius = 1.0f;
+			u32 textureSubsurface = 0u;
+			f32v3 transmissionColor = { 1.0f, 1.0f, 1.0f };
+			f32 transmissionDepth = 0.0f;
+			if (mat.has_volume) {
+				subsurfaceWeight = std::min(mat.volume.thickness_factor, 1.0f);
+				subsurfaceColor = {
+					mat.volume.attenuation_color[0],
+					mat.volume.attenuation_color[1],
+					mat.volume.attenuation_color[2],
+				};
+				subsurfaceRadius = mat.volume.attenuation_distance;
+				textureSubsurface = load_texture(
+					*s, mat.volume.thickness_texture.texture, false
+				);
+				transmissionColor = subsurfaceColor;
+				transmissionDepth = mat.volume.attenuation_distance;
+			}
+
+			f32 transmissionWeight = 0.0f;
+			u32 textureTransmission = 0u;
+			if (mat.has_transmission) {
+				transmissionWeight = mat.transmission.transmission_factor;
+				textureTransmission = load_texture(
+					*s, mat.transmission.transmission_texture.texture, false
+				);
+			}
+
+			f32 thinFilmWeight = 0.0f;
+			f32 thinFilmIor = 1.4f;
+			f32 thinFilmThickness = 0.5f;
+			f32 thinFilmThicknessMin = 100.0f;
+			u32 textureIridescence = 0u;
+			u32 textureIridescenceThickness = 0u;
+			if (mat.has_iridescence) {
+				thinFilmWeight = mat.iridescence.iridescence_factor;
+				thinFilmIor = mat.iridescence.iridescence_ior;
+				thinFilmThickness = mat.iridescence.iridescence_thickness_max;
+				thinFilmThicknessMin = mat.iridescence.iridescence_thickness_min;
+				textureIridescence = load_texture(
+					*s, mat.iridescence.iridescence_texture.texture, false
+				);
+				textureIridescenceThickness = load_texture(
+					*s, mat.iridescence.iridescence_thickness_texture.texture, false
+				);
+			}
+
+			f32 specularRoughnessAnisotropy = 0.0f;
+			f32 specularAnisotropyRotation = 0.0f;
+			u32 textureAnisotropy = 0u;
+			if (mat.has_anisotropy) {
+				specularRoughnessAnisotropy = mat.anisotropy.anisotropy_strength;
+				specularAnisotropyRotation = mat.anisotropy.anisotropy_rotation;
+				textureAnisotropy = load_texture(
+					*s, mat.anisotropy.anisotropy_texture.texture, false
+				);
+			}
+
+			u32 const textureClearcoatNormal = (
+				mat.has_clearcoat
+				? load_texture(
+					*s, mat.clearcoat.clearcoat_normal_texture.texture, false)
+				: 0u
 			);
+			u32 const textureFuzzRoughness = (
+				mat.has_sheen
+				? load_texture(*s, mat.sheen.sheen_roughness_texture.texture, false)
+				: 0u
+			);
+			u32 const textureOcclusion = load_texture(
+				*s, mat.occlusion_texture.texture, false
+			);
+
+			u32 flags = (u32)mat.alpha_mode;
+			if (mat.double_sided) { flags |= 0x4u; }
+			if (mat.unlit) { flags |= 0x8u; }
+
+			f32 transmissionDispersionAbbeNumber = 20.0f;
+			if (mat.has_dispersion && mat.dispersion.dispersion > 0.0f) {
+				transmissionDispersionAbbeNumber = 20.0f / mat.dispersion.dispersion;
+			}
+
+			f32 emissiveLuminance = 1.0f;
+			if (mat.has_emissive_strength) {
+				emissiveLuminance = mat.emissive_strength.emissive_strength;
+			}
+
 			s->materials.push_back({
 				.baseColor = {
 					mr.base_color_factor[0],
@@ -309,13 +451,14 @@ static void load_primitive(
 					mr.base_color_factor[2],
 					mr.base_color_factor[3],
 				},
-				.metallic = mr.metallic_factor,
-				.roughness = mr.roughness_factor,
-				.emissive = {
+				.baseMetalness = mr.metallic_factor,
+				.specularRoughness = mr.roughness_factor,
+				.emissiveColor = {
 					mat.emissive_factor[0],
 					mat.emissive_factor[1],
 					mat.emissive_factor[2],
 				},
+				.emissiveLuminance = emissiveLuminance,
 				.textureBaseColor = load_texture(
 					*s, mr.base_color_texture.texture, true
 				),
@@ -328,7 +471,42 @@ static void load_primitive(
 				.textureEmissive = load_texture(
 					*s, mat.emissive_texture.texture, true
 				),
-				.flags = 0,
+				.specularColor = specularColor,
+				.specularWeight = specularWeight,
+				.textureSpecular = textureSpecular,
+				.textureSpecularColor = textureSpecularColor,
+				.specularIor = specularIor,
+				.coatWeight = coatWeight,
+				.coatRoughness = coatRoughness,
+				.textureClearcoat = textureClearcoat,
+				.textureClearcoatRoughness = textureClearcoatRoughness,
+				.fuzzColor = fuzzColor,
+				.fuzzRoughness = fuzzRoughness,
+				.textureFuzz = textureFuzz,
+				.subsurfaceWeight = subsurfaceWeight,
+				.subsurfaceColor = subsurfaceColor,
+				.subsurfaceRadius = subsurfaceRadius,
+				.textureSubsurface = textureSubsurface,
+				.transmissionWeight = transmissionWeight,
+				.textureTransmission = textureTransmission,
+				.transmissionColor = transmissionColor,
+				.transmissionDepth = transmissionDepth,
+				.thinFilmWeight = thinFilmWeight,
+				.thinFilmIor = thinFilmIor,
+				.thinFilmThickness = thinFilmThickness,
+				.thinFilmThicknessMin = thinFilmThicknessMin,
+				.textureIridescence = textureIridescence,
+				.textureIridescenceThickness = textureIridescenceThickness,
+				.specularRoughnessAnisotropy = specularRoughnessAnisotropy,
+				.specularAnisotropyRotation = specularAnisotropyRotation,
+				.textureAnisotropy = textureAnisotropy,
+				.textureClearcoatNormal = textureClearcoatNormal,
+				.textureFuzzRoughness = textureFuzzRoughness,
+				.textureOcclusion = textureOcclusion,
+				.transmissionDispersionAbbeNumber = transmissionDispersionAbbeNumber,
+				.alphaCutoff = mat.alpha_cutoff,
+				.geometryOpacity = 1.0f,
+				.flags = flags,
 			});
 			s->materialIndices.emplace(prim.material, materialIndex);
 		}
@@ -458,14 +636,50 @@ mor::Scene mor::scene_create() {
 	// index 0 is always the default material; meshlets with no material use it
 	s->materials.push_back({
 		.baseColor = { 1.0f, 1.0f, 1.0f, 1.0f },
-		.metallic = 0.0f,
-		.roughness = 1.0f,
-		.emissive = { 0.0f, 0.0f, 0.0f },
-		.textureBaseColor = 0,
-		.textureNormal = 0,
-		.textureMetallicRoughness = 0,
-		.textureEmissive = 0,
-		.flags = 0,
+		.baseMetalness = 0.0f,
+		.specularRoughness = 1.0f,
+		.emissiveColor = { 0.0f, 0.0f, 0.0f },
+		.emissiveLuminance = 1.0f,
+		.textureBaseColor = 0u,
+		.textureNormal = 0u,
+		.textureMetallicRoughness = 0u,
+		.textureEmissive = 0u,
+		.specularColor = { 1.0f, 1.0f, 1.0f },
+		.specularWeight = 1.0f,
+		.textureSpecular = 0u,
+		.textureSpecularColor = 0u,
+		.specularIor = 1.5f,
+		.coatWeight = 0.0f,
+		.coatRoughness = 0.0f,
+		.textureClearcoat = 0u,
+		.textureClearcoatRoughness = 0u,
+		.fuzzColor = { 1.0f, 1.0f, 1.0f },
+		.fuzzRoughness = 0.5f,
+		.textureFuzz = 0u,
+		.subsurfaceWeight = 0.0f,
+		.subsurfaceColor = { 0.8f, 0.8f, 0.8f },
+		.subsurfaceRadius = 1.0f,
+		.textureSubsurface = 0u,
+		.transmissionWeight = 0.0f,
+		.textureTransmission = 0u,
+		.transmissionColor = { 1.0f, 1.0f, 1.0f },
+		.transmissionDepth = 0.0f,
+		.thinFilmWeight = 0.0f,
+		.thinFilmIor = 1.4f,
+		.thinFilmThickness = 0.5f,
+		.thinFilmThicknessMin = 100.0f,
+		.textureIridescence = 0u,
+		.textureIridescenceThickness = 0u,
+		.specularRoughnessAnisotropy = 0.0f,
+		.specularAnisotropyRotation = 0.0f,
+		.textureAnisotropy = 0u,
+		.textureClearcoatNormal = 0u,
+		.textureFuzzRoughness = 0u,
+		.textureOcclusion = 0u,
+		.transmissionDispersionAbbeNumber = 20.0f,
+		.alphaCutoff = 0.5f,
+		.geometryOpacity = 1.0f,
+		.flags = 0u,
 	});
 	return mor::Scene { .id = reinterpret_cast<u64>(s) };
 }
@@ -535,6 +749,19 @@ void mor::scene_set_anisotropy(
 		mat.textureNormal = remap(mat.textureNormal);
 		mat.textureMetallicRoughness = remap(mat.textureMetallicRoughness);
 		mat.textureEmissive = remap(mat.textureEmissive);
+		mat.textureSpecular = remap(mat.textureSpecular);
+		mat.textureSpecularColor = remap(mat.textureSpecularColor);
+		mat.textureClearcoat = remap(mat.textureClearcoat);
+		mat.textureClearcoatRoughness = remap(mat.textureClearcoatRoughness);
+		mat.textureClearcoatNormal = remap(mat.textureClearcoatNormal);
+		mat.textureFuzz = remap(mat.textureFuzz);
+		mat.textureFuzzRoughness = remap(mat.textureFuzzRoughness);
+		mat.textureSubsurface = remap(mat.textureSubsurface);
+		mat.textureTransmission = remap(mat.textureTransmission);
+		mat.textureIridescence = remap(mat.textureIridescence);
+		mat.textureIridescenceThickness = remap(mat.textureIridescenceThickness);
+		mat.textureAnisotropy = remap(mat.textureAnisotropy);
+		mat.textureOcclusion = remap(mat.textureOcclusion);
 	}
 
 	if (!s->materials.empty()) {
@@ -621,7 +848,7 @@ void mor::scene_imgui_debug(mor::Scene const & scene) {
 				i,
 				mat.baseColor.x, mat.baseColor.y,
 				mat.baseColor.z, mat.baseColor.w,
-				mat.metallic, mat.roughness
+				mat.baseMetalness, mat.specularRoughness
 			);
 		}
 		ImGui::TreePop();

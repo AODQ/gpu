@@ -3,17 +3,52 @@
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 
-// Must match GpuMorMaterial in mor_shared.h (scalar layout, 56 bytes)
 struct GpuMorMaterial {
-	vec4  baseColor;
-	float metallic;
-	float roughness;
-	vec3  emissive;
-	uint  textureBaseColor;
-	uint  textureNormal;
-	uint  textureMetallicRoughness;
-	uint  textureEmissive;
-	uint  flags;
+	vec4 baseColor;
+	float baseMetalness;
+	float specularRoughness;
+	vec3 emissiveColor;
+	float emissiveLuminance;
+	uint textureBaseColor;
+	uint textureNormal;
+	uint textureMetallicRoughness;
+	uint textureEmissive;
+	vec3 specularColor;
+	float specularWeight;
+	uint textureSpecular;
+	uint textureSpecularColor;
+	float specularIor;
+	float coatWeight;
+	float coatRoughness;
+	uint textureClearcoat;
+	uint textureClearcoatRoughness;
+	vec3 fuzzColor;
+	float fuzzRoughness;
+	uint textureFuzz;
+	float subsurfaceWeight;
+	vec3 subsurfaceColor;
+	float subsurfaceRadius;
+	uint textureSubsurface;
+	float transmissionWeight;
+	uint textureTransmission;
+	vec3 transmissionColor;
+	float transmissionDepth;
+	float thinFilmWeight;
+	float thinFilmIor;
+	float thinFilmThickness;
+	float thinFilmThicknessMin;
+	uint textureIridescence;
+	uint textureIridescenceThickness;
+	float specularRoughnessAnisotropy;
+	float specularAnisotropyRotation;
+	uint textureAnisotropy;
+	uint textureClearcoatNormal;
+	uint textureFuzzRoughness;
+	uint textureOcclusion;
+	float transmissionDispersionAbbeNumber;
+	float alphaCutoff;
+	float geometryOpacity;
+	uint flags;
 };
 
 layout(buffer_reference, scalar) buffer MaterialsBuffer {
@@ -39,6 +74,6 @@ void main() {
 	out_.data[1] = mat.baseColor.g;
 	out_.data[2] = mat.baseColor.b;
 	out_.data[3] = mat.baseColor.a;
-	out_.data[4] = mat.metallic;
-	out_.data[5] = mat.roughness;
+	out_.data[4] = mat.baseMetalness;
+	out_.data[5] = mat.specularRoughness;
 }

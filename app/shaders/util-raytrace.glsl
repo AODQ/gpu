@@ -3,8 +3,9 @@
 #ifndef UTIL_RAYTRACE_GLSL
 #define UTIL_RAYTRACE_GLSL
 
-#include "util-material.glsl"
 #include "util-mesh.glsl"
+
+#include "util-material-openpbr.glsl"
 
 // -----------------------------------------------------------------------------
 // -- ray-query utility
@@ -88,8 +89,10 @@ struct Ray {
 };
 
 int utilIrradiance(
-	const BsdfMaterial material,
+	const OpenPbrMaterial material,
 	inout f32v3 itOri,
+	inout f32v3 itNormalWorld,
+	inout f32v3 itNormalGeometrical,
 	inout f32v3 itWi,
 	inout f32v3 irradianceThroughput,
 	inout f32v3 irradianceAccumulator,
@@ -106,26 +109,38 @@ int utilIrradiance(
 
 	// -- propagate irradiance throughput along bsdf
 	bsdfWo = (
-		fnBsdfSample(
-			/*N=*/ material.normalGeometrical,
+		openPbrSampleWo(
+			/*nor=*/ itNormalWorld,
 			/*wi=*/ itWi,
-			/*P=*/ itOri,
 			/*mat=*/ material,
 			/*pdf=*/ bsdfPdf,
 			seed, seed2
 		)
 	);
 	const f32v3 irradianceThroughputPrevious = irradianceThroughput;
-	const f32 dotNorWo = dot(material.normalGeometrical, bsdfWo);
 
-	// terminate path if this produced a bad direction
+	// uncomment this block to test itNormalWorld vs itNormalGeometrical
+#if 0
+	if (dot(itNormalGeometrical, bsdfWo) < 0.0f)
+	{
+		// if the sampled wo is below the surface, then terminate path
+		irradianceAccumulator = (itNormalGeometrical-itNormalWorld);
+		return skHitTerminate;
+	}
+#endif
+
+	// if it's below the surface, terminate path; this can happen due to
+	// numerical precision issues. It's generally not worthwhile to try to
+	// reorient the wo and recalculate the pdf, just accept that there will
+	// be path termination noise
+	f32 dotNorWo = dot(itNormalWorld, bsdfWo);
 	if (dotNorWo <= 0.0f) {
-		irradianceAccumulator = f32v3(0.0f, 1.0f, 0.0f);
 		return skHitTerminate;
 	}
 
+	// propagate irradiance throughput along bsdf
 	irradianceThroughput *= (
-		fnBsdfF(material.normalGeometrical, itWi, bsdfWo, material)
+		openPbrEvaluateF(itNormalWorld, itWi, bsdfWo, material)
 		* dotNorWo / bsdfPdf
 	);
 
@@ -154,8 +169,7 @@ int utilIrradiance(
 	{
 		bsdfRq = (
 			utilTraceRay(
-				// TODO below replace with the geometrical normal
-				itOri + material.normalGeometrical * 0.01f,
+				itOri + itNormalGeometrical*0.0005f,
 				bsdfWo,
 				/*maxDist=*/999999.0f,
 				/*isShadowRay=*/false
@@ -165,8 +179,15 @@ int utilIrradiance(
 		// miss shader hits the sky for now
 		if (bsdfRq.dist <= 0.0f) {
 			// -- sky contribution
+			const GpuDebugPC unf = GpuDebugPCBuffer(pc.global.debug).data;
 			irradianceAccumulator += (
-				f32v3(0.2f) * irradianceThroughput
+				// f32v3(0.3f) * irradianceThroughput
+				sampleSky(
+					/*dir=*/ bsdfWo,
+					/*sunDir=*/ unf.sunDir,
+					/*turbidity=*/ unf.skyTurbidity,
+					/*intensity=*/ unf.skyIntensity
+				) * irradianceThroughput
 			);
 			return skHitDirect;
 		}
@@ -269,8 +290,10 @@ int utilIrradiance(
 }
 
 int utilIrradiancePropagate(
-	inout BsdfMaterial material,
+	inout OpenPbrMaterial material,
 	inout f32v3 itOri,
+	inout f32v3 itNormalWorld,
+	inout f32v3 itNormalGeometrical,
 	inout f32v3 itWi,
 	inout f32v3 irradianceThroughput,
 	inout f32v3 irradianceAccumulator,
@@ -286,6 +309,8 @@ int utilIrradiancePropagate(
 		utilIrradiance(
 			material,
 			itOri,
+			itNormalWorld,
+			itNormalGeometrical,
 			itWi,
 			irradianceThroughput,
 			irradianceAccumulator,
@@ -306,57 +331,39 @@ int utilIrradiancePropagate(
 				bsdfRq.barycentric
 			)
 		);
-		const f32v3 bitangent = (
-			cross(
-				rqData.normal,
-				rqData.tangent.xyz
-			)
-			* rqData.tangent.w
-		);
 		const mat3 tbn = (
-			mat3(
-				normalize(rqData.tangent.xyz),
-				normalize(bitangent),
-				normalize(rqData.normal)
-			)
+			utilCalculateTbnBasis(rqData.normal, rqData.tangent)
 		);
-		const BsdfMaterial rqBsdfMaterial = (
-			bsdfMaterialFromGltfWithLod(
+		f32v3 modelNormal;
+		material = (
+			openPbrMaterialFromGltfWithLod(
 				/*material=*/rqData.material,
-				/*normalGeometrical=*/rqData.normalGeometrical,
-				/*tbn=*/ tbn,
 				/*uv=*/rqData.uv,
-				/*lod=*/ uint(sqrt(material.alpha) * 10.0f + 0.5f)
+				/*lod=*/ 0,
+				/*modelNormal=*/modelNormal
 			)
 		);
-		material = rqBsdfMaterial;
 		itOri = itOri + bsdfWo * bsdfRq.dist;
+		itNormalWorld = normalize(tbn * modelNormal);
+		itNormalGeometrical = rqData.normalGeometrical;
 		itWi = -bsdfWo;
 	}
 
 	return returnEnum;
-
-	// if path is terminated, then return early
-	// if (returnEnum == skHitTerminate) {
-	// 	return skHitTerminate;
-	// }
 }
 
 f32v4 utilIrradiancePropagationEntry(
-	BsdfMaterial originalMaterial,
+	OpenPbrMaterial originalMaterial,
 	f32v3 origin,
+	f32v3 normalWorld,
+	f32v3 normalGeometrical,
 	f32v3 wi,
-	const uint propagationDepth
+	const uint propagationDepth,
+	inout f32 seed,
+	inout f32v2 seed2
 ) {
 	f32v3 irradianceThroughput = f32v3(1.0);
 	f32v3 irradianceAccumulator = f32v3(0.0);
-
-	f32 seed = (
-		float(gl_WorkGroupID.x * gl_WorkGroupID.y * gl_WorkGroupID.z)
-		+ float(gl_LocalInvocationIndex)
-		+ pc.global.time
-	);
-	f32v2 seed2 = f32v2(seed, seed * 1.61803398875);
 
 	int hit = 0;
 	for (int i = 0; i < propagationDepth; ++i) {
@@ -364,6 +371,8 @@ f32v4 utilIrradiancePropagationEntry(
 			utilIrradiancePropagate(
 				originalMaterial,
 				origin,
+				normalWorld,
+				normalGeometrical,
 				wi,
 				irradianceThroughput,
 				irradianceAccumulator,

@@ -28,6 +28,7 @@ add_executable(
 	test_rendernode.cpp
 	test_mor.cpp
 	test_accel.cpp
+	test_hot_reload.cpp
 )
 
 # Bake the absolute path to the test shaders directory into the binary

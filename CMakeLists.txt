@@ -357,6 +357,7 @@ target_include_directories(
 	${vma_SOURCE_DIR}/include
 	${imguizmo_SOURCE_DIR}/src
 	${rapidjson_SOURCE_DIR}/include
+	${stb_SOURCE_DIR}
 )
 
 target_precompile_headers(

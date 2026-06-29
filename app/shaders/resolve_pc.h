@@ -46,9 +46,15 @@ struct GpuResolvePC {
 	u32 prevFrameDepthStorageHandle;
 	u32 prevFrameSpecularStorageHandle;
 	u32 prevFrameMomentStorageHandle;
+	u32 frameIndex;
+	u32 bluenoiseCount;
+	u64 bluenoiseVa;
 };
 
 #ifndef __cplusplus
+layout(buffer_reference, scalar) buffer GpuBluenoiseHandleBuffer {
+	u32 data[];
+};
 #ifndef RESOLVE_NO_PC
 layout(push_constant, scalar) uniform PC {
 	GpuGlobalPC global;

@@ -24,7 +24,7 @@ vec3 sampleSky(
 	const float skyIntensity
 ) {
 	if (dir.y < 0.0) {
-		return vec3(0.0f);
+		return vec3(0.3f);
 	}
 	// return vec3(0.0f);
 	const float T = turbidity;

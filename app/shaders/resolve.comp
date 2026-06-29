@@ -59,6 +59,7 @@ f32v3 fnAces(const f32v3 x) {
 #include "sky.glsl"
 
 #include "util-mesh.glsl"
+#include "util-random.glsl"
 #include "util-raytrace.glsl"
 
 void main() {
@@ -92,43 +93,67 @@ void main() {
 			/*unpackMaterial=*/true
 		)
 	);
-	const f32v3 bitangent = (
-		cross(
-			attributeData.normal,
-			attributeData.tangent.xyz
-		)
-		* attributeData.tangent.w
-	);
 	const mat3 tbn = (
-		mat3(
-			normalize(attributeData.tangent.xyz),
-			normalize(bitangent),
-			normalize(attributeData.normal)
-		)
+		utilCalculateTbnBasis(attributeData.normal, attributeData.tangent)
 	);
 
 	// -- unpack material data and angles
-	const BsdfMaterial bsdfMaterial = (
-		bsdfMaterialFromGltf(
+	f32v3 modelNormal;
+	const OpenPbrMaterial bsdfMaterial = (
+		openPbrMaterialFromGltf(
 			/*material=*/attributeData.material,
-			/*normalGeometrical=*/ attributeData.normalGeometrical,
-			/*tbn=*/tbn,
 			/*uv=*/attributeData.uv,
 			/*uvDx=*/attributeData.uvDx,
-			/*uvDy=*/attributeData.uvDy
+			/*uvDy=*/attributeData.uvDy,
+			/*modelNormal=*/modelNormal
 		)
 	);
-	const f32v3 wi = normalize(attributeData.origin - pc.global.cameraPos);
+	const f32v3 wi = normalize(pc.global.cameraPos - attributeData.origin);
 
 	// -- compute lighting
-	const f32v4 irradiance = (
+	f32v4 irradiance = f32v4(0.0f);
+	f32 seed = fnSampleBluenoise(
+		pc.resolve.bluenoiseVa,
+		pc.resolve.bluenoiseCount,
+		pc.resolve.frameIndex,
+		coord
+	);
+	f32v2 seed2 = f32v2(seed * 1.2419241, seed * 1.61803398875);
+	#define ITERS 3
+	for (int it = 0; it < ITERS; ++it) {
+		irradiance +=
 		utilIrradiancePropagationEntry(
 			/*originalMaterial=*/bsdfMaterial,
 			/*origin=*/attributeData.origin,
+			/*normalWorld=*/ normalize(tbn * modelNormal),
+			/*normalGeometrical=*/ attributeData.normalGeometrical,
 			/*wi=*/wi,
-			/*propagationDepth=*/ 1u
-		)
-	);
+			/*propagationDepth=*/8u,
+			/*seed=*/seed,
+			/*seed2=*/seed2
+		);
+	}
+	irradiance /= float(ITERS);
+	// const f32v4 irradiance = (
+	// 	utilIrradiancePropagationEntry(
+	// 		/*originalMaterial=*/bsdfMaterial,
+	// 		/*origin=*/attributeData.origin,
+	// 		/*normalWorld=*/bsdfMaterial.normalWorld,
+	// 		/*normalGeometrical=*/attributeData.normalGeometrical,
+	// 		/*wi=*/wi,
+	// 		/*propagationDepth=*/8u
+	// 	)
+	// );
+
+	// -- debug mode visualizers
+	if (unf.debugMode == 1u) {
+		imageStore(
+			vkofImages[pc.resolve.outputImageHandle],
+			coord,
+			vec4(index_color(texelPacked), 1.0)
+		);
+		return;
+	}
 
 	// -- store results
 	imageStore(

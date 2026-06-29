@@ -23,7 +23,9 @@ int vkof_write_png_uncompressed(
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <filesystem>
 
 #define VkAssert(x) { \
@@ -358,6 +360,9 @@ namespace
 
 		std::filesystem::file_time_type lastWriteTimeFragment;
 		std::filesystem::file_time_type lastWriteTimeMesh;
+
+		std::vector<std::string> dependencyPaths;
+		std::vector<std::filesystem::file_time_type> dependencyWriteTimes;
 	};
 
 	struct ImplPipelineCompute
@@ -368,6 +373,9 @@ namespace
 		std::vector<std::string> defines;
 		std::vector<std::string> includePaths;
 		std::filesystem::file_time_type lastWriteTimeCompute;
+
+		std::vector<std::string> dependencyPaths;
+		std::vector<std::filesystem::file_time_type> dependencyWriteTimes;
 	};
 
 	struct PerFrameData {
@@ -3822,6 +3830,114 @@ static VkShaderModule compile_and_load_shader_module(
 }
 
 // -----------------------------------------------------------------------------
+// -- shader dependency tracking
+// -----------------------------------------------------------------------------
+
+static void collect_deps_impl(
+	std::string const & path,
+	std::vector<std::string> const & includePaths,
+	std::unordered_set<std::string> & visited,
+	std::vector<std::string> & result
+) {
+	if (path.empty()) { return; }
+	std::ifstream file(path);
+	if (!file.is_open()) { return; }
+
+	std::filesystem::path const fileDir = std::filesystem::path(path).parent_path();
+	std::string line;
+	while (std::getline(file, line)) {
+		size_t start = 0u;
+		while (start < line.size() && (line[start] == ' ' || line[start] == '\t')) {
+			++start;
+		}
+		if (start >= line.size() || line[start] != '#') { continue; }
+		++start;
+		while (start < line.size() && (line[start] == ' ' || line[start] == '\t')) {
+			++start;
+		}
+		if (line.compare(start, 7u, "include") != 0) { continue; }
+		start += 7u;
+		while (start < line.size() && (line[start] == ' ' || line[start] == '\t')) {
+			++start;
+		}
+		if (start >= line.size()) { continue; }
+
+		char const openDelim = line[start];
+		bool const isQuoted = (openDelim == '"');
+		if (openDelim != '"' && openDelim != '<') { continue; }
+		char const closeDelim = isQuoted ? '"' : '>';
+		++start;
+		size_t const end = line.find(closeDelim, start);
+		if (end == std::string::npos) { continue; }
+
+		std::string const includeName = line.substr(start, end - start);
+		if (includeName.empty()) { continue; }
+
+		std::string resolvedPath;
+		if (isQuoted) {
+			std::error_code ec;
+			std::filesystem::path const canon = std::filesystem::canonical(
+				fileDir / includeName, ec
+			);
+			if (!ec) { resolvedPath = canon.string(); }
+		}
+		if (resolvedPath.empty()) {
+			for (std::string const & incPath : includePaths) {
+				std::error_code ec;
+				std::filesystem::path const canon = std::filesystem::canonical(
+					std::filesystem::path(incPath) / includeName, ec
+				);
+				if (!ec) {
+					resolvedPath = canon.string();
+					break;
+				}
+			}
+		}
+		if (resolvedPath.empty()) { continue; }
+		if (visited.count(resolvedPath)) { continue; }
+		visited.insert(resolvedPath);
+		result.push_back(resolvedPath);
+		collect_deps_impl(resolvedPath, includePaths, visited, result);
+	}
+}
+
+static std::vector<std::string> collect_shader_dependencies(
+	std::vector<std::string> const & primaryPaths,
+	std::vector<std::string> const & includePaths
+) {
+	std::unordered_set<std::string> visited;
+	for (std::string const & p : primaryPaths) {
+		if (!p.empty()) { visited.insert(p); }
+	}
+	std::vector<std::string> result;
+	for (std::string const & p : primaryPaths) {
+		collect_deps_impl(p, includePaths, visited, result);
+	}
+	return result;
+}
+
+static std::vector<std::filesystem::file_time_type> snapshot_write_times(
+	std::vector<std::string> const & paths
+) {
+	std::vector<std::filesystem::file_time_type> times;
+	times.reserve(paths.size());
+	for (std::string const & p : paths) {
+		times.push_back(file_write_time(p));
+	}
+	return times;
+}
+
+static bool any_dependency_changed(
+	std::vector<std::string> const & paths,
+	std::vector<std::filesystem::file_time_type> const & times
+) {
+	for (size_t i = 0u; i < paths.size(); ++i) {
+		if (file_changed(paths[i], times[i])) { return true; }
+	}
+	return false;
+}
+
+// -----------------------------------------------------------------------------
 // -- shader hot reload
 // -----------------------------------------------------------------------------
 
@@ -3848,6 +3964,10 @@ static void pipeline_hot_reload()
 			anyChanged = true;
 			break;
 		}
+		if (any_dependency_changed(impl.dependencyPaths, impl.dependencyWriteTimes)) {
+			anyChanged = true;
+			break;
+		}
 	}
 	if (!anyChanged) {
 		for (auto const & id : sDevice->pipelineComputeHandles) {
@@ -3855,6 +3975,10 @@ static void pipeline_hot_reload()
 				*sDevice->pipelineComputePool.get(id)
 			);
 			if (file_changed(impl.pathCompute, impl.lastWriteTimeCompute)) {
+				anyChanged = true;
+				break;
+			}
+			if (any_dependency_changed(impl.dependencyPaths, impl.dependencyWriteTimes)) {
 				anyChanged = true;
 				break;
 			}
@@ -3879,7 +4003,10 @@ static void pipeline_hot_reload()
 		bool const frgChanged = (
 			file_changed(impl.pathFragment, impl.lastWriteTimeFragment)
 		);
-		if (!vtxChanged && !frgChanged) { continue; }
+		bool const depChanged = any_dependency_changed(
+			impl.dependencyPaths, impl.dependencyWriteTimes
+		);
+		if (!vtxChanged && !frgChanged && !depChanged) { continue; }
 
 		VkPipeline const rebuilt = build_graphics_pipeline(impl);
 		if (rebuilt == VK_NULL_HANDLE) {
@@ -3896,6 +4023,10 @@ static void pipeline_hot_reload()
 		impl.pipeline = rebuilt;
 		impl.lastWriteTimeMesh = file_write_time(impl.pathMesh);
 		impl.lastWriteTimeFragment = file_write_time(impl.pathFragment);
+		impl.dependencyPaths = collect_shader_dependencies(
+			{impl.pathMesh, impl.pathFragment}, impl.includePaths
+		);
+		impl.dependencyWriteTimes = snapshot_write_times(impl.dependencyPaths);
 		vkDestroyPipeline(sDevice->device, old, nullptr);
 		printf(
 			"hot reloaded pipeline '%s/%s'\n",
@@ -3908,9 +4039,13 @@ static void pipeline_hot_reload()
 		ImplPipelineCompute & impl = (
 			*sDevice->pipelineComputePool.get(id)
 		);
-		if (!file_changed(impl.pathCompute, impl.lastWriteTimeCompute)) {
-			continue;
-		}
+		bool const primaryChanged = file_changed(
+			impl.pathCompute, impl.lastWriteTimeCompute
+		);
+		bool const depChangedCompute = any_dependency_changed(
+			impl.dependencyPaths, impl.dependencyWriteTimes
+		);
+		if (!primaryChanged && !depChangedCompute) { continue; }
 
 		VkPipeline const rebuilt = build_compute_pipeline(impl);
 		if (rebuilt == VK_NULL_HANDLE) {
@@ -3924,6 +4059,10 @@ static void pipeline_hot_reload()
 		VkPipeline const old = impl.pipeline;
 		impl.pipeline = rebuilt;
 		impl.lastWriteTimeCompute = file_write_time(impl.pathCompute);
+		impl.dependencyPaths = collect_shader_dependencies(
+			{impl.pathCompute}, impl.includePaths
+		);
+		impl.dependencyWriteTimes = snapshot_write_times(impl.dependencyPaths);
 		vkDestroyPipeline(sDevice->device, old, nullptr);
 		printf("hot reloaded compute pipeline '%s'\n", impl.pathCompute.c_str());
 	}
@@ -3964,15 +4103,40 @@ vkof::Pipeline vkof::pipeline_graphics_create(
 
 		.lastWriteTimeFragment = file_write_time(createInfo.pathFragment),
 		.lastWriteTimeMesh = file_write_time(createInfo.pathMesh),
+
+		.dependencyPaths = {},
+		.dependencyWriteTimes = {},
 	};
 	implPipeline.pipeline = build_graphics_pipeline(implPipeline);
 	if (implPipeline.pipeline == VK_NULL_HANDLE) {
+		std::error_code ec;
+		bool const meshOk = (
+			implPipeline.pathMesh.empty()
+			|| (std::filesystem::exists(implPipeline.pathMesh, ec) && !ec)
+		);
+		bool const fragOk = (
+			implPipeline.pathFragment.empty()
+			|| (std::filesystem::exists(implPipeline.pathFragment, ec) && !ec)
+		);
+		if (!meshOk || !fragOk) {
+			printf(
+				"failed to create graphics pipeline '%s | %s'\n",
+				createInfo.pathMesh, createInfo.pathFragment
+			);
+			return vkof::Pipeline { .id = 0 };
+		}
 		printf(
-			"failed to create graphics pipeline '%s | %s'\n",
+			"graphics pipeline compile failed '%s | %s'; will retry on next save\n",
 			createInfo.pathMesh, createInfo.pathFragment
 		);
-		return vkof::Pipeline { .id = 0 };
 	}
+	implPipeline.dependencyPaths = collect_shader_dependencies(
+		{implPipeline.pathMesh, implPipeline.pathFragment},
+		implPipeline.includePaths
+	);
+	implPipeline.dependencyWriteTimes = snapshot_write_times(
+		implPipeline.dependencyPaths
+	);
 	vkof::Pipeline const handle = (
 		sDevice->pipelineGraphicsPool.allocate(implPipeline)
 	);
@@ -3996,14 +4160,27 @@ vkof::Pipeline vkof::pipeline_compute_create(
 	implPipeline.layout = sDevice->pipelineLayoutUniversal;
 	implPipeline.pipeline = build_compute_pipeline(implPipeline);
 	if (implPipeline.pipeline == VK_NULL_HANDLE) {
+		std::error_code ec;
+		if (!std::filesystem::exists(implPipeline.pathCompute, ec) || ec) {
+			printf(
+				"failed to create compute pipeline '%s'\n",
+				createInfo.pathCompute
+			);
+			return vkof::Pipeline { .id = 0 };
+		}
 		printf(
-			"failed to create compute pipeline '%s'\n",
+			"compute pipeline compile failed '%s'; will retry on next save\n",
 			createInfo.pathCompute
 		);
-		return vkof::Pipeline { .id = 0 };
 	}
 	implPipeline.lastWriteTimeCompute = (
 		file_write_time(implPipeline.pathCompute)
+	);
+	implPipeline.dependencyPaths = collect_shader_dependencies(
+		{implPipeline.pathCompute}, implPipeline.includePaths
+	);
+	implPipeline.dependencyWriteTimes = snapshot_write_times(
+		implPipeline.dependencyPaths
 	);
 	auto const handle = sDevice->pipelineComputePool.allocate(implPipeline);
 	sDevice->pipelineComputeHandles.emplace_back(handle.id);
@@ -4057,6 +4234,7 @@ void vkof::cmd_draw(CmdDraw const & draw)
 	if (!implCmd || !implPipeline) {
 		return;
 	}
+	if (implPipeline->pipeline == VK_NULL_HANDLE) { return; }
 
 	// bind pipeline only if it changed on this command buffer
 	if (
@@ -4109,6 +4287,7 @@ void vkof::cmd_dispatch(CmdDispatch const & dispatch)
 		printf("[vkof] cmd_dispatch: invalid command buffer or pipeline\n");
 		return;
 	}
+	if (implPipeline->pipeline == VK_NULL_HANDLE) { return; }
 
 	if (
 		   implCmd->boundPipeline.id != dispatch.pipeline.id

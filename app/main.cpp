@@ -1,5 +1,6 @@
 #include "shaders/scene_shared.h"
 #include "shaders/resolve_pc.h"
+#include "shaders/pt-accumulate-pc.h"
 #include "shared/ddgi-shared.h"
 #include "shared/light_shared.h"
 #include "asset_library.hpp"
@@ -9,6 +10,7 @@
 #include <mor/mor.hpp>
 #include <srat/camera.hpp>
 
+#include <stb_image.h>
 #include <imgui.h>
 #include <ImGuizmo.h>
 #include <backends/imgui_impl_glfw.h>
@@ -311,6 +313,9 @@ struct DdgiSystem
 static DdgiSystem sDdgi {};
 static SpecularHistory sSpecularHistory {};
 static u32 sFrameIndex = 0u;
+static bool sPtMode = false;
+static bool sPtResetAccum = false;
+static f32m44 sPtPrevViewProj = {};
 
 
 // -----------------------------------------------------------------------------
@@ -504,6 +509,14 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			.includePaths = srat::slice { kIncludePaths, 1u },
 		})
 	);
+	vkof::Pipeline const ptAccumulatePipeline = (
+		vkof::pipeline_compute_create({
+			.pathCompute = (
+				(shaderDir / "pt-accumulate.comp").string().c_str()
+			),
+			.includePaths = srat::slice { kIncludePaths, 1u },
+		})
+	);
 	vkof::Pipeline const debugProbePipeline = (
 		vkof::debug_sphere_pipeline_create({
 			.pathFrag = (
@@ -571,6 +584,79 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 	}
 	sDdgi.dirty = false;
 	sSpecularHistory = specular_history_create(kScreenW, kScreenH);
+
+	vkof::Image const ptAccumImage = vkof::image_create({
+		.width = kScreenW,
+		.height = kScreenH,
+		.depth = 1u,
+		.format = vkof::ImageFormat::r16g16b16a16_sfloat,
+		.mipLevels = 1u,
+		.optInitialData = {},
+	});
+	u32 const ptAccumStorageHandle = vkof::image_storage_handle({
+		.image = ptAccumImage,
+		.mipLevel = 0u,
+	});
+	vkof::TransientImage const ptOutputTarget = vkof::transient_image_create({
+		.format = vkof::ImageFormat::r8g8b8a8_unorm,
+		.scaleWidth = 1.0f,
+		.scaleHeight = 1.0f,
+		.mipLevels = 1,
+		.isDoubleBuffered = !headless,
+	});
+
+	// -- load STBN scalar bluenoise textures for PT seeding
+	static constexpr u32 kBluenoiseCount = 64u;
+	vkof::Sampler const bluenoiseCommonSampler = vkof::sampler_create({
+		.magFilter = vkof::SamplerFilter::nearest,
+		.minFilter = vkof::SamplerFilter::nearest,
+		.addressModeU = vkof::SamplerAddressMode::repeat,
+		.addressModeV = vkof::SamplerAddressMode::repeat,
+		.addressModeW = vkof::SamplerAddressMode::repeat,
+		.mipmapMode = vkof::SamplerMipmapMode::nearest,
+	});
+	vkof::Image bluenoiseImages[kBluenoiseCount] = {};
+	u32 bluenoiseHandles[kBluenoiseCount] = {};
+	for (u32 i = 0u; i < kBluenoiseCount; ++i) {
+		std::string const path = (
+			(shaderDir / "textures")
+			/ ("stbn_scalar_2Dx1Dx1D_128x128x64x1_" + std::to_string(i) + ".png")
+		).string();
+		int w = 0, h = 0, channels = 0;
+		stbi_uc * const pixels = stbi_load(path.c_str(), &w, &h, &channels, 4);
+		if (!pixels) {
+			printf("[warn] bluenoise: failed to load %s\n", path.c_str());
+			continue;
+		}
+		bluenoiseImages[i] = vkof::image_create({
+			.width = (u32)w,
+			.height = (u32)h,
+			.depth = 1u,
+			.format = vkof::ImageFormat::r8g8b8a8_unorm,
+			.mipLevels = 1u,
+			.optInitialData = srat::slice<u8 const>(
+				reinterpret_cast<u8 const *>(pixels),
+				(u32)(w * h * 4)
+			),
+		});
+		stbi_image_free(pixels);
+		bluenoiseHandles[i] = vkof::image_sampler_handle({
+			.image = bluenoiseImages[i],
+			.sampler = bluenoiseCommonSampler,
+		});
+	}
+	vkof::Buffer const bluenoiseHandleBuffer = vkof::buffer_create({
+		.byteCount = sizeof(u32) * kBluenoiseCount,
+		.memory = vkof::BufferMemory::HostWritable,
+	});
+	vkof::buffer_upload({
+		.buffer = bluenoiseHandleBuffer,
+		.byteOffset = 0u,
+		.data = srat::slice<u8 const>(
+			reinterpret_cast<u8 const *>(bluenoiseHandles),
+			sizeof(u32) * kBluenoiseCount
+		),
+	});
 
 	static constexpr u32 kMaxLights = 64u;
 	vkof::Buffer const lightsBuffer = vkof::buffer_create({
@@ -1419,6 +1505,9 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 		ImGui::Combo(
 			"debug", &sDebugMode, kDebugModes, IM_ARRAYSIZE(kDebugModes)
 		);
+		if (ImGui::Checkbox("path tracer", &sPtMode)) {
+			sPtResetAccum = true;
+		}
 		ImGui::Separator();
 		ImGui::Checkbox("override mip LOD", &sMipOverrideActive);
 		if (sMipOverrideActive) {
@@ -1736,6 +1825,19 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			);
 		}
 
+		// -- detect camera movement to reset PT accumulation
+		if (sPtMode) {
+			bool const viewProjChanged = (
+				memcmp(
+					globalPC.viewProj.m.ptr(),
+					sPtPrevViewProj.m.ptr(),
+					sizeof(f32m44)
+				) != 0
+			);
+			if (viewProjChanged) { sPtResetAccum = true; }
+		}
+		sPtPrevViewProj = globalPC.viewProj;
+
 		// -- render graph
 		{
 			// -- visibility draw
@@ -1978,6 +2080,11 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 						.prevFrameMomentStorageHandle = (
 							sSpecularHistory.momentStorageHandle[writeIdx]
 						),
+						.frameIndex = sFrameIndex,
+						.bluenoiseCount = kBluenoiseCount,
+						.bluenoiseVa = (
+							vkof::buffer_virtual_address(bluenoiseHandleBuffer)
+						),
 					};
 					vkof::cmd_dispatch_pushconst(vkof::CmdDispatchPushconst {
 						.cmd = cmd,
@@ -1989,21 +2096,85 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 				}
 			});
 
+			// -- pt accumulate node (only in PT mode)
+			u32 ptOutputHandle = 0u;
+			vkof::RenderNode ptAccumNode = {};
+			if (sPtMode) {
+				ptOutputHandle = vkof::transient_image_storage_handle({
+					.image = ptOutputTarget,
+					.mipLevel = 0,
+				});
+				ptAccumNode = vkof::render_node_create({
+					.queue = vkof::CommandQueue::graphics,
+				});
+				vkof::render_node_add_image({
+					.node = ptAccumNode,
+					.image = colorTarget,
+					.access = vkof::RenderNodeAccess::read,
+				});
+				vkof::render_node_add_persistent_image({
+					.node = ptAccumNode,
+					.image = ptAccumImage,
+					.access = vkof::RenderNodeAccess::readWrite,
+				});
+				vkof::render_node_add_image({
+					.node = ptAccumNode,
+					.image = ptOutputTarget,
+					.access = vkof::RenderNodeAccess::write,
+				});
+				vkof::render_node_callback({
+					.node = ptAccumNode,
+					.callback = [&](vkof::CommandBuffer const & cmd) {
+						GpuPtAccumulatePC const ptAccumPC {
+							.inputHandle = colorHandle,
+							.accumHandle = ptAccumStorageHandle,
+							.outputHandle = ptOutputHandle,
+							.reset = sPtResetAccum ? 1u : 0u,
+						};
+						vkof::cmd_dispatch_pushconst(vkof::CmdDispatchPushconst {
+							.cmd = cmd,
+							.pipeline = ptAccumulatePipeline,
+							.push = ptAccumPC,
+							.threadgroupSize = u32v3{ 16u, 16u, 1u },
+							.invocationCount = u32v3{ kScreenW, kScreenH, 1u },
+						});
+					},
+				});
+			}
+
 			// -- execute render graph
-			vkof::RenderNode const allNodes[] = {
-				drawNode, tlasNode, ddgiNode, resolveNode,
-			};
-			vkof::render_graph_execute({
-				.nodes = srat::slice<vkof::RenderNode const>(allNodes, 4u),
-				.rootPushconstant = srat::slice_as_bytes(globalPC),
-				.finalImage = colorTarget,
-				.debugDrawViewProj = globalPC.viewProj,
-				.debugDrawDepth = depthTarget,
-			});
+			if (sPtMode) {
+				vkof::RenderNode const allNodes[] = {
+					drawNode, tlasNode, ddgiNode, resolveNode, ptAccumNode,
+				};
+				vkof::render_graph_execute({
+					.nodes = srat::slice<vkof::RenderNode const>(allNodes, 5u),
+					.rootPushconstant = srat::slice_as_bytes(globalPC),
+					.finalImage = ptOutputTarget,
+					.debugDrawViewProj = globalPC.viewProj,
+					.debugDrawDepth = depthTarget,
+				});
+			} else {
+				vkof::RenderNode const allNodes[] = {
+					drawNode, tlasNode, ddgiNode, resolveNode,
+				};
+				vkof::render_graph_execute({
+					.nodes = srat::slice<vkof::RenderNode const>(allNodes, 4u),
+					.rootPushconstant = srat::slice_as_bytes(globalPC),
+					.finalImage = colorTarget,
+					.debugDrawViewProj = globalPC.viewProj,
+					.debugDrawDepth = depthTarget,
+				});
+			}
+			sPtResetAccum = false;
+
 			vkof::render_node_destroy(drawNode);
 			vkof::render_node_destroy(tlasNode);
 			vkof::render_node_destroy(ddgiNode);
 			vkof::render_node_destroy(resolveNode);
+			if (ptAccumNode.id) {
+				vkof::render_node_destroy(ptAccumNode);
+			}
 		}
 	}
 
@@ -2020,11 +2191,18 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 		ddgi_volume_destroy(sDdgi.cascades[ci].volume);
 	}
 	specular_history_destroy(sSpecularHistory);
+	vkof::buffer_destroy(bluenoiseHandleBuffer);
+	for (u32 i = 0u; i < kBluenoiseCount; ++i) {
+		if (bluenoiseImages[i].id) { vkof::image_destroy(bluenoiseImages[i]); }
+	}
+	vkof::sampler_destroy(bluenoiseCommonSampler);
 	vkof::buffer_destroy(modelsIndirectBuffer);
 	vkof::buffer_destroy(lightsBuffer);
 	vkof::pipeline_destroy(visibilityPipeline);
 	vkof::pipeline_destroy(resolvePipeline);
+	vkof::pipeline_destroy(ptAccumulatePipeline);
 	vkof::pipeline_destroy(debugProbePipeline);
+	vkof::image_destroy(ptAccumImage);
 	mor::sampler_cache_destroy();
 	vkof::shutdown();
 	return 0;

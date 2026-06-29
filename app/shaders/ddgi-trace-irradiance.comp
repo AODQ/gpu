@@ -100,83 +100,83 @@ void traceRay(const vec3 rayDir) {
 
 	// -- second bounce: look up geometry at hit, sample DDGI irradiance there
 	if (pc.global.ddgiGrid != 0u && pc.global.models != 0u) {
-		const uint di = uint(
-			rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true)
-		);
-		const uint primIdx = uint(
-			rayQueryGetIntersectionPrimitiveIndexEXT(rq, true)
-		);
-		const vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+		// const uint di = uint(
+		// 	rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true)
+		// );
+		// const uint primIdx = uint(
+		// 	rayQueryGetIntersectionPrimitiveIndexEXT(rq, true)
+		// );
+		// const vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
 
-		const GpuResolveModelIndirect desc = (
-			GpuResolveModelIndirectBuffer(pc.global.models).data[di]
-		);
+		// const GpuResolveModelIndirect desc = (
+		// 	GpuResolveModelIndirectBuffer(pc.global.models).data[di]
+		// );
 
-		const uint i0 = (
-			GpuFlatIndexBuffer(desc.flatIndices).data[primIdx * 3u + 0u]
-		);
-		const uint i1 = (
-			GpuFlatIndexBuffer(desc.flatIndices).data[primIdx * 3u + 1u]
-		);
-		const uint i2 = (
-			GpuFlatIndexBuffer(desc.flatIndices).data[primIdx * 3u + 2u]
-		);
+		// const uint i0 = (
+		// 	GpuFlatIndexBuffer(desc.flatIndices).data[primIdx * 3u + 0u]
+		// );
+		// const uint i1 = (
+		// 	GpuFlatIndexBuffer(desc.flatIndices).data[primIdx * 3u + 1u]
+		// );
+		// const uint i2 = (
+		// 	GpuFlatIndexBuffer(desc.flatIndices).data[primIdx * 3u + 2u]
+		// );
 
-		const vec3 n0 = (
-			GpuMorVertexAttributeBuffer(desc.attributes).data[i0].normal
-		);
-		const vec3 n1 = (
-			GpuMorVertexAttributeBuffer(desc.attributes).data[i1].normal
-		);
-		const vec3 n2 = (
-			GpuMorVertexAttributeBuffer(desc.attributes).data[i2].normal
-		);
+		// const vec3 n0 = (
+		// 	GpuMorVertexAttributeBuffer(desc.attributes).data[i0].normal
+		// );
+		// const vec3 n1 = (
+		// 	GpuMorVertexAttributeBuffer(desc.attributes).data[i1].normal
+		// );
+		// const vec3 n2 = (
+		// 	GpuMorVertexAttributeBuffer(desc.attributes).data[i2].normal
+		// );
 
-		const vec3 localNormal = normalize(
-			n0 * (1.0 - bary.x - bary.y) + n1 * bary.x + n2 * bary.y
-		);
-		const mat3 normalMat = transpose(inverse(mat3(desc.modelMatrix)));
-		const vec3 worldNormal = normalize(normalMat * localNormal);
+		// const vec3 localNormal = normalize(
+		// 	n0 * (1.0 - bary.x - bary.y) + n1 * bary.x + n2 * bary.y
+		// );
+		// const mat3 normalMat = transpose(inverse(mat3(desc.modelMatrix)));
+		// const vec3 worldNormal = normalize(normalMat * localNormal);
 
-		const uint hitMi = GpuFlatMeshletBuffer(desc.flatMeshlets).data[primIdx];
-		const GpuMorMeshlet hitMeshlet = (
-			GpuMorMeshletBuffer(desc.meshlets).data[hitMi]
-		);
-		const GpuMorMaterial hitMat = (
-			GpuMorMaterialBuffer(desc.materials).data[hitMeshlet.materialIndex]
-		);
+		// const uint hitMi = GpuFlatMeshletBuffer(desc.flatMeshlets).data[primIdx];
+		// const GpuMorMeshlet hitMeshlet = (
+		// 	GpuMorMeshletBuffer(desc.meshlets).data[hitMi]
+		// );
+		// const GpuMorMaterial hitMat = (
+		// 	GpuMorMaterialBuffer(desc.materials).data[hitMeshlet.materialIndex]
+		// );
 
-		// -- sun contribution at bounce hit
-		if (dbg.sunIntensity > 0.0) {
-			const float dotNL = max(dot(worldNormal, dbg.sunDir), 0.0);
-			if (dotNL > 0.0 && dbg.sunDir.y > 0.0) {
-				rayQueryEXT sunRq;
-				rayQueryInitializeEXT(
-					sunRq,
-					vkofTlas,
-					gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
-					0xFFu,
-					hitPos + worldNormal * 0.001f,
-					0.001f,
-					dbg.sunDir,
-					10000.0f
-				);
-				rayQueryProceedEXT(sunRq);
-				const bool sunOccluded = (
-					rayQueryGetIntersectionTypeEXT(sunRq, true)
-					!= gl_RayQueryCommittedIntersectionNoneEXT
-				);
-				if (!sunOccluded) {
-					const vec3 sunColor = sunLightColor(dbg.sunDir, dbg.skyTurbidity);
-					irradiance += (
-						hitMat.baseColor.rgb * sunColor * dotNL * dbg.sunIntensity
-					);
-				}
-			}
-		}
+		// // -- sun contribution at bounce hit
+		// if (dbg.sunIntensity > 0.0) {
+		// 	const float dotNL = max(dot(worldNormal, dbg.sunDir), 0.0);
+		// 	if (dotNL > 0.0 && dbg.sunDir.y > 0.0) {
+		// 		rayQueryEXT sunRq;
+		// 		rayQueryInitializeEXT(
+		// 			sunRq,
+		// 			vkofTlas,
+		// 			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
+		// 			0xFFu,
+		// 			hitPos + worldNormal * 0.001f,
+		// 			0.001f,
+		// 			dbg.sunDir,
+		// 			10000.0f
+		// 		);
+		// 		rayQueryProceedEXT(sunRq);
+		// 		const bool sunOccluded = (
+		// 			rayQueryGetIntersectionTypeEXT(sunRq, true)
+		// 			!= gl_RayQueryCommittedIntersectionNoneEXT
+		// 		);
+		// 		if (!sunOccluded) {
+		// 			const vec3 sunColor = sunLightColor(dbg.sunDir, dbg.skyTurbidity);
+		// 			irradiance += (
+		// 				hitMat.baseColor.rgb * sunColor * dotNL * dbg.sunIntensity
+		// 			);
+		// 		}
+		// 	}
+		// }
 
-		irradiance += hitMat.emissive;
-		irradiance += hitMat.baseColor.rgb * sampleProbeIrradiance(hitPos, worldNormal);
+		// irradiance += hitMat.emissive;
+		// irradiance += hitMat.baseColor.rgb * sampleProbeIrradiance(hitPos, worldNormal);
 	}
 
 	sharedRays[gl_LocalInvocationIndex].irradiance = irradiance;
