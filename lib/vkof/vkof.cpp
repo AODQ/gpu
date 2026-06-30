@@ -48,6 +48,7 @@ static void vkof_aftermath_on_device_lost() {}
 // -----------------------------------------------------------------------------
 
 static std::string sProbeMessage;
+static bool sShaderReloaded = false;
 
 static VKAPI_ATTR VkBool32 VKAPI_CALL debugMessengerCallback(
 	VkDebugUtilsMessageSeverityFlagBitsEXT const severity,
@@ -86,6 +87,8 @@ char const * vkof::probe_message() {
 	if (sProbeMessage.empty()) { return nullptr; }
 	return sProbeMessage.c_str();
 }
+
+bool vkof::shader_reloaded() { return sShaderReloaded; }
 
 // -----------------------------------------------------------------------------
 // -- private forwards
@@ -174,6 +177,8 @@ static VkFormat to_vk_format(vkof::ImageFormat format) {
 			return VK_FORMAT_R16G16B16A16_SFLOAT;
 		case vkof::ImageFormat::r32_float:
 			return VK_FORMAT_R32_SFLOAT;
+		case vkof::ImageFormat::r32g32b32a32_sfloat:
+			return VK_FORMAT_R32G32B32A32_SFLOAT;
 		case vkof::ImageFormat::d24_unorm_s8_uint:
 			return VK_FORMAT_D24_UNORM_S8_UINT;
 		default:
@@ -4028,6 +4033,7 @@ static void pipeline_hot_reload()
 		);
 		impl.dependencyWriteTimes = snapshot_write_times(impl.dependencyPaths);
 		vkDestroyPipeline(sDevice->device, old, nullptr);
+		sShaderReloaded = true;
 		printf(
 			"hot reloaded pipeline '%s/%s'\n",
 			impl.pathMesh.c_str(), impl.pathFragment.c_str()
@@ -4064,6 +4070,7 @@ static void pipeline_hot_reload()
 		);
 		impl.dependencyWriteTimes = snapshot_write_times(impl.dependencyPaths);
 		vkDestroyPipeline(sDevice->device, old, nullptr);
+		sShaderReloaded = true;
 		printf("hot reloaded compute pipeline '%s'\n", impl.pathCompute.c_str());
 	}
 }
@@ -4470,6 +4477,7 @@ static void profiler_init()
 void vkof::render_graph_execute(RenderGraphExecuteInfo const & exec)
 {
 	sProbeMessage.clear();
+	sShaderReloaded = false;
 
 	u32 const frameSlot = sDevice->frameIndex % kFramesInFlight;
 	auto & fd = sDevice->frameData[frameSlot];
@@ -5801,7 +5809,9 @@ vkof::AccelerationStructureBlas vkof::blas_create(BlasCreateInfo const & ci) {
 				.transformData = { .deviceAddress = 0u },
 			},
 		},
-		.flags = VK_GEOMETRY_OPAQUE_BIT_KHR,
+		.flags = (
+			ci.isOpaque ? VK_GEOMETRY_OPAQUE_BIT_KHR : (VkGeometryFlagBitsKHR)0u
+		),
 	};
 	VkAccelerationStructureBuildGeometryInfoKHR const sizeQueryInfo = {
 		.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,

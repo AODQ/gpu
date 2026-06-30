@@ -257,9 +257,12 @@ f32 utilMicrofacetSmithG1(const f32 dotNorWi, const f32 alpha2) {
 // returns the fractional energy to mix diffuse and specular
 // uses kulla-conty multi-scatter energy compensation tables
 f32 utilMicrofacetDielectricEnergyCompensate(
+	const MaterialTableHandles tables,
 	const f32 mu,
 	const f32 roughness
 ) {
+	// mu axis: (i+0.5f)/16.0f (grazing->normal)
+	// roughness axis: (i/16.0f)^2 (smooth->rough)
 	const f32 ai = clamp(roughness * 15.0f, 0.0f, 14.999f);
 	const f32 mi = clamp(mu*16.0f - 0.5f, 0.0f, 14.999f);
 	const int ai0 = int(ai);
@@ -271,13 +274,46 @@ f32 utilMicrofacetDielectricEnergyCompensate(
 	return (
 		mix(
 			mix(
-				skKullaContyEnergyTable[mi0*16 + ai0],
-				skKullaContyEnergyTable[mi0*16 + ai1],
+				texelFetch(vkofTextures[tables.kullaContyEnergy], ivec2(mi0, ai0), 0).r,
+				texelFetch(vkofTextures[tables.kullaContyEnergy], ivec2(mi1, ai0), 0).r,
 				ta
 			),
 			mix(
-				skKullaContyEnergyTable[mi1*16 + ai0],
-				skKullaContyEnergyTable[mi1*16 + ai1],
+				texelFetch(vkofTextures[tables.kullaContyEnergy], ivec2(mi0, ai1), 0).r,
+				texelFetch(vkofTextures[tables.kullaContyEnergy], ivec2(mi1, ai1), 0).r,
+				ta
+			),
+			tm
+		)
+	);
+}
+
+// returns the value from the LTC parameter table
+f32v3 utilZeltnerFuzzLookup(
+	const MaterialTableHandles tables,
+	const f32 mu,
+	const f32 roughness
+) {
+	// mu axis: (i+0.5f)/32.0f (grazing->normal)
+	// roughness axis: (i/32.0f)^2 (smooth->rough)
+	const f32 ai = clamp(roughness * 31.0f, 0.0f, 30.999f);
+	const f32 mi = clamp(mu*32.0f - 0.5f, 0.0f, 30.999f);
+	const int ai0 = int(ai);
+	const int ai1 = min(ai0 + 1, 31);
+	const int mi0 = int(mi);
+	const int mi1 = min(mi0 + 1, 31);
+	const f32 ta = fract(ai);
+	const f32 tm = fract(mi);
+	return (
+		mix(
+			mix(
+				texelFetch(vkofTextures[tables.zeltnerLtcParam], ivec2(mi0, ai0), 0).rgb,
+				texelFetch(vkofTextures[tables.zeltnerLtcParam], ivec2(mi1, ai0), 0).rgb,
+				ta
+			),
+			mix(
+				texelFetch(vkofTextures[tables.zeltnerLtcParam], ivec2(mi0, ai1), 0).rgb,
+				texelFetch(vkofTextures[tables.zeltnerLtcParam], ivec2(mi1, ai1), 0).rgb,
 				ta
 			),
 			tm
@@ -286,60 +322,101 @@ f32 utilMicrofacetDielectricEnergyCompensate(
 }
 
 f32 utilMicrofacetPdf(
+	const MaterialTableHandles tables,
 	const OpenPbrMaterial mat,
 	const f32v3 nor,
 	const f32v3 wi,
 	const f32v3 wo
 ) {
-	f32 dotNorWo = dot(nor, wo);
-	// Below the hemisphere contributes no reflection density.
-	if ( dotNorWo <= 0.0 ) {
-		return 0.0;
-	}
-	const f32v3 h = normalize(wi + wo);
-	const f32 dotNorH = max(dot(nor, h), 0.0f);
-	const f32 a2 = (
-		max(mat.specularRoughnessScale * mat.specularRoughnessScale, 0.0001f)
-	);
+	const f32 dotNorWo = dot(nor, wo);
 	const f32 dotNorWi = max(dot(nor, wi), 1e-5f);
-	const f32 G1 = utilMicrofacetSmithG1(dotNorWi, a2);
-	const f32 specPdf = (
-		G1 * utilMicrofacetGgxDistribution(dotNorH, a2) / (4.0f * dotNorWi)
-	);
-	const f32 diffPdf = dotNorWo * IPI;
+
+	// probabilities must match openPbrSampleWo exactly
 	const f32 iorRatio = (mat.specularIor - 1.0f) / (mat.specularIor + 1.0f);
 	f32 f0 = iorRatio * iorRatio;
-	if (f0 == 0.0f) f0 = 0.04f; // dielectric default
+	if (f0 == 0.0f) f0 = 0.04f;
 	const f32 dielectricProbability = (
 		mat.specularWeight * f0
 		* utilMicrofacetDielectricEnergyCompensate(
-			dotNorWi,
-			mat.specularRoughnessScale
+			tables, dotNorWi, mat.specularRoughnessScale
 		)
 	);
-	const f32 specProbability = (
-		max(dielectricProbability, mat.baseMetallic)
-	);
-	const f32 coatA2 = mat.coatRoughness * mat.coatRoughness;
-	const f32 coatG1 = (
-		utilMicrofacetSmithG1(dotNorWi, coatA2)
-	);
-	const f32 coatSpecularProbability = (
-		coatG1
-		* utilMicrofacetGgxDistribution(dotNorH, coatA2) / (4.0f * dotNorWi)
-	);
+	const f32 probabilitySpecular = max(dielectricProbability, mat.baseMetallic);
 	const f32 coatIorRatio = (mat.coatIor - 1.0f) / (mat.coatIor + 1.0f);
 	const f32 coatF0 = coatIorRatio * coatIorRatio;
-	const f32 coatProbability = (
+	const f32 probabilityCoat = (
 		mat.coatWeight * coatF0
-		* utilMicrofacetDielectricEnergyCompensate(dotNorWi, mat.coatRoughness)
+		* utilMicrofacetDielectricEnergyCompensate(
+			tables, dotNorWi, mat.coatRoughness
+		)
 	);
+	const f32v3 fuzzParams = (
+		utilZeltnerFuzzLookup(tables, dotNorWi, mat.fuzzRoughness)
+	);
+	const f32 fuzzA = fuzzParams.x;
+	const f32 fuzzB = fuzzParams.y;
+	const f32 probabilityFuzz = mat.fuzzWeight * fuzzParams.z;
+	const f32 baseBudget = (
+		max(0.0f, 1.0f - probabilityCoat - probabilitySpecular - probabilityFuzz)
+	);
+	const f32 probabilityTransmission = baseBudget * mat.transmissionWeight;
+	const f32 probabilityDiff = baseBudget * (1.0f - mat.transmissionWeight);
+	const f32 probabilityTotal = (
+		probabilityCoat + probabilitySpecular + probabilityDiff
+		+ probabilityFuzz + probabilityTransmission
+	);
+
+	// transmitted direction: reflection lobes contribute 0
+	if (dotNorWo <= 0.0f) {
+		/*
+			VNDF refraction PDF (Walter et al. 2007):\\
+			pdf(\omega_o) =
+				G_1(\omega_i) \cdot D(h_t) \cdot \frac{|\omega_i \cdot h_t|}{|\omega_i \cdot n|}
+				\cdot \frac{\eta_t^2 \cdot |\omega_o \cdot h_t|}
+				           {(\omega_i \cdot h_t + \eta_t |\omega_o \cdot h_t|)^2}
+		*/
+		const f32 eta = mat.specularIor;
+		const f32v3 ht = normalize(-(wi + eta * wo));
+		const f32v3 htOriented = dot(ht, nor) < 0.0f ? -ht : ht;
+		const f32 dotNorHt = max(dot(nor, htOriented), 0.0f);
+		const f32 dotHtWi = max(dot(htOriented, wi), 0.0f);
+		const f32 dotHtWo = max(abs(dot(htOriented, wo)), 0.0f);
+		const f32 a2 = mat.specularRoughnessScale * mat.specularRoughnessScale;
+		const f32 G1 = utilMicrofacetSmithG1(dotNorWi, a2);
+		const f32 D = utilMicrofacetGgxDistribution(dotNorHt, a2);
+		const f32 denom = dotHtWi + eta * dotHtWo;
+		const f32 transmPdf = (
+			G1 * D * dotHtWi / dotNorWi
+			* eta * eta * dotHtWo
+			/ max(denom * denom, 1e-6f)
+		);
+		return probabilityTransmission * transmPdf / probabilityTotal;
+	}
+
+	// reflection PDFs
+	const f32v3 h = normalize(wi + wo);
+	const f32 dotNorH = max(dot(nor, h), 0.0f);
+	const f32 a2 = max(mat.specularRoughnessScale * mat.specularRoughnessScale, 0.0001f);
+	const f32 G1 = utilMicrofacetSmithG1(dotNorWi, a2);
+	const f32 specPdf = G1 * utilMicrofacetGgxDistribution(dotNorH, a2) / (4.0f * dotNorWi);
+	const f32 diffPdf = dotNorWo * IPI;
+	const f32 coatA2 = mat.coatRoughness * mat.coatRoughness;
+	const f32 coatG1 = utilMicrofacetSmithG1(dotNorWi, coatA2);
+	const f32 coatSpecularProbability = (
+		coatG1 * utilMicrofacetGgxDistribution(dotNorH, coatA2) / (4.0f * dotNorWi)
+	);
+	const f32 fuzzSinNorWo = sqrt(max(0.0f, 1.0f - dotNorWo * dotNorWo));
+	const f32 fuzzTx = fuzzA * fuzzSinNorWo + fuzzB * dotNorWo;
+	const f32 fuzzTz = dotNorWo;
+	const f32 fuzzLenT2 = max(fuzzTx * fuzzTx + fuzzTz * fuzzTz, 1e-8f);
+	const f32 fuzzPdf = dotNorWo * fuzzA * fuzzA * IPI / (fuzzLenT2 * fuzzLenT2);
+
 	return (
-		coatProbability * coatSpecularProbability
-		+ specProbability * specPdf
-		+ (1.0f - max(coatProbability, specProbability)) * diffPdf
+		probabilityCoat * coatSpecularProbability / probabilityTotal
+		+ probabilitySpecular * specPdf / probabilityTotal
+		+ probabilityDiff * diffPdf / probabilityTotal
+		+ probabilityFuzz * fuzzPdf / probabilityTotal
 	);
-	return specProbability * specPdf + (1.0f - specProbability) * diffPdf;
 }
 
 // -----------------------------------------------------------------------------
@@ -361,6 +438,62 @@ f32 utilOrenNayerEnergyCompensate(const f32 mu, const f32 r) {
 // -----------------------------------------------------------------------------
 // -- utility material evaluation
 // -----------------------------------------------------------------------------
+
+f32v3 openPbrTransmissionEvaluateF(
+	const OpenPbrMaterial mat,
+	const f32v3 nor,
+	const f32v3 wi,
+	const f32v3 wo
+) {
+	/*
+		microfacet BTDF (Walter et al. 2007):\\
+		h_t = -(\eta_i \omega_i + \eta_t \omega_o) / |\eta_i \omega_i + \eta_t \omega_o|\\
+		f_t(\omega_i, \omega_o) =
+			\frac
+				{(1 - F(\omega_i \cdot h_t, \eta_t)) \cdot D(h_t) \cdot G_2(\omega_i, \omega_o)
+				\cdot |\omega_i \cdot h_t| \cdot |\omega_o \cdot h_t| \cdot \eta_t^2}
+				{|\omega_i \cdot n| \cdot |\omega_o \cdot n|
+				\cdot (\omega_i \cdot h_t + \eta_t |\omega_o \cdot h_t|)^2}
+		\\
+		utilMicrofacetSmithGgxVisibility returns V = G_2 / (4 |\omega_i \cdot n| |\omega_o \cdot n|)
+		so this simplifies to:\\
+		f_t = (1 - F) \cdot D \cdot V \cdot
+		      \frac{4 |\omega_i \cdot h_t| \cdot |\omega_o \cdot h_t| \cdot \eta_t^2}
+		           {(\omega_i \cdot h_t + \eta_t |\omega_o \cdot h_t|)^2}
+		\\
+		when transmissionDepth = 0: transmissionColor tints as a constant Fresnel factor (spec 3.7.4).
+		when transmissionDepth > 0: Beer-Lambert in utilIrradiancePropagate handles the color.
+	*/
+	const f32 eta = mat.specularIor;
+	// h_t = -normalize(\eta_i \omega_i + \eta_t \omega_o), \eta_i = 1
+	const f32v3 ht = normalize(-(wi + eta * wo));
+	const f32v3 htOriented = dot(ht, nor) < 0.0f ? -ht : ht;
+
+	const f32 dotNorWi = max(dot(nor, wi), 1e-5f);
+	const f32 dotNorWo = max(abs(dot(nor, wo)), 1e-5f);
+	// |\omega_i \cdot h_t|, |\omega_o \cdot h_t|
+	const f32 dotHtWi = max(dot(htOriented, wi), 0.0f);
+	const f32 dotHtWo = max(abs(dot(htOriented, wo)), 0.0f);
+	const f32 dotNorHt = max(dot(nor, htOriented), 0.0f);
+
+	const f32 a2 = max(mat.specularRoughnessScale * mat.specularRoughnessScale, 1e-4f);
+	// F(\omega_i \cdot h_t, \eta_t)
+	const f32 F = utilMicrofacetFresnelDielectric(dotHtWi, eta);
+	// D(h_t)
+	const f32 D = utilMicrofacetGgxDistribution(dotNorHt, a2);
+	// V = G_2 / (4 |\omega_i \cdot n| |\omega_o \cdot n|)
+	const f32 V = utilMicrofacetSmithGgxVisibility(dotNorWi, dotNorWo, a2);
+	// \omega_i \cdot h_t + \eta_t |\omega_o \cdot h_t|
+	const f32 denom = dotHtWi + eta * dotHtWo;
+	const f32 btdf = (
+		(1.0f - F) * D * V
+		* 4.0f * dotHtWi * dotHtWo * eta * eta
+		/ max(denom * denom, 1e-6f)
+	);
+	// transmissionDepth = 0: transmissionColor is a constant Fresnel tint (spec 3.7.4)
+	const f32v3 tint = (mat.transmissionDepth <= 0.0f) ? mat.transmissionColor : f32v3(1.0f);
+	return tint * btdf;
+}
 
 f32v3 openPbrFresnelMetallicEvaluateF(
 	const OpenPbrMaterial mat,
@@ -420,6 +553,7 @@ f32v3 openPbrFresnelMetallicEvaluateF(
 }
 
 f32v3 openPbrCoatEvaluateF(
+	const MaterialTableHandles tables,
 	const OpenPbrMaterial mat,
 	const f32v3 nor,
 	const f32v3 wi,
@@ -455,6 +589,7 @@ f32v3 openPbrCoatEvaluateF(
 	const f32 coatEnergyCompensation = (
 		f0
 		* utilMicrofacetDielectricEnergyCompensate(
+			tables,
 			dot(nor, wo),
 			mat.coatRoughness
 		)
@@ -620,6 +755,7 @@ f32v3 openPbrGlossyDiffuseOrenNayerEvaluateF(
 }
 
 f32v3 openPbrGlossyDiffuseEvaluateF(
+	const MaterialTableHandles tables,
 	const OpenPbrMaterial mat,
 	const f32v3 nor,
 	const f32v3 wi,
@@ -692,6 +828,7 @@ f32v3 openPbrGlossyDiffuseEvaluateF(
 	const f32 dielectricEnergyCompensate = (
 		mat.specularWeight * f0
 		* utilMicrofacetDielectricEnergyCompensate(
+			tables,
 			dot(nor, wo),
 			mat.specularRoughnessScale
 		)
@@ -702,6 +839,7 @@ f32v3 openPbrGlossyDiffuseEvaluateF(
 }
 
 f32v3 openPbrSubsurfaceEvaluateF(
+	const MaterialTableHandles tables,
 	const OpenPbrMaterial mat,
 	const f32v3 nor,
 	const f32v3 wi,
@@ -744,6 +882,7 @@ f32v3 openPbrSubsurfaceEvaluateF(
 	const f32 dielectricEnergy = (
 		mat.specularWeight * f0
 		* utilMicrofacetDielectricEnergyCompensate(
+			tables,
 			dot(nor, wo),
 			mat.specularRoughnessScale
 		)
@@ -756,25 +895,97 @@ f32v3 openPbrSubsurfaceEvaluateF(
 	return f32v3(fSpec) + fBelow;
 }
 
+f32v3 openPbrFuzzEvaluateF(
+	const MaterialTableHandles tables,
+	const OpenPbrMaterial mat,
+	const f32v3 coatedBase,
+	const f32v3 nor,
+	const f32v3 wi,
+	const f32v3 wo
+) {
+	// homogeneous volumetric layer with fiber-like SGGX microflake phase fn
+	/*
+		cos\theta_i f_{fuzz}(\omega_i, \omega_o) =
+			F_c E_{fuzz}(cos\theta_o, \alpha)
+			D(cos\theta_i | cos\theta_o, \alpha)
+		\\
+
+		layer(M_{coated-base}, S_{fuzz}, F_w) \rightarrow
+			F_w f_{fuzz} + (1 - F_w \cdot E_{fuzz}) f_{coated-base}
+		\\
+
+		f_{fuzz}(\omega_i, \omega_o) cos\theta_o =
+			C_{sheen} \cdot R_i \cdot D_o
+			(\frac{M_i^{-1} \cdot \omega_o}{|| M_i^{-1} \cdot \omega_o ||})
+			\frac{|M_i^{-1}|}{|| M_i^{-1} \cdot \omega_o ||^3}
+		\\
+
+		M_i^{-1} = [[a, 0, b], [0, a, 0], [0, 0, 1]] \\
+		t = M_i^{-1} \cdot \omega_{o_{local}} = (
+			a \cdot sin\theta_o \cdot \cos\phi + b \cdot cos\theta_o,
+			a \cdot sin\theta_o \cdot \sin\phi,
+			cos\theta_o
+		)\\
+
+		where,
+			F_c = fuzz color
+			E_{fuzz} = energy compensation for the fuzz layer
+			D = SGGX microflake phase function
+	*/
+
+	// note that fuzz is isotropic
+	const f32v3 fuzzLtcParams = (
+		// M_i^{-1} \cdot \omega_o
+		utilZeltnerFuzzLookup(tables, dot(nor, wi), mat.fuzzRoughness)
+	);
+	const f32 a = fuzzLtcParams.x;
+	const f32 b = fuzzLtcParams.y;
+	const f32 eFuzz = fuzzLtcParams.z;
+
+	// need to apply M_i^{-1} to wo in local frame
+	const f32 dotNorWo = dot(nor, wo);
+	const f32 sinNorWo = sqrt(max(0.0f, 1.0f - dotNorWo * dotNorWo));
+	const f32 tx = a * sinNorWo + b * dotNorWo;
+	const f32 tz = dotNorWo;
+	const f32 lenT2 = tx * tx + tz * tz;
+
+	// f_{fuzz}
+	const f32v3 fFuzz = (
+		mat.fuzzColor
+		* eFuzz
+		* a*a * IPI / (lenT2 * lenT2)
+	);
+
+	return mat.fuzzWeight * fFuzz + (1.0f - mat.fuzzWeight) * coatedBase;
+}
+
 // -----------------------------------------------------------------------------
 // -- public api
 // -----------------------------------------------------------------------------
 
 f32v3 openPbrEvaluateF(
+	const MaterialTableHandles tables,
 	const f32v3 nor,
 	const f32v3 wi,
 	const f32v3 wo,
 	OpenPbrMaterial mat
 ) {
+	// for transmitted wo, reflection lobes produce garbage — only transmission contributes
+	if (dot(nor, wo) < 0.0f) {
+		return (
+			mat.transmissionWeight
+			* openPbrTransmissionEvaluateF(mat, nor, wi, wo)
+		);
+	}
 	// M_opaque_base = mix(M_glossy_diffuse, S_subsurface, subsurfaceWeight)
-	const f32v3 glossyDiffuse = openPbrGlossyDiffuseEvaluateF(mat, nor, wi, wo);
+	const f32v3 glossyDiffuse = (
+		openPbrGlossyDiffuseEvaluateF(tables, mat, nor, wi, wo)
+	);
 	// no SSS for now
-	// const f32v3 subsurface = openPbrSubsurfaceEvaluateF(mat, nor, wi, wo);
+	// const f32v3 subsurface = openPbrSubsurfaceEvaluateF(tables, mat, nor, wi, wo);
 	const f32v3 subsurface = f32v3(0.0f);
 	const f32v3 opaqueBase = mix(glossyDiffuse, subsurface, mat.subsurfaceWeight);
-
-	// no transmission for now
-	const f32v3 transmission = f32v3(0.0f);
+	const f32v3 transmission = openPbrTransmissionEvaluateF(mat, nor, wi, wo);
 	const f32v3 dielectricBase = (
 		mix(opaqueBase, transmission, mat.transmissionWeight)
 	);
@@ -783,28 +994,34 @@ f32v3 openPbrEvaluateF(
 	const f32v3 baseSubstrate = mix(dielectricBase, metal, mat.baseMetallic);
 
 	const f32v3 coatedBase = (
-		openPbrCoatEvaluateF(mat, nor, wi, wo, baseSubstrate)
+		openPbrCoatEvaluateF(tables, mat, nor, wi, wo, baseSubstrate)
+	);
+	const f32v3 fuzz = (
+		openPbrFuzzEvaluateF(tables, mat, coatedBase, nor, wi, wo)
 	);
 
 	// TODO fuzz, thin film, emission, ambient medium
 
-	return coatedBase;
+	return fuzz;
 }
 
 f32 openPbrEvaluatePdf(
+	const MaterialTableHandles tables,
 	const f32v3 nor,
 	const f32v3 wi,
 	const f32v3 wo,
 	const OpenPbrMaterial mat
 ) {
-	return utilMicrofacetPdf(mat, nor, wi, wo);
+	return utilMicrofacetPdf(tables, mat, nor, wi, wo);
 }
 
 f32v3 openPbrSampleWo(
+	const MaterialTableHandles tables,
 	const f32v3 nor,
 	const f32v3 wi,
 	const OpenPbrMaterial mat,
 	out f32 pdf,
+	out bool sampledTransmission,
 	inout f32 seed,
 	inout f32v2 seed2
 ) {
@@ -815,6 +1032,7 @@ f32v3 openPbrSampleWo(
 	const f32 dielectricProbability = (
 		mat.specularWeight * f0
 		* utilMicrofacetDielectricEnergyCompensate(
+			tables,
 			dot(nor, wi),
 			mat.specularRoughnessScale
 		)
@@ -825,38 +1043,93 @@ f32v3 openPbrSampleWo(
 	const f32 probabilityCoat = (
 		mat.coatWeight * coatF0
 		* utilMicrofacetDielectricEnergyCompensate(
+			tables,
 			dot(nor, wi),
 			mat.coatRoughness
 		)
 	);
 	const f32 probabilitySpecular = max(dielectricProbability, mat.baseMetallic);
-	const f32 probabilityDiff = (
-		max(0.0f, 1.0f - probabilityCoat - probabilitySpecular)
+	const f32v3 fuzzSampleParams = (
+		utilZeltnerFuzzLookup(tables, dot(nor, wi), mat.fuzzRoughness)
 	);
+	const f32 fuzzSampleA = fuzzSampleParams.x;
+	const f32 fuzzSampleB = fuzzSampleParams.y;
+	const f32 probabilityFuzz = mat.fuzzWeight * fuzzSampleParams.z;
+	const f32 baseBudget = (
+		max(0.0f, 1.0f - probabilityCoat - probabilitySpecular - probabilityFuzz)
+	);
+	const f32 probabilityTransmission = baseBudget * mat.transmissionWeight;
+	const f32 probabilityDiff = baseBudget * (1.0f - mat.transmissionWeight);
 	const f32 probabilityTotal = (
-		probabilityCoat + probabilitySpecular + probabilityDiff
+		probabilityCoat + probabilitySpecular + probabilityDiff + probabilityFuzz
+		+ probabilityTransmission
 	);
 	const f32 u = fnSampleUniform(seed);
 
+	const bool isCoat = (
+		u < probabilityCoat / probabilityTotal
+	);
+	const bool isSpecular = (
+		u < (probabilityCoat + probabilitySpecular) / probabilityTotal
+	);
+	const bool isFuzz = (
+		u < (
+			(
+				probabilityCoat + probabilitySpecular + probabilityFuzz
+			) / probabilityTotal
+		)
+	);
+	const bool isTransmission = (
+		u < (
+			(
+				probabilityCoat + probabilitySpecular + probabilityFuzz
+				+ probabilityTransmission
+			) / probabilityTotal
+		)
+	);
+
 	f32v3 wo;
-	if (u < probabilityCoat / probabilityTotal) {
+	sampledTransmission = false;
+	if (isCoat) {
+		const f32v2 xi = fnSampleUniform2(seed2);
+		const f32 roughness = max(mat.coatRoughness, 1e-5f);
+		const f32v3 h = utilMicrofacetSampleGgxVndf(nor, wi, roughness, xi);
+		wo = normalize(2.0f * dot(wi, h) * h - wi);
+	} else if (isSpecular) {
 		const f32v3 h = (
 			utilMicrofacetSampleGgxVndf(
-				nor, wi, max(mat.coatRoughness, 1e-5f),
+				nor, wi, max(mat.specularRoughnessScale, 1e-5f),
 				fnSampleUniform2(seed2)
 			)
 		);
 		wo = normalize(2.0f * dot(wi, h) * h - wi);
-	} else if (u < (probabilityCoat + probabilitySpecular) / probabilityTotal) {
-		// sample specular microfacet
+	} else if (isFuzz) {
+		const f32v2 xi = fnSampleUniform2(seed2);
+		const f32v3 dLocal = utilToCartesian(sqrt(xi.x), TAU * xi.y);
+		// M = inv(M^{-1}) = [[1/a, 0, -b/a], [0, 1/a, 0], [0, 0, 1]]
+		const f32 safeA = max(fuzzSampleA, 1e-5f);
+		const f32v3 tLocal = f32v3(
+			(dLocal.x - fuzzSampleB * dLocal.z) / safeA,
+			dLocal.y / safeA,
+			dLocal.z
+		);
+		wo = normalize(utilReorientHemisphere(tLocal, nor));
+	} else if (isTransmission) {
 		const f32v2 xi = fnSampleUniform2(seed2);
 		const f32 roughness = max(mat.specularRoughnessScale, 1e-5f);
 		const f32v3 h = utilMicrofacetSampleGgxVndf(nor, wi, roughness, xi);
-		wo = normalize(2.0f * dot(wi, h) * h - wi);
+		const f32v3 refracted = refract(-wi, h, 1.0f / mat.specularIor);
+		if (length(refracted) > 0.5f) {
+			wo = refracted;
+			sampledTransmission = true;
+		} else {
+			// total internal reflection — reflect instead
+			wo = normalize(2.0f * dot(wi, h) * h - wi);
+		}
 	} else {
 		wo = utilCosineHemisphereSampleWo(nor, seed2);
 	}
-	pdf = utilMicrofacetPdf(mat, nor, wi, wo);
+	pdf = utilMicrofacetPdf(tables, mat, nor, wi, wo);
 	return wo;
 }
 

@@ -62,14 +62,17 @@ struct GpuMorMaterial {
 	u32 textureClearcoat;
 	u32 textureClearcoatRoughness;
 	f32v3 fuzzColor;
+	f32 fuzzWeight;
 	f32 fuzzRoughness;
 	u32 textureFuzz;
 	f32 subsurfaceWeight;
 	f32v3 subsurfaceColor;
 	f32 subsurfaceRadius;
 	u32 textureSubsurface;
+	u32 textureSubsurfaceColor;
 	f32 transmissionWeight;
 	u32 textureTransmission;
+	u32 textureTransmissionColor;
 	f32v3 transmissionColor;
 	f32 transmissionDepth;
 	f32 thinFilmWeight;
@@ -89,6 +92,30 @@ struct GpuMorMaterial {
 	f32 geometryOpacity;
 	u32 flags;
 };
+
+// X(uiLabel, field, texField)
+#define MOR_MATERIAL_RGBA_PARAMS(X) \
+	X("base color", baseColor, textureBaseColor)
+
+// X(uiLabel, field, texField)
+#define MOR_MATERIAL_RGB_PARAMS(X) \
+	X("emissive color",     emissiveColor,     textureEmissive)          \
+	X("specular color",     specularColor,     textureSpecularColor)     \
+	X("fuzz color",         fuzzColor,         textureFuzz)              \
+	X("subsurface color",   subsurfaceColor,   textureSubsurfaceColor)   \
+	X("transmission color", transmissionColor, textureTransmissionColor)
+
+// X(uiLabel, field, texField, swizzle)
+// All use *= sampling; thinFilmThickness uses mix() and is handled separately
+#define MOR_MATERIAL_SCALAR_TEX_PARAMS(X) \
+	X("specular weight",    specularWeight,              textureSpecular,           a) \
+	X("coat weight",        coatWeight,                  textureClearcoat,          r) \
+	X("coat roughness",     coatRoughness,               textureClearcoatRoughness, g) \
+	X("fuzz roughness",     fuzzRoughness,               textureFuzzRoughness,      g) \
+	X("subsurface weight",  subsurfaceWeight,            textureSubsurface,         r) \
+	X("transmission weight",transmissionWeight,          textureTransmission,       r) \
+	X("thin film weight",   thinFilmWeight,              textureIridescence,        r) \
+	X("anisotropy",         specularRoughnessAnisotropy, textureAnisotropy,         b)
 
 struct GpuMorInstance {
 	f32m44 transform;

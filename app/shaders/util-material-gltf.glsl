@@ -56,96 +56,52 @@ OpenPbrMaterial openPbrMaterialFromGltf(
 	const f32v2 uvDy,
 	out f32v3 modelNormal
 ) {
-	f32v4 baseColor = mat.baseColor;
-	if (mat.textureBaseColor != 0u) {
-		baseColor *= fnSampleTexture(mat.textureBaseColor, uv, uvDx, uvDy);
-	}
+#define SAMPLER(h) fnSampleTexture(h, uv, uvDx, uvDy)
+
+#define SAMPLE_RGBA(label, field, texField) \
+	f32v4 field = mat.field; \
+	if (mat.texField != 0u) { field *= SAMPLER(mat.texField); }
+#define SAMPLE_RGB(label, field, texField) \
+	f32v3 field = mat.field; \
+	if (mat.texField != 0u) { field *= SAMPLER(mat.texField).rgb; }
+#define SAMPLE_SCALAR(label, field, texField, swizzle) \
+	f32 field = mat.field; \
+	if (mat.texField != 0u) { field *= SAMPLER(mat.texField).swizzle; }
+
+	MOR_MATERIAL_RGBA_PARAMS(SAMPLE_RGBA)
+	MOR_MATERIAL_RGB_PARAMS(SAMPLE_RGB)
+	MOR_MATERIAL_SCALAR_TEX_PARAMS(SAMPLE_SCALAR)
+
+#undef SAMPLE_RGBA
+#undef SAMPLE_RGB
+#undef SAMPLE_SCALAR
+
+	// metallic roughness: shared texture, two channels
 	f32 roughness = mat.specularRoughness;
 	f32 metallic = mat.baseMetalness;
 	if (mat.textureMetallicRoughness != 0u) {
-		const f32v4 mr = (
-			fnSampleTexture(mat.textureMetallicRoughness, uv, uvDx, uvDy)
-		);
+		const f32v4 mr = SAMPLER(mat.textureMetallicRoughness);
 		roughness *= mr.g;
 		metallic *= mr.b;
 	}
-	f32v3 emissiveColor = mat.emissiveColor;
-	if (mat.textureEmissive != 0u) {
-		emissiveColor *= fnSampleTexture(mat.textureEmissive, uv, uvDx, uvDy).rgb;
-	}
+
+	// normal map: unpack [-1,1] not a multiply
 	f32v3 normal = f32v3(0.0f, 0.0f, 1.0f);
 	if (mat.textureNormal != 0u) {
 		normal = (
-			fnSampleTexture(mat.textureNormal, uv, uvDx, uvDy).rgb * 2.0f - 1.0f
+			SAMPLER(mat.textureNormal).rgb * 2.0f - 1.0f
 		);
 	}
 	modelNormal = normal;
 
-	f32v3 specularColor = mat.specularColor;
-	f32 specularWeight = mat.specularWeight;
-	if (mat.textureSpecularColor != 0u) {
-		specularColor *= (
-			fnSampleTexture(mat.textureSpecularColor, uv, uvDx, uvDy).rgb
-		);
-	}
-	if (mat.textureSpecular != 0u) {
-		specularWeight *= fnSampleTexture(mat.textureSpecular, uv, uvDx, uvDy).a;
-	}
-
-	f32 coatWeight = mat.coatWeight;
-	f32 coatRoughness = mat.coatRoughness;
-	if (mat.textureClearcoat != 0u) {
-		coatWeight *= fnSampleTexture(mat.textureClearcoat, uv, uvDx, uvDy).r;
-	}
-	if (mat.textureClearcoatRoughness != 0u) {
-		coatRoughness *= (
-			fnSampleTexture(mat.textureClearcoatRoughness, uv, uvDx, uvDy).g
-		);
-	}
-
-	f32v3 fuzzColor = mat.fuzzColor;
-	f32 fuzzRoughness = mat.fuzzRoughness;
-	if (mat.textureFuzz != 0u) {
-		fuzzColor *= fnSampleTexture(mat.textureFuzz, uv, uvDx, uvDy).rgb;
-	}
-	if (mat.textureFuzzRoughness != 0u) {
-		fuzzRoughness *= (
-			fnSampleTexture(mat.textureFuzzRoughness, uv, uvDx, uvDy).g
-		);
-	}
-	const f32 fuzzWeight = max(fuzzColor.r, max(fuzzColor.g, fuzzColor.b));
-	fuzzColor = (fuzzWeight > 0.0f) ? (fuzzColor / fuzzWeight) : f32v3(1.0f);
-
-	f32 subsurfaceWeight = mat.subsurfaceWeight;
-	if (mat.textureSubsurface != 0u) {
-		subsurfaceWeight *= fnSampleTexture(mat.textureSubsurface, uv, uvDx, uvDy).r;
-	}
-
-	f32 transmissionWeight = mat.transmissionWeight;
-	if (mat.textureTransmission != 0u) {
-		transmissionWeight *= (
-			fnSampleTexture(mat.textureTransmission, uv, uvDx, uvDy).r
-		);
-	}
-
-	f32 thinFilmWeight = mat.thinFilmWeight;
-	if (mat.textureIridescence != 0u) {
-		thinFilmWeight *= fnSampleTexture(mat.textureIridescence, uv, uvDx, uvDy).r;
-	}
+	// thin film thickness: mix between min/max, not a multiply
 	f32 thinFilmThickness = mat.thinFilmThickness;
 	if (mat.textureIridescenceThickness != 0u) {
-		const f32 t = (
-			fnSampleTexture(mat.textureIridescenceThickness, uv, uvDx, uvDy).r
-		);
+		const f32 t = SAMPLER(mat.textureIridescenceThickness).r;
 		thinFilmThickness = mix(mat.thinFilmThicknessMin, mat.thinFilmThickness, t);
 	}
 
-	f32 specularRoughnessAnisotropy = mat.specularRoughnessAnisotropy;
-	if (mat.textureAnisotropy != 0u) {
-		specularRoughnessAnisotropy *= (
-			fnSampleTexture(mat.textureAnisotropy, uv, uvDx, uvDy).b
-		);
-	}
+#undef SAMPLER
 
 	const uint alphaMode = mat.flags & 0x3u;
 	const f32 geometryOpacity = (
@@ -156,7 +112,7 @@ OpenPbrMaterial openPbrMaterialFromGltf(
 
 	OpenPbrMaterial pbrMat;
 	pbrMat.baseColor = baseColor.rgb;
-	pbrMat.baseWeight = 1.0f;
+	pbrMat.baseWeight = 1.0f - mat.transmissionWeight;
 	pbrMat.baseMetallic = metallic;
 	pbrMat.baseDiffuseRoughness = 0.04f;
 	pbrMat.specularColor = specularColor;
@@ -165,20 +121,20 @@ OpenPbrMaterial openPbrMaterialFromGltf(
 	pbrMat.specularRoughnessScale = clamp(roughness, 0.04f, 1.0f);
 	pbrMat.specularRoughnessAnisotropy = specularRoughnessAnisotropy;
 	pbrMat.subsurfaceWeight = subsurfaceWeight;
-	pbrMat.subsurfaceColor = mat.subsurfaceColor;
+	pbrMat.subsurfaceColor = subsurfaceColor;
 	pbrMat.subsurfaceRadius = mat.subsurfaceRadius;
 	pbrMat.subsurfaceRadiusScale = f32v3(1.0f, 0.5f, 0.25f);
 	pbrMat.subsurfaceScatterAnisotropy = 0.0f;
 	pbrMat.transmissionWeight = transmissionWeight;
-	pbrMat.transmissionColor = mat.transmissionColor;
+	pbrMat.transmissionColor = transmissionColor;
 	pbrMat.transmissionDepth = mat.transmissionDepth;
 	pbrMat.transmissionDispersionAbbeNumber = mat.transmissionDispersionAbbeNumber;
 	pbrMat.coatWeight = coatWeight;
-	pbrMat.coatColor = mat.subsurfaceColor;
+	pbrMat.coatColor = subsurfaceColor;
 	pbrMat.coatRoughness = clamp(coatRoughness, 0.04f, 1.0f);
 	pbrMat.coatIor = 1.6f;
-	pbrMat.fuzzWeight = fuzzWeight;
-	pbrMat.fuzzColor = fuzzColor;
+	pbrMat.fuzzWeight = mat.fuzzWeight;
+	pbrMat.fuzzColor = mat.fuzzColor;
 	pbrMat.fuzzRoughness = clamp(fuzzRoughness, 0.04f, 1.0f);
 	pbrMat.thinFilmWeight = thinFilmWeight;
 	pbrMat.thinFilmIor = mat.thinFilmIor;
@@ -229,98 +185,56 @@ OpenPbrMaterial openPbrMaterialFromGltfWithLod(
 	const uint lod,
 	out f32v3 modelNormal
 ) {
-	f32v4 baseColor = mat.baseColor;
-	if (mat.textureBaseColor != 0u) {
-		baseColor *= fnSampleTextureWithLod(mat.textureBaseColor, uv, lod);
-	}
+#define SAMPLER(h) fnSampleTextureWithLod(h, uv, lod)
+
+#define SAMPLE_RGBA(label, field, texField) \
+	f32v4 field = mat.field; \
+	if (mat.texField != 0u) { field *= SAMPLER(mat.texField); }
+#define SAMPLE_RGB(label, field, texField) \
+	f32v3 field = mat.field; \
+	if (mat.texField != 0u) { field *= SAMPLER(mat.texField).rgb; }
+#define SAMPLE_SCALAR(label, field, texField, swizzle) \
+	f32 field = mat.field; \
+	if (mat.texField != 0u) { field *= SAMPLER(mat.texField).swizzle; }
+
+	MOR_MATERIAL_RGBA_PARAMS(SAMPLE_RGBA)
+	MOR_MATERIAL_RGB_PARAMS(SAMPLE_RGB)
+	MOR_MATERIAL_SCALAR_TEX_PARAMS(SAMPLE_SCALAR)
+
+#undef SAMPLE_RGBA
+#undef SAMPLE_RGB
+#undef SAMPLE_SCALAR
+
+	// metallic roughness: shared texture, two channels
 	f32 roughness = mat.specularRoughness;
 	f32 metallic = mat.baseMetalness;
 	if (mat.textureMetallicRoughness != 0u) {
-		const f32v4 mr = (
-			fnSampleTextureWithLod(mat.textureMetallicRoughness, uv, lod)
-		);
+		const f32v4 mr = SAMPLER(mat.textureMetallicRoughness);
 		roughness *= mr.g;
 		metallic *= mr.b;
 	}
-	f32v3 emissiveColor = mat.emissiveColor;
-	if (mat.textureEmissive != 0u) {
-		emissiveColor *= (
-			fnSampleTextureWithLod(mat.textureEmissive, uv, lod).rgb
-		);
-	}
+
+	// normal map: unpack [-1,1] not a multiply
 	f32v3 normal = f32v3(0.0f, 0.0f, 1.0f);
 	if (mat.textureNormal != 0u) {
 		normal = (
-			fnSampleTextureWithLod(mat.textureNormal, uv, lod).rgb * 2.0f - 1.0f
+			SAMPLER(mat.textureNormal).rgb * 2.0f - 1.0f
 		);
 	}
 	modelNormal = normal;
 
-	f32v3 specularColor = mat.specularColor;
-	f32 specularWeight = mat.specularWeight;
-	if (mat.textureSpecularColor != 0u) {
-		specularColor *= (
-			fnSampleTextureWithLod(mat.textureSpecularColor, uv, lod).rgb
-		);
-	}
-	if (mat.textureSpecular != 0u) {
-		specularWeight *= fnSampleTextureWithLod(mat.textureSpecular, uv, lod).a;
-	}
-
-	f32 coatWeight = mat.coatWeight;
-	f32 coatRoughness = mat.coatRoughness;
-	if (mat.textureClearcoat != 0u) {
-		coatWeight *= fnSampleTextureWithLod(mat.textureClearcoat, uv, lod).r;
-	}
-	if (mat.textureClearcoatRoughness != 0u) {
-		coatRoughness *= (
-			fnSampleTextureWithLod(mat.textureClearcoatRoughness, uv, lod).g
-		);
-	}
-
-	f32v3 fuzzColor = mat.fuzzColor;
-	f32 fuzzRoughness = mat.fuzzRoughness;
-	if (mat.textureFuzz != 0u) {
-		fuzzColor *= fnSampleTextureWithLod(mat.textureFuzz, uv, lod).rgb;
-	}
-	if (mat.textureFuzzRoughness != 0u) {
-		fuzzRoughness *= fnSampleTextureWithLod(mat.textureFuzzRoughness, uv, lod).g;
-	}
-	const f32 fuzzWeight = max(fuzzColor.r, max(fuzzColor.g, fuzzColor.b));
-	fuzzColor = (fuzzWeight > 0.0f) ? (fuzzColor / fuzzWeight) : f32v3(1.0f);
-
-	f32 subsurfaceWeight = mat.subsurfaceWeight;
-	if (mat.textureSubsurface != 0u) {
-		subsurfaceWeight *= (
-			fnSampleTextureWithLod(mat.textureSubsurface, uv, lod).r
-		);
-	}
-
-	f32 transmissionWeight = mat.transmissionWeight;
-	if (mat.textureTransmission != 0u) {
-		transmissionWeight *= (
-			fnSampleTextureWithLod(mat.textureTransmission, uv, lod).r
-		);
-	}
-
-	f32 thinFilmWeight = mat.thinFilmWeight;
-	if (mat.textureIridescence != 0u) {
-		thinFilmWeight *= fnSampleTextureWithLod(mat.textureIridescence, uv, lod).r;
-	}
+	// thin film thickness: mix between min/max, not a multiply
 	f32 thinFilmThickness = mat.thinFilmThickness;
 	if (mat.textureIridescenceThickness != 0u) {
-		const f32 t = (
-			fnSampleTextureWithLod(mat.textureIridescenceThickness, uv, lod).r
-		);
+		const f32 t = SAMPLER(mat.textureIridescenceThickness).r;
 		thinFilmThickness = mix(mat.thinFilmThicknessMin, mat.thinFilmThickness, t);
 	}
 
-	f32 specularRoughnessAnisotropy = mat.specularRoughnessAnisotropy;
-	if (mat.textureAnisotropy != 0u) {
-		specularRoughnessAnisotropy *= (
-			fnSampleTextureWithLod(mat.textureAnisotropy, uv, lod).b
-		);
-	}
+#undef SAMPLER
+
+	// fuzz weight = max component of (texture-modulated) fuzz color
+	const f32 fuzzWeight = max(fuzzColor.r, max(fuzzColor.g, fuzzColor.b));
+	fuzzColor = (fuzzWeight > 0.0f) ? (fuzzColor / fuzzWeight) : f32v3(1.0f);
 
 	const uint alphaMode = mat.flags & 0x3u;
 	const f32 geometryOpacity = (
@@ -331,7 +245,7 @@ OpenPbrMaterial openPbrMaterialFromGltfWithLod(
 
 	OpenPbrMaterial pbrMat;
 	pbrMat.baseColor = baseColor.rgb;
-	pbrMat.baseWeight = 1.0f;
+	pbrMat.baseWeight = 1.0f - mat.transmissionWeight;
 	pbrMat.baseMetallic = metallic;
 	pbrMat.baseDiffuseRoughness = 0.04f;
 	pbrMat.specularColor = specularColor;
@@ -340,16 +254,16 @@ OpenPbrMaterial openPbrMaterialFromGltfWithLod(
 	pbrMat.specularRoughnessScale = clamp(roughness, 0.04f, 1.0f);
 	pbrMat.specularRoughnessAnisotropy = specularRoughnessAnisotropy;
 	pbrMat.subsurfaceWeight = subsurfaceWeight;
-	pbrMat.subsurfaceColor = mat.subsurfaceColor;
+	pbrMat.subsurfaceColor = subsurfaceColor;
 	pbrMat.subsurfaceRadius = mat.subsurfaceRadius;
 	pbrMat.subsurfaceRadiusScale = f32v3(1.0f, 0.5f, 0.25f);
 	pbrMat.subsurfaceScatterAnisotropy = 0.0f;
 	pbrMat.transmissionWeight = transmissionWeight;
-	pbrMat.transmissionColor = mat.transmissionColor;
+	pbrMat.transmissionColor = transmissionColor;
 	pbrMat.transmissionDepth = mat.transmissionDepth;
 	pbrMat.transmissionDispersionAbbeNumber = mat.transmissionDispersionAbbeNumber;
 	pbrMat.coatWeight = coatWeight;
-	pbrMat.coatColor = mat.subsurfaceColor;
+	pbrMat.coatColor = subsurfaceColor;
 	pbrMat.coatRoughness = clamp(coatRoughness, 0.04f, 1.0f);
 	pbrMat.coatIor = 1.6f;
 	pbrMat.fuzzWeight = fuzzWeight;

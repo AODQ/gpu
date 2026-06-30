@@ -13,7 +13,7 @@
 //     * direct lighting from light sources
 //     * indirect diffuse lighting via DDGI probes
 //     * specular reflections
-//  * tonemapping
+//  * tonemapping <- except in pt pass moved to pt-accumulate
 // in the future probably the following will also be fused:
 //  * temporal accumulation
 //  * denoising
@@ -46,15 +46,6 @@ vec3 index_color(uint idx) {
 	);
 }
 
-f32v3 fnAces(const f32v3 x) {
-	const f32 a = 2.51;
-	const f32 b = 0.03;
-	const f32 c = 2.43;
-	const f32 d = 0.59;
-	const f32 e = 0.14;
-	return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
-}
-
 #include "probe_sample.glsl"
 #include "sky.glsl"
 
@@ -62,95 +53,166 @@ f32v3 fnAces(const f32v3 x) {
 #include "util-random.glsl"
 #include "util-raytrace.glsl"
 
+void utilGenerateSeeds(
+	out f32 seed,
+	out f32v2 seed2
+) {
+	seed = (
+		fnSampleBluenoise(
+			pc.resolve.bluenoiseVa,
+			pc.resolve.bluenoiseCount,
+			pc.resolve.frameIndex,
+			ivec2(gl_GlobalInvocationID.xy)
+		)
+	);
+	seed += (
+		fract(
+			sin(dot(f32v2(pc.global.time), f32v2(12.9898, 78.233))) * 43758.5453
+		)
+	);
+	seed2 = f32v2(seed * 1.2419241f, seed * 1.61803398875f);
+}
+
 void main() {
-	// -- fetch texel visibility data
 	const GpuDebugPC unf = GpuDebugPCBuffer(pc.global.debug).data;
 	const ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
 	const ivec2 screensize = ivec2(1280, 720);
-	const uint texelPacked = (
-		imageLoad(vkofImagesU[pc.resolve.visibilityImageHandle], coord).r
-	);
 
-	// -- store miss for pixels that weren't rendered
-	if (texelPacked == 0u || texelPacked == 0xFFFFFFFFu) {
-		imageStore(
-			vkofImages[pc.resolve.outputImageHandle],
-			coord,
-			vec4(0.1f, 0.1f, 0.1f, 1.0f)
+	f32 seed;
+	f32v2 seed2;
+	utilGenerateSeeds(seed, seed2);
+
+	f32v3 origin;
+	f32v3 wi;
+	f32v3 normalWorld;
+	f32v3 normalGeometrical;
+	OpenPbrMaterial bsdfMaterial;
+	uint texelPacked = 0u;
+
+	if (pc.resolve.ptMode != 0u) {
+		// -- camera ray path: reconstruct primary ray, ignore visibility buffer
+		const f32v2 jitter = fnSampleUniform2(seed2);
+		const f32v2 uv = (f32v2(coord) + jitter) / f32v2(screensize);
+		const f32v2 ndc = uv * 2.0f - 1.0f;
+		const mat4 invVP = inverse(pc.global.viewProj);
+		const f32v4 worldFar = invVP * f32v4(ndc, 1.0f, 1.0f);
+		const f32v3 rayDir = normalize(worldFar.xyz / worldFar.w - pc.global.cameraPos);
+
+		const RayQueryResult primaryHit = (
+			utilTraceRay(
+				pc.global.cameraPos,
+				rayDir,
+				999999.0f,
+				/*isShadowRay=*/false,
+				/*testAlphaCutoff=*/true
+			)
 		);
-		return;
-	}
 
-	// -- unpack model/meshlet/triangle data
-	const UtilMeshUnpacked texelData = utilMeshUnpackTexel(texelPacked);
-	const UtilMeshAttributeData attributeData = (
-		utilMeshDecodeAttributes(
-			/*texelUnpacked=*/texelData,
-			/*unpackWorldOrigin=*/true,
-			/*unpackNormal=*/true,
-			/*unpackUv=*/true,
-			/*unpackUvDerviatives=*/true,
-			/*unpackMaterial=*/true
-		)
-	);
-	const mat3 tbn = (
-		utilCalculateTbnBasis(attributeData.normal, attributeData.tangent)
-	);
+		if (primaryHit.dist <= 0.0f) {
+			imageStore(
+				vkofImages[pc.resolve.outputImageHandle],
+				coord,
+				f32v4(
+					sampleSky(rayDir, unf.sunDir, unf.skyTurbidity, unf.skyIntensity),
+					1.0f
+				)
+			);
+			return;
+		}
 
-	// -- unpack material data and angles
-	f32v3 modelNormal;
-	const OpenPbrMaterial bsdfMaterial = (
-		openPbrMaterialFromGltf(
+		const UtilMeshAttributeDataFromIndices rqData = (
+			utilMeshAttributeDataFromIndices(
+				primaryHit.modelDrawIndex,
+				primaryHit.primitiveIndex,
+				primaryHit.barycentric
+			)
+		);
+		origin = pc.global.cameraPos + rayDir * primaryHit.dist;
+		const mat3 tbn = utilCalculateTbnBasis(rqData.normal, rqData.tangent);
+		f32v3 modelNormal;
+		bsdfMaterial = openPbrMaterialFromGltf(
+			/*material=*/rqData.material,
+			/*uv=*/rqData.uv,
+			/*uvDx=*/f32v2(0.0f),
+			/*uvDy=*/f32v2(0.0f),
+			/*modelNormal=*/modelNormal
+		);
+		normalWorld = normalize(tbn * modelNormal);
+		normalGeometrical = rqData.normalGeometrical;
+		wi = -rayDir;
+	} else {
+		// -- visibility buffer path
+		const uint vis = (
+			imageLoad(vkofImagesU[pc.resolve.visibilityImageHandle], coord).r
+		);
+		if (vis == 0u || vis == 0xFFFFFFFFu) {
+			imageStore(
+				vkofImages[pc.resolve.outputImageHandle],
+				coord,
+				f32v4(0.1f, 0.1f, 0.1f, 1.0f)
+			);
+			return;
+		}
+		texelPacked = vis;
+		const UtilMeshUnpacked texelData = utilMeshUnpackTexel(vis);
+		const UtilMeshAttributeData attributeData = (
+			utilMeshDecodeAttributes(
+				/*texelUnpacked=*/texelData,
+				/*unpackWorldOrigin=*/true,
+				/*unpackNormal=*/true,
+				/*unpackUv=*/true,
+				/*unpackUvDerviatives=*/true,
+				/*unpackMaterial=*/true
+			)
+		);
+		const mat3 tbn = (
+			utilCalculateTbnBasis(attributeData.normal, attributeData.tangent)
+		);
+		f32v3 modelNormal;
+		bsdfMaterial = openPbrMaterialFromGltf(
 			/*material=*/attributeData.material,
 			/*uv=*/attributeData.uv,
 			/*uvDx=*/attributeData.uvDx,
 			/*uvDy=*/attributeData.uvDy,
 			/*modelNormal=*/modelNormal
-		)
-	);
-	const f32v3 wi = normalize(pc.global.cameraPos - attributeData.origin);
+		);
+		origin = attributeData.origin;
+		normalWorld = normalize(tbn * modelNormal);
+		normalGeometrical = attributeData.normalGeometrical;
+		wi = normalize(pc.global.cameraPos - attributeData.origin);
+	}
 
 	// -- compute lighting
-	f32v4 irradiance = f32v4(0.0f);
-	f32 seed = fnSampleBluenoise(
-		pc.resolve.bluenoiseVa,
-		pc.resolve.bluenoiseCount,
-		pc.resolve.frameIndex,
-		coord
+	const MaterialTableHandles materialTables = MaterialTableHandles(
+		pc.resolve.kullaContyEnergyHandle,
+		pc.resolve.zeltnerLtcParamHandle
 	);
-	f32v2 seed2 = f32v2(seed * 1.2419241, seed * 1.61803398875);
-	#define ITERS 3
+	f32v4 irradiance = f32v4(0.0f);
+	#define ITERS 1
 	for (int it = 0; it < ITERS; ++it) {
-		irradiance +=
-		utilIrradiancePropagationEntry(
-			/*originalMaterial=*/bsdfMaterial,
-			/*origin=*/attributeData.origin,
-			/*normalWorld=*/ normalize(tbn * modelNormal),
-			/*normalGeometrical=*/ attributeData.normalGeometrical,
-			/*wi=*/wi,
-			/*propagationDepth=*/8u,
-			/*seed=*/seed,
-			/*seed2=*/seed2
+		irradiance += (
+			utilIrradiancePropagationEntry(
+				/*tables=*/materialTables,
+				/*originalMaterial=*/bsdfMaterial,
+				/*origin=*/origin,
+				/*normalWorld=*/normalWorld,
+				/*normalGeometrical=*/normalGeometrical,
+				/*wi=*/wi,
+				/*propagationDepth=*/8u,
+				/*seed=*/seed,
+				/*seed2=*/seed2
+			)
 		);
+		utilGenerateSeeds(seed, seed2);
 	}
 	irradiance /= float(ITERS);
-	// const f32v4 irradiance = (
-	// 	utilIrradiancePropagationEntry(
-	// 		/*originalMaterial=*/bsdfMaterial,
-	// 		/*origin=*/attributeData.origin,
-	// 		/*normalWorld=*/bsdfMaterial.normalWorld,
-	// 		/*normalGeometrical=*/attributeData.normalGeometrical,
-	// 		/*wi=*/wi,
-	// 		/*propagationDepth=*/8u
-	// 	)
-	// );
 
-	// -- debug mode visualizers
-	if (unf.debugMode == 1u) {
+	// -- debug mode visualizers (visibility path only)
+	if (pc.resolve.ptMode == 0u && unf.debugMode == 1u) {
 		imageStore(
 			vkofImages[pc.resolve.outputImageHandle],
 			coord,
-			vec4(index_color(texelPacked), 1.0)
+			f32v4(index_color(texelPacked), 1.0f)
 		);
 		return;
 	}

@@ -49,6 +49,9 @@ struct GpuResolvePC {
 	u32 frameIndex;
 	u32 bluenoiseCount;
 	u64 bluenoiseVa;
+	u32 ptMode;
+	u32 kullaContyEnergyHandle;
+	u32 zeltnerLtcParamHandle;
 };
 
 #ifndef __cplusplus

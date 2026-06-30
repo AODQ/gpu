@@ -24,7 +24,7 @@ vec3 sampleSky(
 	const float skyIntensity
 ) {
 	if (dir.y < 0.0) {
-		return vec3(0.3f);
+		return vec3(0.3f) * skyIntensity * (sunDir.y < 0.0 ? 0.0f : 1.0f);
 	}
 	// return vec3(0.0f);
 	const float T = turbidity;
@@ -94,7 +94,11 @@ vec3 sampleSky(
 	const float sunDisk = smoothstep(0.9997, 0.9999, dot(dir, sunDir));
 	const vec3 sunColor = mix(vec3(0.8, 0.4, 0.1), vec3(0.8, 0.7, 0.5), clamp(sunDir.y * 4.0, 0.0, 1.0));
 
-	return (max(rgb, vec3(0.0)) / 30.0 + sunDisk * sunColor) * skyIntensity;
+	return (
+		(max(rgb, vec3(0.0)) / 30.0 + sunDisk * sunColor)
+		* skyIntensity
+		* (sunDir.y < 0.0 ? 0.1f : 1.0f)
+	);
 }
 
 // approximate color of the sun as a directional light

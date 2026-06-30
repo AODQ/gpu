@@ -29,6 +29,7 @@ add_executable(
 	test_mor.cpp
 	test_accel.cpp
 	test_hot_reload.cpp
+	test_scene_materials.cpp
 )
 
 # Bake the absolute path to the test shaders directory into the binary
@@ -51,6 +52,7 @@ target_link_libraries(
 	cull_flags
 	vkof
 	mor
+	scene
 	Vulkan::Vulkan
 	vk-bootstrap::vk-bootstrap
 	glfw

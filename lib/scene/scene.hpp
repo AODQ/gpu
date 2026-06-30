@@ -1,5 +1,6 @@
 #pragma once
 
+#include <mor/mor_shared.h>
 #include <srat/core-math.hpp>
 
 #include <filesystem>
@@ -10,11 +11,18 @@
 namespace scene
 {
 
+struct SceneMaterial
+{
+	std::string name;
+	GpuMorMaterial params;
+};
+
 struct EntityInstance
 {
 	std::string filename;
 	f32v3 rotation;
 	f32 scale;
+	std::vector<SceneMaterial> materials;
 };
 
 struct EntityLight

@@ -59,6 +59,7 @@ struct SamplerKeyHash
 };
 
 static std::unordered_map<SamplerKey, vkof::Sampler, SamplerKeyHash> sSamplerCache;
+static vkof::Sampler sImguiDisplaySampler = { 0u };
 
 struct ImplScene {
 	std::vector<f32v3> positions;
@@ -73,10 +74,19 @@ struct ImplScene {
 	std::unordered_map<cgltf_texture const *, vkof::Image> textureImages;
 	std::unordered_map<cgltf_texture const *, SamplerKey> textureSamplerKeys;
 	std::vector<vkof::Image> images;
+	std::vector<std::string> imageNames;
+	std::vector<ImTextureID> imguiIds;
 
 	std::unordered_map<cgltf_material const *, u32> materialIndices;
 
 	std::vector<GpuMorMaterial> materials;
+	std::vector<std::string> materialNames;
+};
+
+struct ImplGpuMaterials
+{
+	vkof::Buffer buffer;
+	std::vector<GpuMorMaterial> cpu;
 };
 
 struct ImplGpuScene {
@@ -209,6 +219,19 @@ static u32 load_texture(
 	});
 
 	s.images.push_back(image);
+	{
+		std::string name;
+		if (tex->name && tex->name[0] != '\0') {
+			name = tex->name;
+		} else if (img->name && img->name[0] != '\0') {
+			name = img->name;
+		} else if (img->uri) {
+			name = std::filesystem::path(img->uri).filename().string();
+		} else {
+			name = "[texture " + std::to_string(s.imageNames.size()) + "]";
+		}
+		s.imageNames.push_back(std::move(name));
+	}
 	s.textureHandles.emplace(tex, handle);
 	s.textureImages.emplace(tex, image);
 	s.textureSamplerKeys.emplace(tex, key);
@@ -342,6 +365,7 @@ static void load_primitive(
 
 			f32v3 fuzzColor = { 1.0f, 1.0f, 1.0f };
 			f32 fuzzRoughness = 0.5f;
+			f32 fuzzWeight = 0.0f;
 			u32 textureFuzz = 0u;
 			if (mat.has_sheen) {
 				fuzzColor = {
@@ -349,6 +373,7 @@ static void load_primitive(
 					mat.sheen.sheen_color_factor[1],
 					mat.sheen.sheen_color_factor[2],
 				};
+				fuzzWeight = 1.0f;
 				fuzzRoughness = mat.sheen.sheen_roughness_factor;
 				textureFuzz = load_texture(
 					*s, mat.sheen.sheen_color_texture.texture, true
@@ -362,18 +387,19 @@ static void load_primitive(
 			f32v3 transmissionColor = { 1.0f, 1.0f, 1.0f };
 			f32 transmissionDepth = 0.0f;
 			if (mat.has_volume) {
-				subsurfaceWeight = std::min(mat.volume.thickness_factor, 1.0f);
 				subsurfaceColor = {
 					mat.volume.attenuation_color[0],
 					mat.volume.attenuation_color[1],
 					mat.volume.attenuation_color[2],
 				};
-				subsurfaceRadius = mat.volume.attenuation_distance;
 				textureSubsurface = load_texture(
 					*s, mat.volume.thickness_texture.texture, false
 				);
 				transmissionColor = subsurfaceColor;
-				transmissionDepth = mat.volume.attenuation_distance;
+				// attenuation_distance defaults to +Infinity in glTF when unset;
+				// treat that as 0 (no Beer-Lambert absorption)
+				f32 const attenuationDistance = mat.volume.attenuation_distance;
+				transmissionDepth = std::isinf(attenuationDistance) ? 0.0f : attenuationDistance;
 			}
 
 			f32 transmissionWeight = 0.0f;
@@ -383,6 +409,15 @@ static void load_primitive(
 				textureTransmission = load_texture(
 					*s, mat.transmission.transmission_texture.texture, false
 				);
+				// per KHR_materials_transmission spec: base color tints transmitted
+				// light; use it when volume provides no separate attenuation color
+				if (!mat.has_volume) {
+					transmissionColor = {
+						mr.base_color_factor[0],
+						mr.base_color_factor[1],
+						mr.base_color_factor[2],
+					};
+				}
 			}
 
 			f32 thinFilmWeight = 0.0f;
@@ -481,14 +516,17 @@ static void load_primitive(
 				.textureClearcoat = textureClearcoat,
 				.textureClearcoatRoughness = textureClearcoatRoughness,
 				.fuzzColor = fuzzColor,
+				.fuzzWeight = fuzzWeight,
 				.fuzzRoughness = fuzzRoughness,
 				.textureFuzz = textureFuzz,
 				.subsurfaceWeight = subsurfaceWeight,
 				.subsurfaceColor = subsurfaceColor,
 				.subsurfaceRadius = subsurfaceRadius,
 				.textureSubsurface = textureSubsurface,
+				.textureSubsurfaceColor = 0u,
 				.transmissionWeight = transmissionWeight,
 				.textureTransmission = textureTransmission,
+				.textureTransmissionColor = 0u,
 				.transmissionColor = transmissionColor,
 				.transmissionDepth = transmissionDepth,
 				.thinFilmWeight = thinFilmWeight,
@@ -509,6 +547,9 @@ static void load_primitive(
 				.flags = flags,
 			});
 			s->materialIndices.emplace(prim.material, materialIndex);
+			s->materialNames.push_back(
+				(mat.name && mat.name[0]) ? std::string(mat.name) : ""
+			);
 		}
 	}
 
@@ -654,14 +695,17 @@ mor::Scene mor::scene_create() {
 		.textureClearcoat = 0u,
 		.textureClearcoatRoughness = 0u,
 		.fuzzColor = { 1.0f, 1.0f, 1.0f },
-		.fuzzRoughness = 0.5f,
+		.fuzzWeight = 0.0f,
+		.fuzzRoughness = 0.0f,
 		.textureFuzz = 0u,
 		.subsurfaceWeight = 0.0f,
 		.subsurfaceColor = { 0.8f, 0.8f, 0.8f },
 		.subsurfaceRadius = 1.0f,
 		.textureSubsurface = 0u,
+		.textureSubsurfaceColor = 0u,
 		.transmissionWeight = 0.0f,
 		.textureTransmission = 0u,
+		.textureTransmissionColor = 0u,
 		.transmissionColor = { 1.0f, 1.0f, 1.0f },
 		.transmissionDepth = 0.0f,
 		.thinFilmWeight = 0.0f,
@@ -681,11 +725,15 @@ mor::Scene mor::scene_create() {
 		.geometryOpacity = 1.0f,
 		.flags = 0u,
 	});
+	s->materialNames.push_back("");
 	return mor::Scene { .id = reinterpret_cast<u64>(s) };
 }
 
 void mor::scene_destroy(mor::Scene const & scene) {
 	ImplScene * const s = reinterpret_cast<ImplScene *>(scene.id);
+	for (ImTextureID const id : s->imguiIds) {
+		if (id) { vkof::image_imgui_id_destroy(id); }
+	}
 	for (vkof::Image const & img : s->images) {
 		vkof::image_destroy(img);
 	}
@@ -697,6 +745,10 @@ void mor::sampler_cache_destroy() {
 		vkof::sampler_destroy(sampler);
 	}
 	sSamplerCache.clear();
+	if (sImguiDisplaySampler.id) {
+		vkof::sampler_destroy(sImguiDisplaySampler);
+		sImguiDisplaySampler = { 0u };
+	}
 }
 
 void mor::scene_set_anisotropy(
@@ -865,6 +917,41 @@ void mor::scene_imgui_debug(mor::Scene const & scene) {
 	}
 }
 
+void mor::scene_imgui_textures(mor::Scene const & scene) {
+	ImplScene * const s = reinterpret_cast<ImplScene *>(scene.id);
+	if (s->images.empty()) { return; }
+	if (!sImguiDisplaySampler.id) {
+		sImguiDisplaySampler = vkof::sampler_create({
+			.magFilter = vkof::SamplerFilter::linear,
+			.minFilter = vkof::SamplerFilter::linear,
+			.addressModeU = vkof::SamplerAddressMode::clamp_to_edge,
+			.addressModeV = vkof::SamplerAddressMode::clamp_to_edge,
+			.addressModeW = vkof::SamplerAddressMode::clamp_to_edge,
+			.mipmapMode = vkof::SamplerMipmapMode::linear,
+			.maxAnisotropy = 1.0f,
+		});
+	}
+	if (s->imguiIds.empty()) {
+		s->imguiIds.resize(s->images.size(), nullptr);
+		for (u32 i = 0u; i < (u32)s->images.size(); ++i) {
+			s->imguiIds[i] = vkof::image_imgui_id({
+				.image = s->images[i],
+				.sampler = sImguiDisplaySampler,
+			});
+		}
+	}
+	constexpr f32 skThumbSize = 64.0f;
+	for (u32 i = 0u; i < (u32)s->imguiIds.size(); ++i) {
+		char const * const name = (
+			i < (u32)s->imageNames.size()
+			? s->imageNames[i].c_str()
+			: "[unknown]"
+		);
+		ImGui::TextUnformatted(name);
+		ImGui::Image(s->imguiIds[i], ImVec2(skThumbSize, skThumbSize));
+	}
+}
+
 void mor::scene_load_gltf(mor::Scene const & scene, char const * const path) {
 	ImplScene * const s = reinterpret_cast<ImplScene *>(scene.id);
 
@@ -1002,4 +1089,146 @@ mor::Buffers mor::scene_gpu_buffers(mor::GpuScene const & scene) {
 
 u32 mor::scene_gpu_meshlet_count(mor::GpuScene const & scene) {
 	return reinterpret_cast<ImplGpuScene const *>(scene.id)->meshletCount;
+}
+
+u32 mor::scene_material_count(mor::Scene const & scene) {
+	return (u32)reinterpret_cast<ImplScene const *>(scene.id)->materials.size();
+}
+
+std::string mor::scene_material_name(mor::Scene const & scene, u32 const index) {
+	ImplScene const * const s = reinterpret_cast<ImplScene const *>(scene.id);
+	SRAT_ASSERT(index < (u32)s->materialNames.size());
+	return s->materialNames[index];
+}
+
+GpuMorMaterial mor::scene_material_get(mor::Scene const & scene, u32 const index) {
+	ImplScene const * const s = reinterpret_cast<ImplScene const *>(scene.id);
+	SRAT_ASSERT(index < (u32)s->materials.size());
+	return s->materials[index];
+}
+
+mor::GpuMaterials mor::scene_gpu_materials_create(mor::Scene const & scene) {
+	ImplScene const * const s = reinterpret_cast<ImplScene const *>(scene.id);
+	ImplGpuMaterials * const m = new ImplGpuMaterials();
+	m->cpu = s->materials;
+	if (!m->cpu.empty()) {
+		m->buffer = upload_buffer(
+			m->cpu.data(), m->cpu.size() * sizeof(GpuMorMaterial)
+		);
+	}
+	return mor::GpuMaterials { .id = reinterpret_cast<u64>(m) };
+}
+
+void mor::scene_gpu_materials_destroy(mor::GpuMaterials const & mats) {
+	ImplGpuMaterials * const m = reinterpret_cast<ImplGpuMaterials *>(mats.id);
+	vkof::buffer_destroy(m->buffer);
+	delete m;
+}
+
+u64 mor::scene_gpu_materials_va(mor::GpuMaterials const & mats) {
+	ImplGpuMaterials const * const m = reinterpret_cast<ImplGpuMaterials const *>(mats.id);
+	return vkof::buffer_virtual_address(m->buffer);
+}
+
+void mor::scene_material_override_scalars(
+	mor::GpuMaterials const & mats, u32 const index, GpuMorMaterial const & scalars
+) {
+	ImplGpuMaterials * const m = reinterpret_cast<ImplGpuMaterials *>(mats.id);
+	SRAT_ASSERT(index < (u32)m->cpu.size());
+	GpuMorMaterial & dst = m->cpu[index];
+	dst.baseColor = scalars.baseColor;
+	dst.baseMetalness = scalars.baseMetalness;
+	dst.specularRoughness = scalars.specularRoughness;
+	dst.emissiveColor = scalars.emissiveColor;
+	dst.emissiveLuminance = scalars.emissiveLuminance;
+	dst.specularColor = scalars.specularColor;
+	dst.specularWeight = scalars.specularWeight;
+	dst.specularIor = scalars.specularIor;
+	dst.coatWeight = scalars.coatWeight;
+	dst.coatRoughness = scalars.coatRoughness;
+	dst.fuzzColor = scalars.fuzzColor;
+	dst.fuzzWeight = scalars.fuzzWeight;
+	dst.fuzzRoughness = scalars.fuzzRoughness;
+	dst.subsurfaceWeight = scalars.subsurfaceWeight;
+	dst.subsurfaceColor = scalars.subsurfaceColor;
+	dst.subsurfaceRadius = scalars.subsurfaceRadius;
+	dst.transmissionWeight = scalars.transmissionWeight;
+	dst.transmissionColor = scalars.transmissionColor;
+	dst.transmissionDepth = scalars.transmissionDepth;
+	dst.thinFilmWeight = scalars.thinFilmWeight;
+	dst.thinFilmIor = scalars.thinFilmIor;
+	dst.thinFilmThickness = scalars.thinFilmThickness;
+	dst.thinFilmThicknessMin = scalars.thinFilmThicknessMin;
+	dst.specularRoughnessAnisotropy = scalars.specularRoughnessAnisotropy;
+	dst.specularAnisotropyRotation = scalars.specularAnisotropyRotation;
+	dst.transmissionDispersionAbbeNumber = scalars.transmissionDispersionAbbeNumber;
+	dst.alphaCutoff = scalars.alphaCutoff;
+	dst.geometryOpacity = scalars.geometryOpacity;
+	dst.flags = scalars.flags;
+	dst.textureBaseColor = scalars.textureBaseColor;
+	dst.textureNormal = scalars.textureNormal;
+	dst.textureMetallicRoughness = scalars.textureMetallicRoughness;
+	dst.textureEmissive = scalars.textureEmissive;
+	dst.textureSpecular = scalars.textureSpecular;
+	dst.textureSpecularColor = scalars.textureSpecularColor;
+	dst.textureClearcoat = scalars.textureClearcoat;
+	dst.textureClearcoatRoughness = scalars.textureClearcoatRoughness;
+	dst.textureClearcoatNormal = scalars.textureClearcoatNormal;
+	dst.textureFuzz = scalars.textureFuzz;
+	dst.textureFuzzRoughness = scalars.textureFuzzRoughness;
+	dst.textureSubsurface = scalars.textureSubsurface;
+	dst.textureSubsurfaceColor = scalars.textureSubsurfaceColor;
+	dst.textureTransmission = scalars.textureTransmission;
+	dst.textureTransmissionColor = scalars.textureTransmissionColor;
+	dst.textureIridescence = scalars.textureIridescence;
+	dst.textureIridescenceThickness = scalars.textureIridescenceThickness;
+	dst.textureAnisotropy = scalars.textureAnisotropy;
+	dst.textureOcclusion = scalars.textureOcclusion;
+	vkof::buffer_upload({
+		.buffer = m->buffer,
+		.byteOffset = 0u,
+		.data = srat::slice<u8 const>(
+			reinterpret_cast<u8 const *>(m->cpu.data()),
+			m->cpu.size() * sizeof(GpuMorMaterial)
+		),
+	});
+}
+
+void mor::scene_gpu_materials_sync_textures(
+	mor::Scene const & scene, mor::GpuMaterials const & mats
+) {
+	ImplScene const * const s = reinterpret_cast<ImplScene const *>(scene.id);
+	ImplGpuMaterials * const m = reinterpret_cast<ImplGpuMaterials *>(mats.id);
+	u32 const count = (u32)std::min(m->cpu.size(), s->materials.size());
+	for (u32 i = 0u; i < count; ++i) {
+		GpuMorMaterial & dst = m->cpu[i];
+		GpuMorMaterial const & src = s->materials[i];
+		dst.textureBaseColor = src.textureBaseColor;
+		dst.textureNormal = src.textureNormal;
+		dst.textureMetallicRoughness = src.textureMetallicRoughness;
+		dst.textureEmissive = src.textureEmissive;
+		dst.textureSpecular = src.textureSpecular;
+		dst.textureSpecularColor = src.textureSpecularColor;
+		dst.textureClearcoat = src.textureClearcoat;
+		dst.textureClearcoatRoughness = src.textureClearcoatRoughness;
+		dst.textureClearcoatNormal = src.textureClearcoatNormal;
+		dst.textureFuzz = src.textureFuzz;
+		dst.textureFuzzRoughness = src.textureFuzzRoughness;
+		dst.textureSubsurface = src.textureSubsurface;
+		dst.textureTransmission = src.textureTransmission;
+		dst.textureIridescence = src.textureIridescence;
+		dst.textureIridescenceThickness = src.textureIridescenceThickness;
+		dst.textureAnisotropy = src.textureAnisotropy;
+		dst.textureOcclusion = src.textureOcclusion;
+	}
+	if (!m->cpu.empty()) {
+		vkof::buffer_upload({
+			.buffer = m->buffer,
+			.byteOffset = 0u,
+			.data = srat::slice<u8 const>(
+				reinterpret_cast<u8 const *>(m->cpu.data()),
+				m->cpu.size() * sizeof(GpuMorMaterial)
+			),
+		});
+	}
 }

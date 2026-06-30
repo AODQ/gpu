@@ -26,6 +26,7 @@ namespace vkof
 		b8g8r8a8_unorm,
 		r16g16b16a16_sfloat,
 		r32_float,
+		r32g32b32a32_sfloat,
 		d24_unorm_s8_uint,
 	};
 
@@ -93,6 +94,8 @@ namespace vkof
 		u32 vertexCount;
 		u64 indexVa;
 		u32 triangleCount;
+
+		bool isOpaque { true };
 	};
 
 	AccelerationStructureBlas blas_create(BlasCreateInfo const & createInfo);
@@ -475,6 +478,10 @@ namespace vkof
 	// returns the debug printf message captured this frame, or nullptr if none.
 	// cleared at the start of each render_graph_execute. safe to call multiple times.
 	[[nodiscard]] char const * probe_message();
+
+	// returns true if any pipeline was successfully hot-reloaded this frame.
+	// cleared at the start of each render_graph_execute.
+	[[nodiscard]] bool shader_reloaded();
 }
 
 // -----------------------------------------------------------------------------

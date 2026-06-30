@@ -4,6 +4,7 @@
 #include "shared/ddgi-shared.h"
 #include "shared/light_shared.h"
 #include "asset_library.hpp"
+#include "material-tables.hpp"
 #include <scene/scene.hpp>
 
 #include <vkof/vkof.hpp>
@@ -317,6 +318,193 @@ static bool sPtMode = false;
 static bool sPtResetAccum = false;
 static f32m44 sPtPrevViewProj = {};
 
+bool igDragFloat3(
+	const char * label,
+	float v[3],
+	float v_speed = 1.0f,
+	float v_min = 0.0f,
+	float v_max = 0.0f,
+	const char* format = "%.3f",
+	ImGuiSliderFlags flags = 0
+) {
+	if (ImGui::DragFloat3(label, v, v_speed, v_min, v_max, format, flags)) {
+		sPtResetAccum = true;
+		return true;
+	}
+	return false;
+}
+
+bool igDragFloat(
+	const char * label,
+	float * v,
+	float v_speed = 1.0f,
+	float v_min = 0.0f,
+	float v_max = 0.0f,
+	const char* format = "%.3f",
+	ImGuiSliderFlags flags = 0
+) {
+	if (ImGui::DragFloat(label, v, v_speed, v_min, v_max, format, flags)) {
+		sPtResetAccum = true;
+		return true;
+	}
+	return false;
+}
+
+bool igSliderFloat(
+	const char * label,
+	float * v,
+	float v_min,
+	float v_max,
+	const char* format = "%.3f",
+	ImGuiSliderFlags flags = 0
+) {
+	if (ImGui::SliderFloat(label, v, v_min, v_max, format, flags)) {
+		sPtResetAccum = true;
+		return true;
+	}
+	return false;
+}
+
+bool igColorEdit3(
+	const char * label,
+	float col[3],
+	ImGuiColorEditFlags flags = 0
+) {
+	if (ImGui::ColorEdit3(label, col, flags)) {
+		sPtResetAccum = true;
+		return true;
+	}
+	return false;
+}
+
+bool igColorEdit4(
+	const char * label,
+	float col[4],
+	ImGuiColorEditFlags flags = 0
+) {
+	if (ImGui::ColorEdit4(label, col, flags)) {
+		sPtResetAccum = true;
+		return true;
+	}
+	return false;
+}
+
+using TexSlotOptions = std::vector<std::pair<char const *, u32>>;
+
+static TexSlotOptions texSlotBuildOptions(GpuMorMaterial const & orig) {
+	TexSlotOptions opts;
+	auto add = [&](char const * name, u32 handle) {
+		if (handle != 0u) { opts.emplace_back(name, handle); }
+	};
+	add("base color", orig.textureBaseColor);
+	add("normal", orig.textureNormal);
+	add("metallic roughness", orig.textureMetallicRoughness);
+	add("emissive", orig.textureEmissive);
+	add("specular", orig.textureSpecular);
+	add("specular color", orig.textureSpecularColor);
+	add("clearcoat", orig.textureClearcoat);
+	add("clearcoat roughness", orig.textureClearcoatRoughness);
+	add("clearcoat normal", orig.textureClearcoatNormal);
+	add("fuzz", orig.textureFuzz);
+	add("fuzz roughness", orig.textureFuzzRoughness);
+	add("subsurface", orig.textureSubsurface);
+	add("transmission", orig.textureTransmission);
+	add("iridescence", orig.textureIridescence);
+	add("iridescence thickness", orig.textureIridescenceThickness);
+	add("anisotropy", orig.textureAnisotropy);
+	add("occlusion", orig.textureOcclusion);
+	return opts;
+}
+
+static bool texSlotCombo(char const * id, u32 & handle, TexSlotOptions const & opts) {
+	char const * current = "none";
+	for (auto const & [name, h] : opts) {
+		if (h == handle) { current = name; break; }
+	}
+	bool changed = false;
+	ImGui::SetNextItemWidth(130.0f);
+	if (ImGui::BeginCombo(id, current)) {
+		if (ImGui::Selectable("none", handle == 0u)) {
+			handle = 0u;
+			changed = true;
+			sPtResetAccum = true;
+		}
+		for (auto const & [name, h] : opts) {
+			if (ImGui::Selectable(name, h == handle)) {
+				handle = h;
+				changed = true;
+				sPtResetAccum = true;
+			}
+		}
+		ImGui::EndCombo();
+	}
+	return changed;
+}
+
+// Renders checkbox + optional texture combo then SameLine for the value widget.
+// Toggling on auto-selects the first available texture; toggling off clears.
+static bool texParamPreamble(u32 & texHandle, TexSlotOptions const & texOpts) {
+	bool useTexture = (texHandle != 0u);
+	bool changed = false;
+	if (ImGui::Checkbox("##use", &useTexture)) {
+		changed = true;
+		sPtResetAccum = true;
+		if (!useTexture) {
+			texHandle = 0u;
+		} else if (!texOpts.empty()) {
+			texHandle = texOpts[0u].second;
+		} else {
+			useTexture = false;
+		}
+	}
+	ImGui::SameLine();
+	if (useTexture) {
+		changed |= texSlotCombo("##tex", texHandle, texOpts);
+		ImGui::SameLine();
+	}
+	return changed;
+}
+
+bool igParamWithTexture4(
+	char const * label,
+	f32v4 & value,
+	u32 & texHandle,
+	TexSlotOptions const & texOpts
+) {
+	ImGui::PushID(label);
+	bool changed = texParamPreamble(texHandle, texOpts);
+	changed |= igColorEdit4(label, &value.x);
+	ImGui::PopID();
+	return changed;
+}
+
+bool igParamWithTexture3(
+	char const * label,
+	f32v3 & value,
+	u32 & texHandle,
+	TexSlotOptions const & texOpts
+) {
+	ImGui::PushID(label);
+	bool changed = texParamPreamble(texHandle, texOpts);
+	changed |= igColorEdit3(label, &value.x);
+	ImGui::PopID();
+	return changed;
+}
+
+bool igParamWithTexture(
+	char const * label,
+	f32 & value,
+	u32 & texHandle,
+	TexSlotOptions const & texOpts,
+	f32 const vmin,
+	f32 const vmax
+) {
+	ImGui::PushID(label);
+	bool changed = texParamPreamble(texHandle, texOpts);
+	changed |= igSliderFloat(label, &value, vmin, vmax);
+	ImGui::PopID();
+	return changed;
+}
 
 // -----------------------------------------------------------------------------
 // -- model
@@ -554,6 +742,7 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 				.filename = std::filesystem::canonical(gltfPath).string(),
 				.rotation = {},
 				.scale = 1.0f,
+				.materials = {},
 			},
 			{}
 		);
@@ -561,6 +750,8 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 
 	std::unordered_map<std::string, size_t> loadedModels;
 	std::vector<LoadedModel> modelList;
+	std::unordered_map<u32, mor::GpuMaterials> entityGpuMaterials;
+	std::unordered_map<u32, std::vector<GpuMorMaterial>> originalMaterials;
 
 	static constexpr u32 kMaxModels = 256u;
 	vkof::Buffer const modelsIndirectBuffer = vkof::buffer_create({
@@ -658,6 +849,8 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 		),
 	});
 
+	MaterialTableImages const materialTables = material_tables_create();
+
 	static constexpr u32 kMaxLights = 64u;
 	vkof::Buffer const lightsBuffer = vkof::buffer_create({
 		.byteCount = sizeof(GpuLight) * kMaxLights,
@@ -687,6 +880,7 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 				.vertexCount = bufsForBlas.vertexCount,
 				.indexVa = bufsForBlas.flatIndices,
 				.triangleCount = bufsForBlas.triangleCount,
+				.isOpaque = false, // TODO determine if opaque from materials TODO
 			})
 		);
 		auto const tDone = Clock::now();
@@ -709,9 +903,41 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 		});
 	};
 
-	for (scene::Entity const & entity : sceneDesc.entities) {
+	auto const fnVerifyEntityMaterials = [&](
+		scene::Entity & entity, scene::EntityInstance & ei
+	) {
+		if (entityGpuMaterials.count(entity.id)) { return; }
+		auto const it = loadedModels.find(ei.filename);
+		if (it == loadedModels.end()) { return; }
+		mor::Scene const & morScene = modelList[it->second].scene;
+		if (ei.materials.empty()) {
+			u32 const count = mor::scene_material_count(morScene);
+			for (u32 i = 0u; i < count; ++i) {
+				ei.materials.push_back({
+					.name = mor::scene_material_name(morScene, i),
+					.params = mor::scene_material_get(morScene, i),
+				});
+			}
+		}
+		if (!originalMaterials.count(entity.id)) {
+			u32 const gltfCount = mor::scene_material_count(morScene);
+			auto & origVec = originalMaterials[entity.id];
+			origVec.reserve(gltfCount);
+			for (u32 i = 0u; i < gltfCount; ++i) {
+				origVec.push_back(mor::scene_material_get(morScene, i));
+			}
+		}
+		mor::GpuMaterials gpuMats = mor::scene_gpu_materials_create(morScene);
+		for (u32 i = 0u; i < (u32)ei.materials.size(); ++i) {
+			mor::scene_material_override_scalars(gpuMats, i, ei.materials[i].params);
+		}
+		entityGpuMaterials[entity.id] = gpuMats;
+	};
+
+	for (scene::Entity & entity : sceneDesc.entities) {
 		if (auto * ei = std::get_if<scene::EntityInstance>(&entity.data)) {
 			fnVerifyModelLoaded(ei->filename);
+			fnVerifyEntityMaterials(entity, *ei);
 		}
 	}
 
@@ -856,6 +1082,9 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 				)
 			)
 		);
+		if (cameraMoving) {
+			sPtResetAccum = true;
+		}
 		if (!fpLookActive && prevFpLookActive) {
 			glfwGetCursorPos(window, &prevMouseX, &prevMouseY);
 		}
@@ -910,9 +1139,10 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 		cam.aspect = (f32)winW / (f32)winH;
 		fpCam.aspect = cam.aspect;
 
-		for (scene::Entity const & entity : sceneDesc.entities) {
+		for (scene::Entity & entity : sceneDesc.entities) {
 			if (auto * ei = std::get_if<scene::EntityInstance>(&entity.data)) {
 				fnVerifyModelLoaded(ei->filename);
+				fnVerifyEntityMaterials(entity, *ei);
 			}
 		}
 
@@ -1154,6 +1384,11 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 			).string();
 			if (sSingleModelView) {
 				vkof::device_wait_idle();
+				for (auto & [id, gpuMats] : entityGpuMaterials) {
+					mor::scene_gpu_materials_destroy(gpuMats);
+				}
+				entityGpuMaterials.clear();
+				originalMaterials.clear();
 				for (auto & [filename, modelIndex] : loadedModels) {
 					LoadedModel const & model = modelList[modelIndex];
 					mor::scene_destroy(model.scene);
@@ -1170,6 +1405,7 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 						.filename = relPath,
 						.rotation = {},
 						.scale = 1.0f,
+						.materials = {},
 					},
 					{}
 				);
@@ -1216,10 +1452,12 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 						.filename = relPath,
 						.rotation = {},
 						.scale = 1.0f,
+						.materials = {},
 					},
 					sFpMode ? fpCam.position : srat::camera_orbit_eye(cam)
 				);
 				fnVerifyModelLoaded(relPath);
+				sSelected = (u32)(sceneDesc.entities.size() - 1u);
 			}
 		}
 
@@ -1352,12 +1590,99 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 				[&](auto & d) {
 					using T = std::decay_t<decltype(d)>;
 					if constexpr (std::is_same_v<T, scene::EntityInstance>) {
-						ImGui::DragFloat3("rotation", &d.rotation.x, 0.5f);
+						igDragFloat3("rotation", &d.rotation.x, 0.5f);
 						ImGui::SameLine();
 						if (ImGui::Button("reset")) { d.rotation = {}; }
-						ImGui::DragFloat("scale", &d.scale, 0.01f, 0.001f, 1000.0f);
+						igDragFloat("scale", &d.scale, 0.01f, 0.001f, 1000.0f);
+						auto const matsIt = entityGpuMaterials.find(selEntity.id);
+						auto const origIt = originalMaterials.find(selEntity.id);
+						if (
+							!d.materials.empty()
+							&& matsIt != entityGpuMaterials.end()
+							&& ImGui::CollapsingHeader("materials")
+						) {
+							bool matChanged = false;
+							for (u32 mi = 0u; mi < (u32)d.materials.size(); ++mi) {
+								scene::SceneMaterial & sm = d.materials[mi];
+								ImGui::PushID((int)mi);
+								char const * label = sm.name.empty() ? "(default)" : sm.name.c_str();
+								if (ImGui::TreeNode(label)) {
+									GpuMorMaterial & p = sm.params;
+									GpuMorMaterial const * const origMat = (
+										origIt != originalMaterials.end()
+										&& mi < origIt->second.size()
+										? &origIt->second[mi]
+										: nullptr
+									);
+									TexSlotOptions const texOpts = (
+										origMat
+										? texSlotBuildOptions(*origMat)
+										: TexSlotOptions{}
+									);
+									// base
+									matChanged |= igParamWithTexture4("base color", p.baseColor, p.textureBaseColor, texOpts);
+									// metallic roughness (shared texture, two channels)
+									{
+										ImGui::PushID("metallic roughness");
+										matChanged |= texParamPreamble(p.textureMetallicRoughness, texOpts);
+										ImGui::Text("metallic roughness");
+										ImGui::PopID();
+									}
+									matChanged |= igSliderFloat("base metalness", &p.baseMetalness, 0.0f, 1.0f);
+									matChanged |= igSliderFloat("specular roughness", &p.specularRoughness, 0.0f, 1.0f);
+									// emissive
+									matChanged |= igParamWithTexture3("emissive color", p.emissiveColor, p.textureEmissive, texOpts);
+									matChanged |= igDragFloat("emissive luminance", &p.emissiveLuminance, 0.1f, 0.0f, 10000.0f);
+									// specular
+									matChanged |= igParamWithTexture3("specular color", p.specularColor, p.textureSpecularColor, texOpts);
+									matChanged |= igParamWithTexture("specular weight", p.specularWeight, p.textureSpecular, texOpts, 0.0f, 1.0f);
+									matChanged |= igSliderFloat("specular ior", &p.specularIor, 0.04f, 3.0f);
+									// coat
+									matChanged |= igParamWithTexture("coat weight", p.coatWeight, p.textureClearcoat, texOpts, 0.0f, 1.0f);
+									matChanged |= igParamWithTexture("coat roughness", p.coatRoughness, p.textureClearcoatRoughness, texOpts, 0.0f, 1.0f);
+									// fuzz
+									matChanged |= igParamWithTexture3("fuzz color", p.fuzzColor, p.textureFuzz, texOpts);
+									matChanged |= igParamWithTexture("fuzz roughness", p.fuzzRoughness, p.textureFuzzRoughness, texOpts, 0.0f, 1.0f);
+									matChanged |= igSliderFloat("fuzz weight", &p.fuzzWeight, 0.0f, 1.0f);
+									// subsurface
+									matChanged |= igParamWithTexture("subsurface weight", p.subsurfaceWeight, p.textureSubsurface, texOpts, 0.0f, 1.0f);
+									matChanged |= igParamWithTexture3("subsurface color", p.subsurfaceColor, p.textureSubsurfaceColor, texOpts);
+									matChanged |= igDragFloat("subsurface radius", &p.subsurfaceRadius, 0.01f, 0.0f, 100.0f);
+									// transmission
+									matChanged |= igParamWithTexture("transmission weight", p.transmissionWeight, p.textureTransmission, texOpts, 0.0f, 1.0f);
+									matChanged |= igParamWithTexture3("transmission color", p.transmissionColor, p.textureTransmissionColor, texOpts);
+									matChanged |= igDragFloat("transmission depth", &p.transmissionDepth, 0.01f, 0.0f, 1000.0f);
+									// thin film
+									matChanged |= igParamWithTexture("thin film weight", p.thinFilmWeight, p.textureIridescence, texOpts, 0.0f, 1.0f);
+									matChanged |= igSliderFloat("thin film ior", &p.thinFilmIor, 0.04f, 3.0f);
+									matChanged |= igDragFloat("thin film thickness", &p.thinFilmThickness, 10.0f, 0.0f, 10000.0f);
+									// anisotropy
+									matChanged |= igParamWithTexture("anisotropy", p.specularRoughnessAnisotropy, p.textureAnisotropy, texOpts, 0.0f, 1.0f);
+									// opacity
+									matChanged |= igSliderFloat("geometry opacity", &p.geometryOpacity, 0.0f, 1.0f);
+									ImGui::TreePop();
+								}
+								ImGui::PopID();
+							}
+							if (matChanged) {
+								for (u32 mi = 0u; mi < (u32)d.materials.size(); ++mi) {
+									mor::scene_material_override_scalars(
+										matsIt->second, mi, d.materials[mi].params
+									);
+								}
+							}
+						}
+					{
+						auto const texModIt = loadedModels.find(d.filename);
+						if (
+							texModIt != loadedModels.end()
+							&& ImGui::CollapsingHeader("textures")
+						) {
+							mor::scene_imgui_textures(modelList[texModIt->second].scene);
+						}
+					}
 					} else if constexpr (std::is_same_v<T, scene::EntityLight>) {
-						ImGui::DragFloat("radius", &d.radius, 0.1f, 0.01f, 1000.0f);
+						igDragFloat("radius", &d.radius, 0.1f, 0.01f, 1000.0f);
 						f32v3 & col = d.color;
 						float maxComp = std::max({col.x, col.y, col.z, 0.0001f});
 						f32v3 norm = {
@@ -1366,9 +1691,9 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 							col.z / maxComp,
 						};
 						bool changed = false;
-						if (ImGui::ColorEdit3("hue", &norm.x)) { changed = true; }
+						if (igColorEdit3("hue", &norm.x)) { changed = true; }
 						if (
-							ImGui::DragFloat(
+							igDragFloat(
 								"intensity", &maxComp, 0.5f, 0.01f, 2000.0f, "%.1f"
 							)
 						) {
@@ -1424,6 +1749,7 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 					ImGuizmo::WORLD,
 					matrix.m.ptr()
 				)) {
+					sPtResetAccum = true;
 					f32 const * m = matrix.m.ptr();
 					selEntity.position = { m[12], m[13], m[14] };
 					if (
@@ -1453,7 +1779,7 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 		}
 
 		float fovDeg = cam.fovY * (180.0f / 3.14159265f);
-		if (ImGui::SliderFloat("fov", &fovDeg, 10.0f, 120.0f, "%.0f deg")) {
+		if (igSliderFloat("fov", &fovDeg, 10.0f, 120.0f, "%.0f deg")) {
 			cam.fovY = fovDeg * (3.14159265f / 180.0f);
 		}
 		if (ImGui::Button("reset camera")) {
@@ -1511,24 +1837,24 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 		ImGui::Separator();
 		ImGui::Checkbox("override mip LOD", &sMipOverrideActive);
 		if (sMipOverrideActive) {
-			ImGui::SliderFloat("mip level", &sMipLodOverride, 0.0f, 12.0f, "%.1f");
+			igSliderFloat("mip level", &sMipLodOverride, 0.0f, 12.0f, "%.1f");
 		} else {
-			ImGui::SliderFloat("mip LOD bias", &sMipLodBias, -4.0f, 4.0f, "%.1f");
+			igSliderFloat("mip LOD bias", &sMipLodBias, -4.0f, 4.0f, "%.1f");
 		}
-		ImGui::DragFloat("exposure", &sExposure, 0.01f, 0.0f, 10.0f, "%.2f");
-		ImGui::SliderFloat("turbidity", &sSkyTurbidity, 1.7f, 5.0f, "%.1f");
-		ImGui::SliderFloat(
+		igDragFloat("exposure", &sExposure, 0.01f, 0.0f, 10.0f, "%.2f");
+		igSliderFloat("turbidity", &sSkyTurbidity, 1.7f, 5.0f, "%.1f");
+		igSliderFloat(
 			"sky intensity", &sSkyIntensity, 0.0f, 100.0f,
 			"%.1f",
 			ImGuiSliderFlags_Logarithmic
 			);
-		ImGui::SliderFloat("sun angle", &sSkySunAngle, 0.0f, 1.0f, "%.3f");
-		ImGui::SliderFloat(
+		igSliderFloat("sun angle", &sSkySunAngle, 0.0f, 1.0f, "%.3f");
+		igSliderFloat(
 			"sun intensity", &sSunIntensity, 0.0f, 1000.0f,
 			"%.2f",
 			ImGuiSliderFlags_Logarithmic
 		);
-		ImGui::SliderFloat(
+		igSliderFloat(
 			"anisotropy", &sAnisotropyPending, 1.0f, 16.0f, "%.0f"
 		);
 		if (
@@ -1543,6 +1869,23 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 					modelList[modelIdx].gpuScene,
 					sAnisotropy
 				);
+			}
+			for (scene::Entity & entity : sceneDesc.entities) {
+				auto * ei = std::get_if<scene::EntityInstance>(&entity.data);
+				if (!ei) { continue; }
+				auto const modIt = loadedModels.find(ei->filename);
+				if (modIt == loadedModels.end()) { continue; }
+				auto const matsIt = entityGpuMaterials.find(entity.id);
+				if (matsIt == entityGpuMaterials.end()) { continue; }
+				mor::scene_gpu_materials_sync_textures(
+					modelList[modIt->second].scene, matsIt->second
+				);
+				// re-apply user overrides clobbered by texture sync
+				for (u32 mi = 0u; mi < (u32)ei->materials.size(); ++mi) {
+					mor::scene_material_override_scalars(
+						matsIt->second, mi, ei->materials[mi].params
+					);
+				}
 			}
 		}
 
@@ -1662,6 +2005,14 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 		if (removeEntityIdx.has_value()) {
 			u32 const removeIdx = *removeEntityIdx;
 			if (removeIdx < (u32)sceneDesc.entities.size()) {
+				u32 const removeId = sceneDesc.entities[removeIdx].id;
+				auto const matsIt = entityGpuMaterials.find(removeId);
+				if (matsIt != entityGpuMaterials.end()) {
+					vkof::device_wait_idle();
+					mor::scene_gpu_materials_destroy(matsIt->second);
+					entityGpuMaterials.erase(matsIt);
+					originalMaterials.erase(removeId);
+				}
 				sceneDesc.entities.erase(
 					sceneDesc.entities.begin() + (ptrdiff_t)removeIdx
 				);
@@ -1747,9 +2098,15 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 				if (it == loadedModels.end()) { continue; }
 				LoadedModel const & model = modelList[it->second];
 				mor::Buffers const bufs = mor::scene_gpu_buffers(model.gpuScene);
+				auto const matsIt = entityGpuMaterials.find(entity.id);
+				u64 const matsVa = (
+					matsIt != entityGpuMaterials.end()
+					? mor::scene_gpu_materials_va(matsIt->second)
+					: bufs.materials
+				);
 				drawDescs.push_back(GpuResolveModelIndirect {
 					.meshlets = bufs.meshlets,
-					.materials = bufs.materials,
+					.materials = matsVa,
 					.positions = bufs.positions,
 					.instances = bufs.instances,
 					.attributes = bufs.attributes,
@@ -2085,6 +2442,9 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 						.bluenoiseVa = (
 							vkof::buffer_virtual_address(bluenoiseHandleBuffer)
 						),
+						.ptMode = sPtMode ? 1u : 0u,
+						.kullaContyEnergyHandle = materialTables.kullaContyEnergyHandle,
+						.zeltnerLtcParamHandle = materialTables.zeltnerLtcParamHandle,
 					};
 					vkof::cmd_dispatch_pushconst(vkof::CmdDispatchPushconst {
 						.cmd = cmd,
@@ -2166,7 +2526,7 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 					.debugDrawDepth = depthTarget,
 				});
 			}
-			sPtResetAccum = false;
+			sPtResetAccum = vkof::shader_reloaded();
 
 			vkof::render_node_destroy(drawNode);
 			vkof::render_node_destroy(tlasNode);
@@ -2179,6 +2539,10 @@ int32_t main(int32_t const argc, char const * const * const argv) {
 	}
 
 	vkof::device_wait_idle();
+	for (auto & [id, gpuMats] : entityGpuMaterials) {
+		mor::scene_gpu_materials_destroy(gpuMats);
+	}
+	entityGpuMaterials.clear();
 	for (auto & [filename, modelIndex] : loadedModels) {
 		LoadedModel const & model = modelList[modelIndex];
 		mor::scene_destroy(model.scene);

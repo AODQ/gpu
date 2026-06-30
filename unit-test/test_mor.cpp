@@ -148,6 +148,55 @@ static std::string write_triangle_gltf_with_material() {
 	return (dir / "material_tri.gltf").string();
 }
 
+// Writes a glTF with a named material ("RedMetal", baseColor=1/0/0/1, metallic=1, roughness=0).
+static std::string write_named_material_gltf() {
+	std::filesystem::path const dir = (
+		std::filesystem::temp_directory_path() / "mor_test"
+	);
+	std::filesystem::create_directories(dir);
+
+	f32 const positions[9] = {
+		-1.0f, -1.0f, 0.0f,
+		 1.0f, -1.0f, 0.0f,
+		 0.0f,  1.0f, 0.0f,
+	};
+	u16 const indices[3] = { 0u, 1u, 2u };
+	{
+		std::ofstream f(dir / "named_mat.bin", std::ios::binary);
+		f.write(reinterpret_cast<char const *>(positions), sizeof(positions));
+		f.write(reinterpret_cast<char const *>(indices), sizeof(indices));
+	}
+	{
+		std::ofstream f(dir / "named_mat.gltf");
+		f << R"({
+  "asset": { "version": "2.0" },
+  "scene": 0,
+  "scenes": [{ "nodes": [0] }],
+  "nodes":  [{ "mesh": 0 }],
+  "meshes": [{ "primitives": [{ "attributes": { "POSITION": 0 }, "indices": 1, "material": 0 }] }],
+  "materials": [{
+    "name": "RedMetal",
+    "pbrMetallicRoughness": {
+      "baseColorFactor": [1.0, 0.0, 0.0, 1.0],
+      "metallicFactor":  1.0,
+      "roughnessFactor": 0.0
+    }
+  }],
+  "accessors": [
+    { "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+      "min": [-1.0, -1.0, 0.0], "max": [1.0, 1.0, 0.0] },
+    { "bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR" }
+  ],
+  "bufferViews": [
+    { "buffer": 0, "byteOffset":  0, "byteLength": 36 },
+    { "buffer": 0, "byteOffset": 36, "byteLength":  6 }
+  ],
+  "buffers": [{ "byteLength": 42, "uri": "named_mat.bin" }]
+})";
+	}
+	return (dir / "named_mat.gltf").string();
+}
+
 TEST_SUITE("[headless]") {
 
 TEST_CASE("mor: scene create/destroy") {
@@ -329,5 +378,201 @@ TEST_CASE("mor: material data readback") {
 	mor::scene_destroy(scene);
 }
 
+
+TEST_CASE("mor: scene_material_count is 1 for no-material scene") {
+	std::string const path = write_triangle_gltf();
+	mor::Scene const scene = mor::scene_create();
+	mor::scene_load_gltf(scene, path.c_str());
+	CHECK(mor::scene_material_count(scene) == 1u);
+	mor::scene_destroy(scene);
+}
+
+TEST_CASE("mor: scene_material_count is 2 for single-material scene") {
+	std::string const path = write_triangle_gltf_with_material();
+	mor::Scene const scene = mor::scene_create();
+	mor::scene_load_gltf(scene, path.c_str());
+	CHECK(mor::scene_material_count(scene) == 2u);
+	mor::scene_destroy(scene);
+}
+
+TEST_CASE("mor: scene_material_name returns empty string for default slot") {
+	std::string const path = write_triangle_gltf();
+	mor::Scene const scene = mor::scene_create();
+	mor::scene_load_gltf(scene, path.c_str());
+	CHECK(mor::scene_material_name(scene, 0u) == "");
+	mor::scene_destroy(scene);
+}
+
+TEST_CASE("mor: scene_material_name returns gltf name for named material") {
+	std::string const path = write_named_material_gltf();
+	mor::Scene const scene = mor::scene_create();
+	mor::scene_load_gltf(scene, path.c_str());
+	CHECK(mor::scene_material_name(scene, 1u) == "RedMetal");
+	mor::scene_destroy(scene);
+}
+
+TEST_CASE("mor: scene_material_get reflects gltf scalars") {
+	std::string const path = write_triangle_gltf_with_material();
+	mor::Scene const scene = mor::scene_create();
+	mor::scene_load_gltf(scene, path.c_str());
+	GpuMorMaterial const mat = mor::scene_material_get(scene, 1u);
+	CHECK(mat.baseColor.x == doctest::Approx(0.8f).epsilon(0.001f));
+	CHECK(mat.baseColor.y == doctest::Approx(0.2f).epsilon(0.001f));
+	CHECK(mat.baseColor.z == doctest::Approx(0.4f).epsilon(0.001f));
+	CHECK(mat.baseColor.w == doctest::Approx(1.0f).epsilon(0.001f));
+	CHECK(mat.baseMetalness == doctest::Approx(0.1f).epsilon(0.001f));
+	CHECK(mat.specularRoughness == doctest::Approx(0.6f).epsilon(0.001f));
+	mor::scene_destroy(scene);
+}
+
+TEST_CASE("mor: GpuMaterials create returns valid id") {
+	std::string const path = write_triangle_gltf_with_material();
+	mor::Scene const scene = mor::scene_create();
+	mor::scene_load_gltf(scene, path.c_str());
+	mor::GpuMaterials const mats = mor::scene_gpu_materials_create(scene);
+	CHECK(mats.id != 0u);
+	mor::scene_gpu_materials_destroy(mats);
+	mor::scene_destroy(scene);
+}
+
+TEST_CASE("mor: GpuMaterials VA is non-zero") {
+	std::string const path = write_triangle_gltf_with_material();
+	mor::Scene const scene = mor::scene_create();
+	mor::scene_load_gltf(scene, path.c_str());
+	mor::GpuMaterials const mats = mor::scene_gpu_materials_create(scene);
+	CHECK(mor::scene_gpu_materials_va(mats) != 0u);
+	mor::scene_gpu_materials_destroy(mats);
+	mor::scene_destroy(scene);
+}
+
+TEST_CASE("mor: GpuMaterials initial data matches GLTF on GPU") {
+	std::string const path = write_triangle_gltf_with_material();
+	mor::Scene const scene = mor::scene_create();
+	mor::scene_load_gltf(scene, path.c_str());
+	mor::GpuMaterials const mats = mor::scene_gpu_materials_create(scene);
+
+	vkof::Pipeline const pl = vkof::pipeline_compute_create({
+		.pathCompute = TEST_SHADER_DIR "read_material.comp",
+	});
+	vkof::Buffer const outBuf = vkof::buffer_create({
+		.byteCount = 6u * sizeof(f32),
+		.memory = vkof::BufferMemory::DeviceOnly,
+	});
+	struct Push { u64 materialsVa; u64 outVa; u32 materialIndex; };
+	Push const push {
+		.materialsVa = mor::scene_gpu_materials_va(mats),
+		.outVa = vkof::buffer_virtual_address(outBuf),
+		.materialIndex = 1u,
+	};
+	test::dispatch(pl, push, 1u);
+	auto const result = test::readback<f32>(outBuf, 0u, 6u);
+
+	CHECK(result[0] == doctest::Approx(0.8f).epsilon(0.001f));
+	CHECK(result[1] == doctest::Approx(0.2f).epsilon(0.001f));
+	CHECK(result[2] == doctest::Approx(0.4f).epsilon(0.001f));
+	CHECK(result[3] == doctest::Approx(1.0f).epsilon(0.001f));
+	CHECK(result[4] == doctest::Approx(0.1f).epsilon(0.001f));
+	CHECK(result[5] == doctest::Approx(0.6f).epsilon(0.001f));
+
+	vkof::pipeline_destroy(pl);
+	vkof::buffer_destroy(outBuf);
+	mor::scene_gpu_materials_destroy(mats);
+	mor::scene_destroy(scene);
+}
+
+TEST_CASE("mor: scene_material_override_scalars reflects on GPU") {
+	std::string const path = write_triangle_gltf_with_material();
+	mor::Scene const scene = mor::scene_create();
+	mor::scene_load_gltf(scene, path.c_str());
+	mor::GpuMaterials const mats = mor::scene_gpu_materials_create(scene);
+
+	GpuMorMaterial override = mor::scene_material_get(scene, 1u);
+	override.baseColor = { 0.11f, 0.22f, 0.33f, 1.0f };
+	override.baseMetalness = 0.88f;
+	override.specularRoughness = 0.04f;
+	mor::scene_material_override_scalars(mats, 1u, override);
+
+	vkof::Pipeline const pl = vkof::pipeline_compute_create({
+		.pathCompute = TEST_SHADER_DIR "read_material.comp",
+	});
+	vkof::Buffer const outBuf = vkof::buffer_create({
+		.byteCount = 6u * sizeof(f32),
+		.memory = vkof::BufferMemory::DeviceOnly,
+	});
+	struct Push { u64 materialsVa; u64 outVa; u32 materialIndex; };
+	Push const push {
+		.materialsVa = mor::scene_gpu_materials_va(mats),
+		.outVa = vkof::buffer_virtual_address(outBuf),
+		.materialIndex = 1u,
+	};
+	test::dispatch(pl, push, 1u);
+	auto const result = test::readback<f32>(outBuf, 0u, 6u);
+
+	CHECK(result[0] == doctest::Approx(0.11f).epsilon(0.001f));
+	CHECK(result[1] == doctest::Approx(0.22f).epsilon(0.001f));
+	CHECK(result[2] == doctest::Approx(0.33f).epsilon(0.001f));
+	CHECK(result[4] == doctest::Approx(0.88f).epsilon(0.001f));
+	CHECK(result[5] == doctest::Approx(0.04f).epsilon(0.001f));
+
+	vkof::pipeline_destroy(pl);
+	vkof::buffer_destroy(outBuf);
+	mor::scene_gpu_materials_destroy(mats);
+	mor::scene_destroy(scene);
+}
+
+TEST_CASE("mor: two GpuMaterials from same scene are independent") {
+	std::string const path = write_triangle_gltf_with_material();
+	mor::Scene const scene = mor::scene_create();
+	mor::scene_load_gltf(scene, path.c_str());
+	mor::GpuMaterials const mats1 = mor::scene_gpu_materials_create(scene);
+	mor::GpuMaterials const mats2 = mor::scene_gpu_materials_create(scene);
+
+	GpuMorMaterial override = mor::scene_material_get(scene, 1u);
+	override.baseColor = { 1.0f, 0.0f, 0.0f, 1.0f };
+	override.baseMetalness = 1.0f;
+	mor::scene_material_override_scalars(mats1, 1u, override);
+
+	vkof::Pipeline const pl = vkof::pipeline_compute_create({
+		.pathCompute = TEST_SHADER_DIR "read_material.comp",
+	});
+	struct Push { u64 materialsVa; u64 outVa; u32 materialIndex; };
+	vkof::Buffer const out1 = vkof::buffer_create({
+		.byteCount = 6u * sizeof(f32),
+		.memory = vkof::BufferMemory::DeviceOnly,
+	});
+	vkof::Buffer const out2 = vkof::buffer_create({
+		.byteCount = 6u * sizeof(f32),
+		.memory = vkof::BufferMemory::DeviceOnly,
+	});
+
+	test::dispatch(
+		pl,
+		Push { mor::scene_gpu_materials_va(mats1), vkof::buffer_virtual_address(out1), 1u },
+		1u
+	);
+	auto const r1 = test::readback<f32>(out1, 0u, 6u);
+
+	test::dispatch(
+		pl,
+		Push { mor::scene_gpu_materials_va(mats2), vkof::buffer_virtual_address(out2), 1u },
+		1u
+	);
+	auto const r2 = test::readback<f32>(out2, 0u, 6u);
+
+	// mats1 was overridden
+	CHECK(r1[0] == doctest::Approx(1.0f).epsilon(0.001f));
+	CHECK(r1[4] == doctest::Approx(1.0f).epsilon(0.001f));
+
+	// mats2 must still hold original GLTF values
+	CHECK(r2[0] == doctest::Approx(0.8f).epsilon(0.001f));
+	CHECK(r2[4] == doctest::Approx(0.1f).epsilon(0.001f));
+
+	vkof::pipeline_destroy(pl);
+	vkof::buffer_destroy(out1);
+	vkof::buffer_destroy(out2);
+	mor::scene_gpu_materials_destroy(mats1);
+	mor::scene_gpu_materials_destroy(mats2);
+	mor::scene_destroy(scene);
+}
 
 } // TEST_SUITE("[headless]")

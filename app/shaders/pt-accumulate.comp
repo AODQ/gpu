@@ -15,6 +15,15 @@ layout(set = 0, binding = 2) uniform image2D vkofImages[];
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
+f32v3 fnAces(const f32v3 x) {
+	const f32 a = 2.51;
+	const f32 b = 0.03;
+	const f32 c = 2.43;
+	const f32 d = 0.59;
+	const f32 e = 0.14;
+	return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
 void main() {
 	const ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
 	const vec4 current = imageLoad(vkofImages[pc.ptAccumulate.inputHandle], coord);
@@ -29,9 +38,14 @@ void main() {
 	}
 
 	imageStore(vkofImages[pc.ptAccumulate.accumHandle], coord, accum);
+
+	// apply HDR to result
+	const f32v4 outColor = f32v4(fnAces(accum.rgb * pc.global.exposure), 1.0f);
+	// const f32v4 outColor = f32v4(accum.rgb * pc.global.exposure, 1.0f);
+
 	imageStore(
 		vkofImages[pc.ptAccumulate.outputHandle],
 		coord,
-		vec4(accum.rgb, 1.0f)
+		outColor
 	);
 }

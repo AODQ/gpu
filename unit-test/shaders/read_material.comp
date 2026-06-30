@@ -23,6 +23,7 @@ struct GpuMorMaterial {
 	uint textureClearcoat;
 	uint textureClearcoatRoughness;
 	vec3 fuzzColor;
+	float fuzzWeight;
 	float fuzzRoughness;
 	uint textureFuzz;
 	float subsurfaceWeight;

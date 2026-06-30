@@ -22,10 +22,14 @@ RayQueryResult utilTraceRay(
 	const vec3 origin,
 	const vec3 dir,
 	const float maxDist,
-	const bool isShadowRay
+	const bool isShadowRay,
+	const bool testAlphaCutoff
 ) {
 	rayQueryEXT rq;
-	uint rayFlags = gl_RayFlagsOpaqueEXT;
+	uint rayFlags = 0;
+	if (!testAlphaCutoff) {
+		rayFlags |= gl_RayFlagsOpaqueEXT;
+	}
 	if (isShadowRay) {
 		rayFlags |= gl_RayFlagsTerminateOnFirstHitEXT;
 	}
@@ -39,27 +43,64 @@ RayQueryResult utilTraceRay(
 		/*dir*/ dir,
 		/*maxT*/ maxDist
 	);
-	rayQueryProceedEXT(rq);
-	if (
-		rayQueryGetIntersectionTypeEXT(rq, true)
-		== gl_RayQueryCommittedIntersectionNoneEXT
-	) {
-		return RayQueryResult(0.0f, 0u, 0u, f32v2(0.0f));
+
+	RayQueryResult result;
+	while (rayQueryProceedEXT(rq)) {
+		if (
+			rayQueryGetIntersectionTypeEXT(rq, false)
+			!= gl_RayQueryCandidateIntersectionTriangleEXT
+		) {
+			return RayQueryResult(0.0f, 0u, 0u, f32v2(0.0f));
+		}
+
+		// get the distance to the intersection
+		result.dist = rayQueryGetIntersectionTEXT(rq, false);
+		result.modelDrawIndex = (
+			rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false)
+		);
+		result.primitiveIndex = (
+			rayQueryGetIntersectionPrimitiveIndexEXT(rq, false)
+		);
+		result.barycentric = (
+			rayQueryGetIntersectionBarycentricsEXT(rq, false)
+		);
+		if (!testAlphaCutoff) {
+			return result;
+		}
+
+		const UtilMeshAttributeDataFromIndices rqData = (
+			utilMeshAttributeDataFromIndices(
+				result.modelDrawIndex,
+				result.primitiveIndex,
+				result.barycentric
+			)
+		);
+		f32v3 modelNormal;
+		const OpenPbrMaterial mat = (
+			openPbrMaterialFromGltfWithLod(
+				/*material=*/rqData.material,
+				/*uv=*/rqData.uv,
+				/*lod=*/ 0,
+				/*modelNormal=*/modelNormal
+			)
+		);
+
+		if (mat.geometryOpacity > 0.01f) {
+			rayQueryConfirmIntersectionEXT(rq);
+			if (isShadowRay) {
+				rayQueryTerminateEXT(rq);
+			}
+		}
 	}
 
-	// get the distance to the intersection
-	RayQueryResult result;
-	result.dist = rayQueryGetIntersectionTEXT(rq, true);
-	result.modelDrawIndex = (
-		rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true)
-	);
-	result.primitiveIndex = (
-		rayQueryGetIntersectionPrimitiveIndexEXT(rq, true)
-	);
-	result.barycentric = (
-		rayQueryGetIntersectionBarycentricsEXT(rq, true)
-	);
-	return result;
+	if (
+		rayQueryGetIntersectionTypeEXT(rq, true)
+		== gl_RayQueryCommittedIntersectionTriangleEXT
+	) {
+		return result;
+	}
+
+	return RayQueryResult(0.0f, 0u, 0u, f32v2(0.0f));
 }
 
 // -----------------------------------------------------------------------------
@@ -89,6 +130,7 @@ struct Ray {
 };
 
 int utilIrradiance(
+	const MaterialTableHandles tables,
 	const OpenPbrMaterial material,
 	inout f32v3 itOri,
 	inout f32v3 itNormalWorld,
@@ -101,6 +143,7 @@ int utilIrradiance(
 	inout f32 seed,
 	inout f32v2 seed2,
 	out RayQueryResult bsdfRq,
+	out bool sampledTransmission,
 	const int iteration
 ) {
 	int returnEnum = skHitNone;
@@ -110,10 +153,12 @@ int utilIrradiance(
 	// -- propagate irradiance throughput along bsdf
 	bsdfWo = (
 		openPbrSampleWo(
+			/*tables=*/ tables,
 			/*nor=*/ itNormalWorld,
 			/*wi=*/ itWi,
 			/*mat=*/ material,
 			/*pdf=*/ bsdfPdf,
+			/*sampledTransmission=*/ sampledTransmission,
 			seed, seed2
 		)
 	);
@@ -129,19 +174,18 @@ int utilIrradiance(
 	}
 #endif
 
-	// if it's below the surface, terminate path; this can happen due to
-	// numerical precision issues. It's generally not worthwhile to try to
-	// reorient the wo and recalculate the pdf, just accept that there will
-	// be path termination noise
+	// below-surface check: valid for reflection but not for transmission
+	// (refracted wo correctly points below the surface normal)
 	f32 dotNorWo = dot(itNormalWorld, bsdfWo);
-	if (dotNorWo <= 0.0f) {
+	if (!sampledTransmission && dotNorWo <= 0.0f) {
 		return skHitTerminate;
 	}
 
-	// propagate irradiance throughput along bsdf
+	// propagate irradiance throughput along bsdf; use abs() so transmission
+	// cosine factor is positive (wo is below normal for refracted rays)
 	irradianceThroughput *= (
-		openPbrEvaluateF(itNormalWorld, itWi, bsdfWo, material)
-		* dotNorWo / bsdfPdf
+		openPbrEvaluateF(tables, itNormalWorld, itWi, bsdfWo, material)
+		* abs(dotNorWo) / bsdfPdf
 	);
 
 	// terminate path if throughput is too low to contribute; this also helps
@@ -169,10 +213,11 @@ int utilIrradiance(
 	{
 		bsdfRq = (
 			utilTraceRay(
-				itOri + itNormalGeometrical*0.0005f,
+				itOri + itNormalGeometrical * (sampledTransmission ? -0.0005f : 0.0005f),
 				bsdfWo,
 				/*maxDist=*/999999.0f,
-				/*isShadowRay=*/false
+				/*isShadowRay=*/false,
+				/*testAlphaCutoff=*/true
 			)
 		);
 
@@ -290,6 +335,7 @@ int utilIrradiance(
 }
 
 int utilIrradiancePropagate(
+	const MaterialTableHandles tables,
 	inout OpenPbrMaterial material,
 	inout f32v3 itOri,
 	inout f32v3 itNormalWorld,
@@ -305,8 +351,10 @@ int utilIrradiancePropagate(
 	f32v3 bsdfWo;
 	Ray rayWo;
 	RayQueryResult bsdfRq;
+	bool sampledTransmission;
 	int returnEnum = (
 		utilIrradiance(
+			tables,
 			material,
 			itOri,
 			itNormalWorld,
@@ -318,9 +366,31 @@ int utilIrradiancePropagate(
 			rayWo,
 			seed, seed2,
 			bsdfRq,
+			sampledTransmission,
 			iteration
 		)
 	);
+
+	// -- Beer-Lambert attenuation through transmissive medium
+	if (
+		sampledTransmission
+		&& material.transmissionDepth > 0.0f
+		&& bsdfRq.dist > 0.0f
+		&& returnEnum != skHitTerminate
+	) {
+		/*
+			Beer-Lambert law (spec 3.7.4):\\
+			\mu_t = -\frac{\ln T}{\lambda},
+			\quad T = transmissionColor,
+			\quad \lambda = transmissionDepth\\
+			attenuation = \exp(-\mu_t \cdot d) = T^{d / \lambda}
+		*/
+		const f32v3 mu = (
+			-log(max(material.transmissionColor, f32v3(1e-6f)))
+			/ material.transmissionDepth
+		);
+		irradianceThroughput *= exp(-mu * bsdfRq.dist);
+	}
 
 	// -- update the material and ray for the next bounce
 	if (returnEnum == skHitIndirect || returnEnum == skHitNone) {
@@ -347,12 +417,19 @@ int utilIrradiancePropagate(
 		itNormalWorld = normalize(tbn * modelNormal);
 		itNormalGeometrical = rqData.normalGeometrical;
 		itWi = -bsdfWo;
+		// after transmission the mesh normal faces away from the incoming ray
+		// (back face of the object); flip so the next bounce sees a consistent frame
+		if (sampledTransmission && dot(itWi, itNormalGeometrical) < 0.0f) {
+			itNormalWorld = -itNormalWorld;
+			itNormalGeometrical = -itNormalGeometrical;
+		}
 	}
 
 	return returnEnum;
 }
 
 f32v4 utilIrradiancePropagationEntry(
+	const MaterialTableHandles tables,
 	OpenPbrMaterial originalMaterial,
 	f32v3 origin,
 	f32v3 normalWorld,
@@ -369,6 +446,7 @@ f32v4 utilIrradiancePropagationEntry(
 	for (int i = 0; i < propagationDepth; ++i) {
 		int returnEnum = (
 			utilIrradiancePropagate(
+				tables,
 				originalMaterial,
 				origin,
 				normalWorld,

@@ -320,6 +320,7 @@ add_executable(
 	app/gfx.cpp
 	app/cull.cpp
 	app/asset_library.cpp
+	app/material-tables.cpp
 	${imguizmo_SOURCE_DIR}/src/ImGuizmo.cpp
 )
 
